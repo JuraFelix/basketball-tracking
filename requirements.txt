@@ -1,0 +1,21 @@
+# Basketball Tracking Analytics — зависимости
+#
+# ВАЖНО про torch/torchvision (CUDA для NVIDIA RTX 4080):
+# Строки ниже устанавливают версии torch/torchvision, совместимые по API с
+# остальными зависимостями, но с индекса PyPI (CPU-сборка). Для реальной
+# работы на RTX 4080 их нужно ставить С CUDA-индекса ДО остальных пакетов —
+# см. пошаговую инструкцию в README.md ("Установка"). Если CUDA-версии уже
+# установлены, повторный `pip install -r requirements.txt` их не перезапишет
+# на CPU-сборку (pip увидит совпадающую версию и пропустит переустановку) —
+# но чтобы быть уверенным на 100%, ставьте torch/torchvision по инструкции
+# из README ПЕРЕД этим файлом.
+
+streamlit==1.38.0
+ultralytics==8.3.28
+torch==2.4.1
+torchvision==0.19.1
+opencv-python==4.10.0.84
+numpy==1.26.4
+pandas==2.2.2
+PyYAML==6.0.2
+Pillow==10.4.0

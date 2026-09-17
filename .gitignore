@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# Streamlit
+.streamlit/
+
+# Веса моделей (скачиваются автоматически при первом запуске)
+*.pt
+*.onnx
+
+# Автогенерируемый конфиг трекера (создаётся app.py при первом запуске)
+custom_botsort.yaml
+
+# Результаты работы приложения (видео пользователей, хайлайты)
+highlights/*.mp4
+output_videos/*.mp4
+!highlights/.gitkeep
+!output_videos/.gitkeep
