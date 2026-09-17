@@ -48,7 +48,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -195,14 +195,13 @@ PERSON_CONF_MAX = 0.8
 IMGSZ_DEFAULT = 640
 IMGSZ_OPTIONS = [640, 768, 896, 1024, 1152, 1280]
 
-# Сколько кадров сэмплировать по всему видео при диагностике видимости мяча
-# (шаг 3) — не весь ролик, чтобы диагностика оставалась быстрой (секунды, а
-# не минуты), но достаточно равномерно распределённых кадров для честной
-# оценки % обнаружения и средней уверенности.
-BALL_DIAGNOSTIC_MAX_SAMPLES = 120
-# Макс. кадров диагностики подряд (≈30 сек при 30 fps) — полный последовательный
-# прогон для честной оценки дыр YOLO и эффекта interpolation/color fallback.
-BALL_DIAGNOSTIC_MAX_FRAMES = 900
+# Диагностика видимости мяча (шаг 3): равномерный сэмпл по всему видео,
+# жёсткий потолок инференсов — не гоняем сотни/тысячи кадров подряд.
+BALL_DIAGNOSTIC_MAX_SAMPLES = 100
+BALL_DIAGNOSTIC_MIN_SAMPLES = 80
+
+# Быстрый скан игроков (шаг 3): макс. число кадров с model.track() за один запуск.
+QUICK_SCAN_MAX_TRACK_FRAMES = 300
 
 # --- Устойчивый трекинг мяча при пропусках YOLO ---
 BALL_MAX_GAP_FRAMES_DEFAULT = 20
@@ -1253,6 +1252,26 @@ def detect_yolo_ball_on_frame(
     return center, conf
 
 
+def build_sparse_frame_indices(
+    total_frames: int,
+    max_samples: int = BALL_DIAGNOSTIC_MAX_SAMPLES,
+    min_samples: int = BALL_DIAGNOSTIC_MIN_SAMPLES,
+) -> List[int]:
+    """Равномерные индексы кадров по всему видео с жёстким потолком инференсов."""
+    if total_frames <= 0:
+        return []
+    cap = min(max(max_samples, min_samples), 120)
+    if total_frames <= cap:
+        return list(range(total_frames))
+    step = max(total_frames // cap, 1)
+    indices = list(range(0, total_frames, step))
+    if len(indices) > cap:
+        indices = indices[:cap]
+    if indices[-1] != total_frames - 1 and len(indices) < cap:
+        indices.append(total_frames - 1)
+    return indices
+
+
 # ---------------------------------------------------------------------------
 # Диагностика видимости мяча (шаг 3) — отличить "проблема в порогах" от
 # "модель в принципе не видит мяч на этом видео".
@@ -1268,11 +1287,11 @@ def diagnose_ball_visibility(
     max_predict_frames: int = BALL_MAX_PREDICT_FRAMES_DEFAULT,
     color_fallback: bool = BALL_COLOR_FALLBACK_DEFAULT,
     color_roi_half: int = BALL_COLOR_ROI_HALF_DEFAULT,
-    max_frames: int = BALL_DIAGNOSTIC_MAX_FRAMES,
+    progress_callback: Optional[Callable[[float], Any]] = None,
+    status_callback: Optional[Callable[[str], Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Последовательно прогоняет видео и сравнивает видимость мяча: только YOLO
-    vs YOLO + Kalman/интерполяция + цветовой fallback. Считает среднюю длину
-    дыр между YOLO-детекциями."""
+    """Сэмплирует до ~100 кадров равномерно по всему видео (model.predict на
+    каждом) и сравнивает видимость мяча: YOLO vs YOLO + Kalman/цвет."""
     if model is None or cv2 is None:
         return None
     cap = cv2.VideoCapture(video_path)
@@ -1283,7 +1302,11 @@ def diagnose_ball_visibility(
         cap.release()
         return None
 
-    frames_to_process = min(total_frames, max_frames)
+    sample_indices = build_sparse_frame_indices(total_frames)
+    if not sample_indices:
+        cap.release()
+        return None
+
     tracker = BallTracker(
         max_gap_frames=max_gap_frames,
         max_predict_frames=max_predict_frames,
@@ -1296,12 +1319,28 @@ def diagnose_ball_visibility(
     yolo_conf_sum = 0.0
     source_counts: Dict[str, int] = {"yolo": 0, "color": 0, "interp": 0, "kalman": 0}
     gaps: List[int] = []
-    current_gap = 0
+    gap_start_frame: Optional[int] = None
+    n_samples = len(sample_indices)
 
-    for frame_idx in range(frames_to_process):
+    for sample_i, frame_idx in enumerate(sample_indices):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
         if not ret:
-            break
+            continue
+
+        if status_callback is not None:
+            try:
+                status_callback(
+                    f"Сэмпл {sample_i + 1}/{n_samples} · кадр {frame_idx} / {total_frames}"
+                )
+            except Exception:
+                pass
+        if progress_callback is not None:
+            try:
+                progress_callback(min((sample_i + 1) / n_samples, 1.0))
+            except Exception:
+                pass
+
         detect_frame = enhance_frame_for_detection(frame) if enhance_quality else frame
         yolo_ball, yolo_conf = detect_yolo_ball_on_frame(
             detect_frame, model, device, ball_conf_threshold, imgsz
@@ -1313,11 +1352,11 @@ def diagnose_ball_visibility(
         if yolo_ball is not None:
             yolo_hits += 1
             yolo_conf_sum += yolo_conf
-            if current_gap > 0:
-                gaps.append(current_gap)
-                current_gap = 0
-        else:
-            current_gap += 1
+            if gap_start_frame is not None:
+                gaps.append(frame_idx - gap_start_frame)
+                gap_start_frame = None
+        elif gap_start_frame is None:
+            gap_start_frame = frame_idx
 
         state = tracker.update(frame_idx, frame, yolo_ball, yolo_conf, [])
         if state is not None:
@@ -1325,13 +1364,15 @@ def diagnose_ball_visibility(
             source_counts[state.source] = source_counts.get(state.source, 0) + 1
 
     cap.release()
-    if frames_to_process <= 0:
+    if n_samples <= 0:
         return None
 
-    yolo_rate = yolo_hits / frames_to_process
-    enhanced_rate = enhanced_hits / frames_to_process
+    yolo_rate = yolo_hits / n_samples
+    enhanced_rate = enhanced_hits / n_samples
     return {
-        "sampled_frames": frames_to_process,
+        "sampled_frames": n_samples,
+        "total_video_frames": total_frames,
+        "sample_step_approx": max(total_frames // max(n_samples, 1), 1),
         "frames_with_ball_yolo": yolo_hits,
         "yolo_detection_rate": yolo_rate,
         "frames_with_ball_enhanced": enhanced_hits,
@@ -1340,7 +1381,6 @@ def diagnose_ball_visibility(
         "avg_gap_frames": float(np.mean(gaps)) if gaps else 0.0,
         "max_gap_frames": int(max(gaps)) if gaps else 0,
         "source_counts": source_counts,
-        # Обратная совместимость со старыми ключами GUI
         "frames_with_ball": yolo_hits,
         "detection_rate": yolo_rate,
     }
@@ -1360,6 +1400,8 @@ def quick_player_scan(
     ball_conf: float = BALL_CONF_DEFAULT,
     imgsz: int = IMGSZ_DEFAULT,
     appearance_similarity: float = APPEARANCE_SIMILARITY_DEFAULT,
+    progress_callback: Optional[Callable[[float], Any]] = None,
+    status_callback: Optional[Callable[[str], Any]] = None,
 ) -> Tuple[Dict[int, Any], List[Dict[str, Any]]]:
     """Короткий прогон трекера по первым max_seconds секундам видео.
 
@@ -1384,13 +1426,36 @@ def quick_player_scan(
 
     fps = fps_hint or 25.0
     max_frames = max(int(fps * max_seconds), 1)
+    frame_step = max(max_frames // QUICK_SCAN_MAX_TRACK_FRAMES, 1) if max_frames > QUICK_SCAN_MAX_TRACK_FRAMES else 1
+    track_targets = list(range(0, max_frames, frame_step))
+    n_track = len(track_targets)
 
     best_crops: Dict[int, Tuple[float, Any]] = {}
     frame_idx = 0
+    track_done = 0
     while frame_idx < max_frames:
         ret, frame = cap.read()
         if not ret:
             break
+
+        if frame_idx % frame_step != 0:
+            frame_idx += 1
+            continue
+
+        track_done += 1
+        if status_callback is not None:
+            try:
+                status_callback(
+                    f"Сканирование: кадр {frame_idx + 1}/{max_frames} "
+                    f"({track_done}/{n_track} с трекингом)"
+                )
+            except Exception:
+                pass
+        if progress_callback is not None:
+            try:
+                progress_callback(min(track_done / n_track, 1.0))
+            except Exception:
+                pass
 
         detect_frame = enhance_frame_for_detection(frame) if enhance_quality else frame
         track_conf = min(person_conf, ball_conf)
@@ -2362,17 +2427,22 @@ def render_step3_players(device: str) -> None:
                 "умолчанию останутся как «Игрок {ID}»."
             )
         else:
-            with st.spinner("Сканирование..."):
-                crops, merge_log = quick_player_scan(
-                    video_path, model, device, max_seconds=scan_seconds, fps_hint=meta["fps"],
-                    enhance_quality=st.session_state.get("enhance_quality", False),
-                    person_conf=float(st.session_state.get("person_conf", PERSON_CONF_DEFAULT)),
-                    ball_conf=float(st.session_state.get("ball_conf", BALL_CONF_DEFAULT)),
-                    imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
-                    appearance_similarity=float(
-                        st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)
-                    ),
-                )
+            scan_progress = st.progress(0.0, text="Сканирование игроков...")
+            scan_status = st.empty()
+            crops, merge_log = quick_player_scan(
+                video_path, model, device, max_seconds=scan_seconds, fps_hint=meta["fps"],
+                enhance_quality=st.session_state.get("enhance_quality", False),
+                person_conf=float(st.session_state.get("person_conf", PERSON_CONF_DEFAULT)),
+                ball_conf=float(st.session_state.get("ball_conf", BALL_CONF_DEFAULT)),
+                imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
+                appearance_similarity=float(
+                    st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)
+                ),
+                progress_callback=scan_progress.progress,
+                status_callback=scan_status.caption,
+            )
+            scan_progress.progress(1.0, text="Сканирование завершено")
+            scan_status.empty()
             st.session_state["player_crops"] = crops
             st.session_state["id_merge_log"] = merge_log
             if not crops:
@@ -2426,17 +2496,22 @@ def render_step3_players(device: str) -> None:
         if model is None:
             st.warning(f"⚠️ Модель YOLO11x не загружена ({model_error}) — диагностика недоступна в этой среде.")
         else:
-            with st.spinner("Сэмплирование кадров по всему видео..."):
-                diag = diagnose_ball_visibility(
-                    video_path, model, device,
-                    ball_conf_threshold=float(st.session_state.get("ball_conf", BALL_CONF_DEFAULT)),
-                    imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
-                    enhance_quality=st.session_state.get("enhance_quality", False),
-                    max_gap_frames=int(st.session_state.get("ball_max_gap_frames", BALL_MAX_GAP_FRAMES_DEFAULT)),
-                    max_predict_frames=int(st.session_state.get("ball_max_predict_frames", BALL_MAX_PREDICT_FRAMES_DEFAULT)),
-                    color_fallback=bool(st.session_state.get("ball_color_fallback", BALL_COLOR_FALLBACK_DEFAULT)),
-                    color_roi_half=int(st.session_state.get("ball_color_roi_half", BALL_COLOR_ROI_HALF_DEFAULT)),
-                )
+            diag_progress = st.progress(0.0, text="Диагностика видимости мяча...")
+            diag_status = st.empty()
+            diag = diagnose_ball_visibility(
+                video_path, model, device,
+                ball_conf_threshold=float(st.session_state.get("ball_conf", BALL_CONF_DEFAULT)),
+                imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
+                enhance_quality=st.session_state.get("enhance_quality", False),
+                max_gap_frames=int(st.session_state.get("ball_max_gap_frames", BALL_MAX_GAP_FRAMES_DEFAULT)),
+                max_predict_frames=int(st.session_state.get("ball_max_predict_frames", BALL_MAX_PREDICT_FRAMES_DEFAULT)),
+                color_fallback=bool(st.session_state.get("ball_color_fallback", BALL_COLOR_FALLBACK_DEFAULT)),
+                color_roi_half=int(st.session_state.get("ball_color_roi_half", BALL_COLOR_ROI_HALF_DEFAULT)),
+                progress_callback=diag_progress.progress,
+                status_callback=diag_status.caption,
+            )
+            diag_progress.progress(1.0, text="Диагностика завершена")
+            diag_status.empty()
             st.session_state["ball_diagnostics"] = diag
             if diag is None:
                 st.error("Не удалось выполнить диагностику (не открылось видео или сбой модели).")
@@ -2447,7 +2522,9 @@ def render_step3_players(device: str) -> None:
         enh_pct = diag.get("enhanced_detection_rate", yolo_pct / 100.0) * 100.0
         src = diag.get("source_counts") or {}
         st.caption(
-            f"Проанализировано кадров подряд: {diag['sampled_frames']} · "
+            f"Сэмплов по видео: {diag['sampled_frames']}"
+            + (f" из ~{diag.get('total_video_frames', '?')} кадров" if diag.get("total_video_frames") else "")
+            + " · "
             f"YOLO: {diag.get('frames_with_ball_yolo', diag.get('frames_with_ball', 0))} "
             f"({yolo_pct:.0f}%, conf≈{diag['avg_confidence']:.2f}) · "
             f"после Kalman/цвет: {diag.get('frames_with_ball_enhanced', 0)} ({enh_pct:.0f}%) · "
