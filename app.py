@@ -15,12 +15,13 @@ Basketball Tracking Analytics
 
 Возможности:
     * Детекция и трекинг игроков и мяча моделью YOLO11x (Ultralytics) с трекером
-      BoT-SORT + ReID (игроки не имеют номеров на майках, поэтому идентификация
-      строится на визуальных признаках формы/обуви, а не на OCR номеров).
-    * Математическая детекция бросков/попаданий по ДВУМ окружностям колец,
-      заданным пользователем, с кулдауном событий.
-    * Детекция передач (пасов) на основе смены владельца мяча в ограниченном
-      временном окне, с "памятью" мяча при кратковременной потере детекции.
+      ByteTrack (игроки без номеров на майках — удержание ID за счёт трекера,
+      а не OCR номеров).
+    * Векторная детекция голов: пересечение траектории мяча с горизонтальной
+      линией кольца (задаётся пользователем), с кулдауном 90 кадров.
+    * Детекция передач (пасов): игрок владел мячом → мяч летел без владельца
+      10–60 кадров → другой игрок получил владение, с "памятью" мяча при
+      кратковременной потере детекции.
     * Отладочный таймлайн владения мячом — виден каждый переход владения и
       причина, по которой передача была засчитана или отклонена.
     * Автоматическая нарезка автономных MP4-хайлайтов (5 сек до события +
@@ -31,8 +32,8 @@ Basketball Tracking Analytics
 Запуск:
     streamlit run app.py
 
-Первый запуск скачивает веса модели YOLO11x (~110 МБ) и веса ReID-модуля
-трекера из интернета. Все последующие запуски полностью офлайн.
+Первый запуск скачивает веса модели YOLO11x (~110 МБ) из интернета.
+Все последующие запуски полностью офлайн.
 """
 
 from __future__ import annotations
@@ -105,7 +106,7 @@ except Exception as exc:  # pragma: no cover - защита от отсутст�
 BASE_DIR = Path(__file__).resolve().parent
 HIGHLIGHTS_DIR = BASE_DIR / "highlights"
 OUTPUT_DIR = BASE_DIR / "output_videos"
-TRACKER_CONFIG_PATH = BASE_DIR / "custom_botsort.yaml"
+TRACKER_CONFIG_PATH = BASE_DIR / "custom_bytetrack.yaml"
 
 # Самая точная модель семейства YOLO11. Официальное имя весов в Ultralytics —
 # "yolo11x.pt"; ниже пробуем сначала имя из технического задания, а при
@@ -121,17 +122,28 @@ COCO_BALL_CLASS_ID = 32  # 'sports ball'
 BUFFER_SECONDS = 5.0
 FUTURE_SECONDS = 2.0
 
-# Через сколько секунд после попадания мяча в зону кольца выносить вердикт
-# "гол/промах" по траектории мяча.
-SHOT_VERDICT_DELAY_SECONDS = 0.6
-
-# Сколько последних точек траектории мяча хранить для математической оценки
-# направления полёта (используется и для пасов, и для вердикта у кольца).
+# Сколько последних точек траектории мяча хранить для отрисовки и анализа.
+BALL_TRAJECTORY_DRAW_LEN = 10
 BALL_HISTORY_MAXLEN = 20
 
-# Минимальное время "в воздухе"/переключения владения, ниже которого пас не
-# засчитывается (защита от дребезга детекций одного кадра).
-PASS_MIN_TIME_SECONDS = 0.0
+# Дефолтные пороги инференса YOLO при вызове model.track() — низкий conf
+# помогает замечать удалённых игроков на противоположной стороне площадки.
+TRACK_CONF_DEFAULT = 0.15
+TRACK_IOU_DEFAULT = 0.45
+
+# Окно передачи в КАДРАХ: мяч должен лететь без владельца от min до max кадров.
+PASS_MIN_FRAMES_DEFAULT = 10
+PASS_MIN_FRAMES_MIN = 3
+PASS_MIN_FRAMES_MAX = 30
+
+PASS_MAX_FRAMES_DEFAULT = 60
+PASS_MAX_FRAMES_MIN = 20
+PASS_MAX_FRAMES_MAX = 120
+
+# Кулдаун между голами у одного кольца (кадры; ~3 сек при 30 fps).
+GOAL_COOLDOWN_FRAMES_DEFAULT = 90
+GOAL_COOLDOWN_FRAMES_MIN = 30
+GOAL_COOLDOWN_FRAMES_MAX = 180
 
 # --- Дефолты и диапазоны настраиваемых через GUI порогов ---
 # ВАЖНО: на реальном видео исходный жёсткий порог владения (65 px) оказался
@@ -143,13 +155,6 @@ POSSESSION_THRESHOLD_DEFAULT = 90
 POSSESSION_THRESHOLD_MIN = 20
 POSSESSION_THRESHOLD_MAX = 250
 
-PASS_WINDOW_DEFAULT = 1.8
-PASS_WINDOW_MIN = 0.3
-PASS_WINDOW_MAX = 3.0
-
-SHOT_COOLDOWN_DEFAULT = 3.0
-SHOT_COOLDOWN_MIN = 1.0
-SHOT_COOLDOWN_MAX = 6.0
 
 # "Память" мяча: если детектор не нашёл мяч в текущем кадре (блики, смаз
 # движения, быстрый полёт), сколько секунд продолжать считать его находящимся
@@ -176,8 +181,8 @@ BALL_CONF_DEFAULT = 0.18
 BALL_CONF_MIN = 0.05
 BALL_CONF_MAX = 0.5
 
-PERSON_CONF_DEFAULT = 0.3
-PERSON_CONF_MIN = 0.1
+PERSON_CONF_DEFAULT = 0.15
+PERSON_CONF_MIN = 0.05
 PERSON_CONF_MAX = 0.8
 
 # Разрешение, до которого YOLO letterbox-ит кадр перед инференсом. Дефолт
@@ -232,6 +237,7 @@ FFMPEG_PATH = shutil.which("ffmpeg")
 
 
 PlayerStats = Dict[str, int]
+# Горизонтальная линия кольца: центр (x, y) и полуширина отрезка линии.
 RingZone = Dict[str, float]
 
 
@@ -250,36 +256,29 @@ def ensure_directories() -> None:
 
 
 def ensure_tracker_config(path: Path = TRACKER_CONFIG_PATH) -> Path:
-    """Генерирует локальный конфиг трекера BoT-SORT при первом запуске.
+    """Генерирует локальный конфиг трекера ByteTrack при первом запуске.
 
-    Игроки играют в разноцветной форме без номеров на майках, поэтому
-    надёжный трекинг возможен только за счёт ReID (повторного распознавания
-    по внешнему виду — цвету формы и обуви), а не по номеру. Поэтому ниже
-    принудительно включён with_reid=True и подобраны пороги, устойчивые к
-    быстрым перемещениям и частичным перекрытиям игроков.
+    ByteTrack удерживает ID игроков без ReID/номеров на форме: track_buffer=180
+    (~5–6 сек при 30 fps) помогает не терять трек при окклюзии, а
+    track_low_thresh=0.1 не отбрасывает частично перекрытые силуэты.
     """
     if path.exists():
         return path
 
     tracker_cfg = {
-        "tracker_type": "botsort",
-        "track_high_thresh": 0.3,
+        "tracker_type": "bytetrack",
+        "track_high_thresh": 0.25,
         "track_low_thresh": 0.1,
-        "new_track_thresh": 0.4,
-        "track_buffer": 120,
-        "match_thresh": 0.7,
+        "new_track_thresh": 0.25,
+        "track_buffer": 180,
+        "match_thresh": 0.8,
         "fuse_score": True,
-        "gmc_method": "sparseOptFlow",
-        # --- ReID по внешнему виду (цвет формы/обуви) вместо номеров ---
-        "with_reid": True,
-        "proximity_thresh": 0.5,
-        "appearance_thresh": 0.25,
     }
     with open(path, "w", encoding="utf-8") as f:
         f.write(
-            "# Автоматически сгенерированный конфиг трекера BoT-SORT.\n"
-            "# with_reid=True включает повторную идентификацию игроков по\n"
-            "# внешнему виду формы/обуви, т.к. номеров на майках нет.\n"
+            "# Автоматически сгенерированный конфиг трекера ByteTrack.\n"
+            "# track_buffer=180 — помнить игрока ~5–6 сек при окклюзии.\n"
+            "# track_low_thresh=0.1 — не терять трек при частичном перекрытии.\n"
         )
         yaml.safe_dump(tracker_cfg, f, sort_keys=False, allow_unicode=True)
     return path
@@ -346,7 +345,7 @@ def load_model(device: str):
 
 
 def reset_tracker(model) -> None:
-    """Сбрасывает внутреннее состояние трекера BoT-SORT перед новой независимой
+    """Сбрасывает внутреннее состояние трекера ByteTrack перед новой независимой
     сессией трекинга (быстрое сканирование ID и финальный полный прогон должны
     оба стартовать "с чистого листа" на кадре 0 — иначе ID из предыдущего
     прогона исказят нумерацию и сопоставление игрок → имя/номер разойдётся
@@ -366,10 +365,6 @@ def reset_tracker(model) -> None:
 def bbox_center(box: Tuple[float, float, float, float]) -> Tuple[float, float]:
     x1, y1, x2, y2 = box
     return (x1 + x2) / 2.0, (y1 + y2) / 2.0
-
-
-def point_in_circle(px: float, py: float, cx: float, cy: float, r: float) -> bool:
-    return (px - cx) ** 2 + (py - cy) ** 2 <= r * r
 
 
 def distance_point_to_bbox(px: float, py: float, box: Tuple[float, float, float, float]) -> float:
@@ -392,32 +387,29 @@ def nearest_player_to_point(
     return best_id
 
 
-def ball_is_falling_through(
-    ball_history: Deque[Tuple[float, float, float]], ring_center: Tuple[float, float], ring_radius: float
+def segment_crosses_hoop_line_top_to_bottom(
+    x_prev: float,
+    y_prev: float,
+    x_curr: float,
+    y_curr: float,
+    line_y: float,
+    center_x: float,
+    half_width: float,
 ) -> bool:
-    """Математическая оценка "гол или промах" по недавней траектории мяча.
+    """Проверяет пересечение отрезка движения мяча с горизонтальной линией кольца сверху вниз.
 
-    Через полсекунды-секунду после входа мяча в зону кольца смотрим на
-    линейную регрессию вертикальной координаты мяча во времени: если мяч
-    продолжает двигаться вниз (координата Y на кадре растёт вниз) и в итоге
-    оказывается ниже кольца в пределах его горизонтальной проекции — это
-    засчитывается как попадание (мяч прошёл через кольцо и сетку). Если мяч
-    отскочил вверх/в сторону — это промах (отскок от кольца/щита).
+    В координатах кадра Y растёт вниз: мяч должен перейти из области выше линии
+    (y_prev < line_y) в область на линии или ниже (y_curr >= line_y), а точка
+    пересечения по X должна попадать в отрезок [center_x - half_width, center_x + half_width].
     """
-    if len(ball_history) < 3:
+    if y_prev >= line_y or y_curr < line_y:
         return False
-    ts = np.array([p[0] for p in ball_history], dtype=np.float64)
-    xs = np.array([p[1] for p in ball_history], dtype=np.float64)
-    ys = np.array([p[2] for p in ball_history], dtype=np.float64)
-
-    # Линейная аппроксимация скорости по вертикали (наклон прямой y(t)).
-    vy = float(np.polyfit(ts, ys, 1)[0]) if len(ts) >= 2 else 0.0
-
-    last_x, last_y = float(xs[-1]), float(ys[-1])
-    moving_down = vy > 0.0
-    below_ring = last_y > ring_center[1] + ring_radius * 0.4
-    near_ring_x = abs(last_x - ring_center[0]) < ring_radius * 1.6
-    return moving_down and below_ring and near_ring_x
+    if abs(y_curr - y_prev) < 1e-6:
+        cross_x = (x_prev + x_curr) / 2.0
+    else:
+        t = (line_y - y_prev) / (y_curr - y_prev)
+        cross_x = x_prev + t * (x_curr - x_prev)
+    return abs(cross_x - center_x) <= half_width
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +521,10 @@ def compute_dynamic_rings(
     dynamic_rings: List[RingZone] = []
     for ring in rings:
         point = transform @ np.array([ring["x"], ring["y"], 1.0], dtype=np.float64)
-        dynamic_rings.append({"x": float(point[0]), "y": float(point[1]), "r": float(ring["r"] * scale)})
+        half_w = ring.get("half_width", ring.get("r", 40.0))
+        dynamic_rings.append(
+            {"x": float(point[0]), "y": float(point[1]), "half_width": float(half_w * scale)}
+        )
     return dynamic_rings
 
 
@@ -595,8 +590,9 @@ def draw_annotations(
     frame,
     persons: List[Tuple[int, Tuple[float, float, float, float]]],
     ball: Optional[Tuple[float, float]],
+    ball_trajectory: Optional[List[Tuple[float, float]]] = None,
 ):
-    """Рисует рамки игроков (с ID) и маркер мяча на копии кадра.
+    """Рисует рамки игроков (с ID), траекторию мяча и маркер мяча на копии кадра.
 
     Заменяет result.plot() из ultralytics: при включённом "улучшении
     качества" детекция идёт на увеличенном кадре, а рисовать нужно на
@@ -604,6 +600,10 @@ def draw_annotations(
     получилось бы в другом разрешении, чем входное.
     """
     annotated = frame.copy()
+    if ball_trajectory and len(ball_trajectory) >= 2:
+        pts = [(int(x), int(y)) for x, y in ball_trajectory]
+        for i in range(1, len(pts)):
+            cv2.line(annotated, pts[i - 1], pts[i], (0, 255, 255), 3, cv2.LINE_AA)
     for pid, (x1, y1, x2, y2) in persons:
         color = id_to_color(pid)
         p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
@@ -737,10 +737,10 @@ def extract_frame_at_time(video_path: str, t_seconds: float):
 
 
 def default_ring_zones(width: int, height: int) -> Tuple[RingZone, RingZone]:
-    """Разумные дефолтные координаты для двух колец (по краям площадки)."""
-    r = max(int(min(width, height) * 0.05), 20)
-    ring1 = {"x": float(int(width * 0.10)), "y": float(int(height * 0.35)), "r": float(r)}
-    ring2 = {"x": float(int(width * 0.90)), "y": float(int(height * 0.35)), "r": float(r)}
+    """Разумные дефолтные горизонтальные линии двух колец (по краям площадки)."""
+    half_w = max(int(min(width, height) * 0.08), 40)
+    ring1 = {"x": float(int(width * 0.10)), "y": float(int(height * 0.35)), "half_width": float(half_w)}
+    ring2 = {"x": float(int(width * 0.90)), "y": float(int(height * 0.35)), "half_width": float(half_w)}
     return ring1, ring2
 
 
@@ -749,7 +749,7 @@ def draw_zones_preview(
     rings: List[RingZone],
     possession_threshold: Optional[float] = None,
 ) -> Any:
-    """Рисует окружности зон колец на копии кадра для наглядной проверки в GUI.
+    """Рисует горизонтальные линии колец на копии кадра для наглядной проверки в GUI.
 
     Если передан possession_threshold — дополнительно рисует в углу кадра
     эталонный полупрозрачный круг такого радиуса с подписью в пикселях, чтобы
@@ -757,14 +757,20 @@ def draw_zones_preview(
     гадал по числу пикселей.
     """
     preview = frame.copy()
+    h, w = preview.shape[:2]
     colors = [(0, 140, 255), (255, 80, 0)]
     for idx, ring in enumerate(rings):
         color = colors[idx % len(colors)]
-        center = (int(ring["x"]), int(ring["y"]))
-        radius = max(int(ring["r"]), 1)
-        cv2.circle(preview, center, radius, color, 3)
-        cv2.drawMarker(preview, center, color, markerType=cv2.MARKER_CROSS, markerSize=14, thickness=2)
-        label_pos = (max(center[0] - 45, 0), max(center[1] - radius - 12, 20))
+        center_x = int(ring["x"])
+        line_y = int(ring["y"])
+        half_w = max(int(ring.get("half_width", ring.get("r", 40))), 1)
+        x1 = max(center_x - half_w, 0)
+        x2 = min(center_x + half_w, w - 1)
+        cv2.line(preview, (x1, line_y), (x2, line_y), color, 3, cv2.LINE_AA)
+        cv2.drawMarker(
+            preview, (center_x, line_y), color, markerType=cv2.MARKER_CROSS, markerSize=14, thickness=2
+        )
+        label_pos = (max(center_x - 45, 0), max(line_y - 18, 20))
         cv2.putText(preview, f"Кольцо {idx + 1}", label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
 
     if possession_threshold and possession_threshold > 0:
@@ -948,13 +954,15 @@ def quick_player_scan(
             break
 
         detect_frame = enhance_frame_for_detection(frame) if enhance_quality else frame
+        track_conf = min(person_conf, ball_conf)
         results = model.track(
             detect_frame,
             persist=True,
             tracker=str(TRACKER_CONFIG_PATH),
             device=device,
             classes=[COCO_PERSON_CLASS_ID, COCO_BALL_CLASS_ID],
-            conf=min(person_conf, ball_conf),
+            conf=track_conf if track_conf > 0 else TRACK_CONF_DEFAULT,
+            iou=TRACK_IOU_DEFAULT,
             imgsz=imgsz,
             verbose=False,
         )
@@ -995,8 +1003,9 @@ def process_video(
     device: str,
     rings: List[RingZone],
     possession_threshold: float,
-    pass_max_time: float,
-    shot_cooldown: float,
+    pass_min_frames: int,
+    pass_max_frames: int,
+    goal_cooldown_frames: int,
     ball_memory_seconds: float,
     progress_bar,
     status_text,
@@ -1040,21 +1049,22 @@ def process_video(
 
     buffer_len = max(int(fps * BUFFER_SECONDS), 1)
     future_frames_needed = max(int(fps * FUTURE_SECONDS), 1)
-    shot_verdict_delay_frames = max(int(fps * SHOT_VERDICT_DELAY_SECONDS), 1)
     sample_every = max(int(fps // 2), 1)  # ~2 отсчёта в секунду для таймлайна отладки
 
     frame_buffer: Deque[Any] = deque(maxlen=buffer_len)
     ball_history: Deque[Tuple[float, float, float]] = deque(maxlen=BALL_HISTORY_MAXLEN)
+    ball_trajectory: Deque[Tuple[float, float]] = deque(maxlen=BALL_TRAJECTORY_DRAW_LEN)
     pending_highlights: List[PendingHighlight] = []
-    pending_shot_verdicts: List[Dict[str, Any]] = []
 
     stats: Dict[int, PlayerStats] = {}
     debug_log: Dict[str, List[Dict[str, Any]]] = {"ownership_changes": [], "sampled_timeline": []}
 
-    # Состояние владения мячом (для пасов и для "кто владел мячом перед броском").
+    # Состояние владения мячом (для пасов и для "кто владел мячом перед голом").
     last_owner: Optional[int] = None
-    last_owner_time: Optional[float] = None
-    last_shot_time_per_ring = [-1e9 for _ in rings]
+    pass_origin: Optional[int] = None
+    free_ball_frames: int = 0
+    last_goal_frame_per_ring = [-10**9 for _ in rings]
+    prev_ball_xy: Optional[Tuple[float, float]] = None
 
     # "Память" мяча: держим последнюю известную позицию, если детектор
     # временно "потерял" мяч (см. константу BALL_MEMORY_SECONDS_DEFAULT).
@@ -1088,13 +1098,15 @@ def process_video(
             # инференсе (per-class conf в ultralytics track()/predict() не
             # поддерживается), чтобы не потерять мяч на этапе NMS модели; более
             # строгая фильтрация по каждому классу — ниже, в parse_track_results.
+            track_conf = min(person_conf, ball_conf)
             results = model.track(
                 detect_frame,
                 persist=True,
                 tracker=tracker_path,
                 device=device,
                 classes=[COCO_PERSON_CLASS_ID, COCO_BALL_CLASS_ID],
-                conf=min(person_conf, ball_conf),
+                conf=track_conf if track_conf > 0 else TRACK_CONF_DEFAULT,
+                iou=TRACK_IOU_DEFAULT,
                 imgsz=imgsz,
                 verbose=False,
             )
@@ -1106,7 +1118,7 @@ def process_video(
                 persons = [(pid, tuple(v * inv_scale for v in box)) for pid, box in persons]
                 if ball is not None:
                     ball = (ball[0] * inv_scale, ball[1] * inv_scale)
-            annotated = draw_annotations(frame, persons, ball)
+            annotated = draw_annotations(frame, persons, ball, list(ball_trajectory))
         else:
             # Демо-режим: модель не загружена (нет интернета/GPU) — не роняем
             # приложение, просто прокатываем видео без детекций.
@@ -1130,9 +1142,9 @@ def process_video(
         # того, что виртуальное кольцо действительно "следует" за панорамой.
         if camera_transforms is not None:
             current_rings = compute_dynamic_rings(rings, camera_transforms, ring_reference_frame_idx, frame_idx)
-            annotated = draw_zones_preview(annotated, current_rings)
         else:
             current_rings = rings
+        annotated = draw_zones_preview(annotated, current_rings)
 
         # -------------------------------------------------------------
         # "ПАМЯТЬ" МЯЧА
@@ -1155,17 +1167,15 @@ def process_video(
 
         if effective_ball is not None:
             ball_history.append((t, effective_ball[0], effective_ball[1]))
+            ball_trajectory.append((effective_ball[0], effective_ball[1]))
 
         # -------------------------------------------------------------
         # ВЛАДЕНИЕ МЯЧОМ И ДЕТЕКЦИЯ ПЕРЕДАЧ (ПАСОВ)
         #
-        # Игрок считается владеющим мячом, если центр мяча находится не
-        # дальше possession_threshold пикселей от его рамки (0, если центр
-        # мяча внутри рамки). Если владелец сменился (мяч "долетел" от
-        # игрока А к игроку Б) в течение не более pass_max_time секунд —
-        # это успешная передача: игроку А засчитывается +1 пас. Все смены
-        # владения (в т.ч. отклонённые из-за долгого перелёта) логируются
-        # в debug_log для отладочного таймлайна в GUI.
+        # Игрок владеет мячом, если расстояние от центра мяча до его bbox
+        # меньше possession_threshold px (дефолт 90). Передача: Игрок_1 владел
+        # мячом → мяч летел без владельца pass_min_frames..pass_max_frames
+        # кадров → Игрок_2 получил владение → +1 пас Игроку_1.
         # -------------------------------------------------------------
         current_owner: Optional[int] = None
         if effective_ball is not None and persons:
@@ -1177,38 +1187,63 @@ def process_video(
             if best_dist is not None and best_dist > possession_threshold:
                 current_owner = None  # мяч ничейный/в полёте — слишком далеко от всех игроков
 
-        if current_owner is not None and current_owner != last_owner:
-            elapsed = (t - last_owner_time) if last_owner_time is not None else None
-            if last_owner is None:
-                reason = "первое владение в кадре"
-            elif elapsed is not None and PASS_MIN_TIME_SECONDS <= elapsed <= pass_max_time:
+        if current_owner is not None:
+            if (
+                pass_origin is not None
+                and pass_origin != current_owner
+                and pass_min_frames <= free_ball_frames <= pass_max_frames
+            ):
                 reason = "✅ передача засчитана"
-                stats.setdefault(last_owner, blank_stats())["passes"] += 1
-                stats.setdefault(current_owner, blank_stats())  # чтобы получатель тоже был в таблице
+                stats.setdefault(pass_origin, blank_stats())["passes"] += 1
+                stats.setdefault(current_owner, blank_stats())
                 pending_highlights.append(
                     PendingHighlight(
-                        filename=f"pass_from_ID{last_owner}_to_ID{current_owner}_frame_{frame_idx}.mp4",
+                        filename=f"pass_from_ID{pass_origin}_to_ID{current_owner}_frame_{frame_idx}.mp4",
                         past_frames=list(frame_buffer),
                         frames_needed=future_frames_needed,
                     )
                 )
-            else:
-                reason = f"❌ отклонено (Δt={elapsed:.2f}с > окно {pass_max_time:.2f}с)" if elapsed is not None else "❌ отклонено"
-
-            debug_log["ownership_changes"].append(
-                {
-                    "Кадр": frame_idx,
-                    "Время, с": round(t, 2),
-                    "От игрока": last_owner if last_owner is not None else "—",
-                    "К игроку": current_owner,
-                    "Δt, с": round(elapsed, 2) if elapsed is not None else None,
-                    "Результат": reason,
-                }
-            )
-
-        if current_owner is not None:
+                debug_log["ownership_changes"].append(
+                    {
+                        "Кадр": frame_idx,
+                        "Время, с": round(t, 2),
+                        "От игрока": pass_origin,
+                        "К игроку": current_owner,
+                        "Кадров без владельца": free_ball_frames,
+                        "Результат": reason,
+                    }
+                )
+            elif current_owner != last_owner:
+                reason = "смена владельца (не пас)"
+                if pass_origin is not None and free_ball_frames > 0:
+                    if free_ball_frames < pass_min_frames:
+                        reason = f"❌ отклонено (< {pass_min_frames} кадров без владельца)"
+                    elif free_ball_frames > pass_max_frames:
+                        reason = f"❌ отклонено (> {pass_max_frames} кадров без владельца)"
+                debug_log["ownership_changes"].append(
+                    {
+                        "Кадр": frame_idx,
+                        "Время, с": round(t, 2),
+                        "От игрока": last_owner if last_owner is not None else "—",
+                        "К игроку": current_owner,
+                        "Кадров без владельца": free_ball_frames if free_ball_frames else None,
+                        "Результат": reason,
+                    }
+                )
+            pass_origin = None
+            free_ball_frames = 0
             last_owner = current_owner
-            last_owner_time = t
+        elif effective_ball is not None:
+            if last_owner is not None:
+                if pass_origin is None:
+                    pass_origin = last_owner
+                free_ball_frames += 1
+                if free_ball_frames > pass_max_frames:
+                    pass_origin = None
+        else:
+            if free_ball_frames > pass_max_frames:
+                pass_origin = None
+                free_ball_frames = 0
 
         if frame_idx % sample_every == 0:
             debug_log["sampled_timeline"].append(
@@ -1219,56 +1254,38 @@ def process_video(
             )
 
         # -------------------------------------------------------------
-        # ЗОНЫ КОЛЕЦ: ФИКСАЦИЯ БРОСКА И ВЕРДИКТ "ГОЛ/ПРОМАХ"
-        #
-        # Если центр мяча входит в одну из окружностей колец (ring_center,
-        # ring_radius) и с прошлого события у ЭТОГО кольца прошло не меньше
-        # shot_cooldown секунд — регистрируем бросок. Бросок засчитывается
-        # игроку, который последним владел мячом (last_owner); если такого
-        # нет — ближайшему к кольцу игроку. Окончательный вердикт
-        # "попадание/промах" выносится чуть позже (см. pending_shot_verdicts)
-        # по направлению полёта мяча.
+        # ГОЛЫ: векторный анализ пересечения траектории мяча с горизонтальной
+        # линией кольца (сверху вниз). Кулдаун — goal_cooldown_frames кадров.
+        # Автором гола считается игрок, который последним владел мячом.
         # -------------------------------------------------------------
-        if effective_ball is not None:
+        if effective_ball is not None and prev_ball_xy is not None:
+            bx_prev, by_prev = prev_ball_xy
+            bx_curr, by_curr = effective_ball[0], effective_ball[1]
             for ring_idx, ring in enumerate(current_rings):
-                if not point_in_circle(effective_ball[0], effective_ball[1], ring["x"], ring["y"], ring["r"]):
+                half_w = ring.get("half_width", ring.get("r", 40.0))
+                if not segment_crosses_hoop_line_top_to_bottom(
+                    bx_prev, by_prev, bx_curr, by_curr, ring["y"], ring["x"], half_w
+                ):
                     continue
-                if (t - last_shot_time_per_ring[ring_idx]) < shot_cooldown:
+                if (frame_idx - last_goal_frame_per_ring[ring_idx]) < goal_cooldown_frames:
                     continue
-                last_shot_time_per_ring[ring_idx] = t
+                last_goal_frame_per_ring[ring_idx] = frame_idx
                 credited_player = last_owner
                 if credited_player is None:
                     credited_player = nearest_player_to_point(persons, (ring["x"], ring["y"]))
                 if credited_player is not None:
                     stats.setdefault(credited_player, blank_stats())["shots"] += 1
-                    pending_shot_verdicts.append(
-                        {
-                            "player": credited_player,
-                            "frames_left": shot_verdict_delay_frames,
-                            "frame_idx": frame_idx,
-                            "ring_idx": ring_idx,
-                            "ring_center": (ring["x"], ring["y"]),
-                            "ring_radius": ring["r"],
-                        }
-                    )
-
-        # Выносим вердикт по накопившимся броскам, у которых истекло время ожидания.
-        still_pending_verdicts = []
-        for verdict in pending_shot_verdicts:
-            verdict["frames_left"] -= 1
-            if verdict["frames_left"] <= 0:
-                if ball_is_falling_through(ball_history, verdict["ring_center"], verdict["ring_radius"]):
-                    stats[verdict["player"]]["makes"] += 1
+                    stats[credited_player]["makes"] += 1
                     pending_highlights.append(
                         PendingHighlight(
-                            filename=f"goal_ring{verdict['ring_idx'] + 1}_ID{verdict['player']}_frame_{verdict['frame_idx']}.mp4",
+                            filename=f"goal_ring{ring_idx + 1}_ID{credited_player}_frame_{frame_idx}.mp4",
                             past_frames=list(frame_buffer),
                             frames_needed=future_frames_needed,
                         )
                     )
-            else:
-                still_pending_verdicts.append(verdict)
-        pending_shot_verdicts = still_pending_verdicts
+
+        if effective_ball is not None:
+            prev_ball_xy = (effective_ball[0], effective_ball[1])
 
         # -------------------------------------------------------------
         # Буфер прошлого (для хайлайтов) и добор "будущих" кадров для уже
@@ -1353,9 +1370,10 @@ def init_session_state() -> None:
         "ring2_y": 0.0,
         "ring2_r": 40.0,
         "possession_threshold": float(POSSESSION_THRESHOLD_DEFAULT),
-        "pass_window": float(PASS_WINDOW_DEFAULT),
+        "pass_min_frames": int(PASS_MIN_FRAMES_DEFAULT),
+        "pass_max_frames": int(PASS_MAX_FRAMES_DEFAULT),
         "ball_memory": float(BALL_MEMORY_SECONDS_DEFAULT),
-        "shot_cooldown": float(SHOT_COOLDOWN_DEFAULT),
+        "goal_cooldown_frames": int(GOAL_COOLDOWN_FRAMES_DEFAULT),
         "enhance_quality": False,
         "person_conf": float(PERSON_CONF_DEFAULT),
         "ball_conf": float(BALL_CONF_DEFAULT),
@@ -1503,12 +1521,12 @@ def render_step2_zones(device: str) -> None:
         st.session_state["ring1_x"], st.session_state["ring1_y"], st.session_state["ring1_r"] = (
             int(ring1["x"]),
             int(ring1["y"]),
-            int(ring1["r"]),
+            int(ring1.get("half_width", ring1.get("r", 40))),
         )
         st.session_state["ring2_x"], st.session_state["ring2_y"], st.session_state["ring2_r"] = (
             int(ring2["x"]),
             int(ring2["y"]),
-            int(ring2["r"]),
+            int(ring2.get("half_width", ring2.get("r", 40))),
         )
         st.session_state["rings_initialized_for"] = video_path
 
@@ -1546,14 +1564,15 @@ def render_step2_zones(device: str) -> None:
             "для пересчёта сдвинется вместе с ней."
         )
 
-    st.subheader("🎯 Зоны обоих колец")
+    st.subheader("🎯 Линии обоих колец")
     if streamlit_image_coordinates is not None and cv2 is not None:
         st.caption(
-            "Кликните по превью, чтобы поставить центр выбранного кольца, либо используйте "
+            "Кликните по превью, чтобы задать центр и Y горизонтальной линии выбранного кольца "
+            "(линия рисуется горизонтально через заданную полуширину), либо используйте "
             "числовые поля ниже для точной донастройки."
         )
         st.session_state["click_target_ring"] = st.radio(
-            "Клик по превью ставит центр:", ["Кольцо 1", "Кольцо 2"],
+            "Клик по превью ставит линию кольца:", ["Кольцо 1", "Кольцо 2"],
             horizontal=True, key="click_target_ring_radio",
             index=0 if st.session_state.get("click_target_ring", "Кольцо 1") == "Кольцо 1" else 1,
         )
@@ -1577,8 +1596,16 @@ def render_step2_zones(device: str) -> None:
     # ring_click_triggered_rerun до конца функции — см. комментарий там.
     if frame is not None:
         rings = [
-            {"x": st.session_state["ring1_x"], "y": st.session_state["ring1_y"], "r": st.session_state["ring1_r"]},
-            {"x": st.session_state["ring2_x"], "y": st.session_state["ring2_y"], "r": st.session_state["ring2_r"]},
+            {
+                "x": st.session_state["ring1_x"],
+                "y": st.session_state["ring1_y"],
+                "half_width": st.session_state["ring1_r"],
+            },
+            {
+                "x": st.session_state["ring2_x"],
+                "y": st.session_state["ring2_y"],
+                "half_width": st.session_state["ring2_r"],
+            },
         ]
         preview_bgr = draw_zones_preview(frame, rings, possession_threshold=st.session_state["possession_threshold"])
         preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
@@ -1628,8 +1655,9 @@ def render_step2_zones(device: str) -> None:
             "Y1 (px)", min_value=0, max_value=int(meta["height"]), value=int(st.session_state["ring1_y"]), key="ring1_y"
         )
         st.number_input(
-            "Радиус 1 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
+            "Полуширина линии 1 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
             value=int(st.session_state["ring1_r"]), key="ring1_r",
+            help="Половина длины горизонтального отрезка линии кольца (от центра влево/вправо).",
         )
     with col2:
         st.markdown("**Кольцо №2**")
@@ -1640,8 +1668,9 @@ def render_step2_zones(device: str) -> None:
             "Y2 (px)", min_value=0, max_value=int(meta["height"]), value=int(st.session_state["ring2_y"]), key="ring2_y"
         )
         st.number_input(
-            "Радиус 2 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
+            "Полуширина линии 2 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
             value=int(st.session_state["ring2_r"]), key="ring2_r",
+            help="Половина длины горизонтального отрезка линии кольца (от центра влево/вправо).",
         )
 
     colcal1, colcal2 = st.columns([3, 1])
@@ -1678,13 +1707,21 @@ def render_step2_zones(device: str) -> None:
             help="Максимальное расстояние от центра мяча до рамки игрока, при котором игрок считается владеющим мячом.",
         )
     with c2:
-        st.session_state["pass_window"] = st.slider(
-            "Максимальное время передачи (сек)",
-            min_value=PASS_WINDOW_MIN,
-            max_value=PASS_WINDOW_MAX,
-            value=float(st.session_state["pass_window"]),
-            step=0.1,
-            help="Сколько секунд может лететь мяч от одного игрока к другому, чтобы это засчиталось как пас.",
+        st.session_state["pass_min_frames"] = st.slider(
+            "Мин. кадров без владельца для паса",
+            min_value=PASS_MIN_FRAMES_MIN,
+            max_value=PASS_MIN_FRAMES_MAX,
+            value=int(st.session_state["pass_min_frames"]),
+            step=1,
+            help="Мяч должен лететь без владельца не меньше этого числа кадров (дефолт 10).",
+        )
+        st.session_state["pass_max_frames"] = st.slider(
+            "Макс. кадров без владельца для паса",
+            min_value=PASS_MAX_FRAMES_MIN,
+            max_value=PASS_MAX_FRAMES_MAX,
+            value=int(st.session_state["pass_max_frames"]),
+            step=1,
+            help="Если мяч без владельца дольше — передача не засчитывается (дефолт 60).",
         )
     with c3:
         st.session_state["ball_memory"] = st.slider(
@@ -1696,13 +1733,13 @@ def render_step2_zones(device: str) -> None:
             help="Сколько секунд считать мяч в последней известной точке, если детектор его временно не находит.",
         )
 
-    st.session_state["shot_cooldown"] = st.slider(
-        "Кулдаун события у кольца (сек)",
-        min_value=SHOT_COOLDOWN_MIN,
-        max_value=SHOT_COOLDOWN_MAX,
-        value=float(st.session_state["shot_cooldown"]),
-        step=0.5,
-        help="Минимальный промежуток между двумя засчитанными бросками у одного и того же кольца.",
+    st.session_state["goal_cooldown_frames"] = st.slider(
+        "Кулдаун гола у кольца (кадры)",
+        min_value=GOAL_COOLDOWN_FRAMES_MIN,
+        max_value=GOAL_COOLDOWN_FRAMES_MAX,
+        value=int(st.session_state["goal_cooldown_frames"]),
+        step=5,
+        help="Минимальный промежуток в кадрах между двумя голами у одного кольца (дефолт 90 ≈ 3 сек при 30 fps).",
     )
 
     st.subheader("🏀 Детекция мяча и производительность")
@@ -1928,8 +1965,16 @@ def run_full_analysis(video_path: str, device: str) -> None:
         )
 
     rings = [
-        {"x": st.session_state["ring1_x"], "y": st.session_state["ring1_y"], "r": st.session_state["ring1_r"]},
-        {"x": st.session_state["ring2_x"], "y": st.session_state["ring2_y"], "r": st.session_state["ring2_r"]},
+        {
+            "x": st.session_state["ring1_x"],
+            "y": st.session_state["ring1_y"],
+            "half_width": st.session_state["ring1_r"],
+        },
+        {
+            "x": st.session_state["ring2_x"],
+            "y": st.session_state["ring2_y"],
+            "half_width": st.session_state["ring2_r"],
+        },
     ]
 
     camera_transforms: Optional[List[np.ndarray]] = None
@@ -1956,8 +2001,9 @@ def run_full_analysis(video_path: str, device: str) -> None:
             device=device,
             rings=rings,
             possession_threshold=float(st.session_state["possession_threshold"]),
-            pass_max_time=float(st.session_state["pass_window"]),
-            shot_cooldown=float(st.session_state["shot_cooldown"]),
+            pass_min_frames=int(st.session_state["pass_min_frames"]),
+            pass_max_frames=int(st.session_state["pass_max_frames"]),
+            goal_cooldown_frames=int(st.session_state["goal_cooldown_frames"]),
             ball_memory_seconds=float(st.session_state["ball_memory"]),
             progress_bar=progress_bar,
             status_text=status_text,
@@ -2073,14 +2119,14 @@ def render_step4_run(device: str) -> None:
     with st.expander("⚙️ Текущие настройки анализа", expanded=False):
         st.write(
             f"Кольцо 1: X={int(st.session_state['ring1_x'])}, Y={int(st.session_state['ring1_y'])}, "
-            f"R={int(st.session_state['ring1_r'])} · Кольцо 2: X={int(st.session_state['ring2_x'])}, "
-            f"Y={int(st.session_state['ring2_y'])}, R={int(st.session_state['ring2_r'])}"
+            f"полуширина={int(st.session_state['ring1_r'])} · Кольцо 2: X={int(st.session_state['ring2_x'])}, "
+            f"Y={int(st.session_state['ring2_y'])}, полуширина={int(st.session_state['ring2_r'])}"
         )
         st.write(
             f"Порог владения: {int(st.session_state['possession_threshold'])} px · "
-            f"Окно передачи: {st.session_state['pass_window']:.1f} с · "
+            f"Окно паса: {int(st.session_state['pass_min_frames'])}–{int(st.session_state['pass_max_frames'])} кадров · "
             f"Память мяча: {st.session_state['ball_memory']:.2f} с · "
-            f"Кулдаун кольца: {st.session_state['shot_cooldown']:.1f} с"
+            f"Кулдаун гола: {int(st.session_state['goal_cooldown_frames'])} кадров"
         )
         st.write(
             "Улучшение качества кадра перед детекцией: "
@@ -2134,7 +2180,7 @@ def main() -> None:
     init_session_state()
 
     st.title("🏀 Basketball Tracking Analytics")
-    st.caption("Офлайн-аналитика баскетбольных тренировок по видео со статичной камеры (YOLO11x + BoT-SORT/ReID)")
+    st.caption("Офлайн-аналитика баскетбольных тренировок по видео со статичной камеры (YOLO11x + ByteTrack)")
 
     device, device_message, device_ok = resolve_device()
     if device_ok:
