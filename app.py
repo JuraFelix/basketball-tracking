@@ -230,6 +230,16 @@ BALL_SOURCE_COLORS_BGR = {
     "interp": (0, 255, 255),
     "kalman": (180, 255, 255),
 }
+# Яркая траектория мяча на аннотированном видео (BGR).
+BALL_TRAJECTORY_COLOR_BGR = (255, 0, 255)
+BALL_TRAJECTORY_THICKNESS = 5
+
+# Appearance-matching поверх ByteTrack (гистограмма HSV майки, без ReID).
+APPEARANCE_SIMILARITY_DEFAULT = 0.72
+APPEARANCE_SIMILARITY_MIN = 0.50
+APPEARANCE_SIMILARITY_MAX = 0.95
+APPEARANCE_LOST_BUFFER_FRAMES = 180
+APPEARANCE_HIST_EMA_ALPHA = 0.35
 
 # --- Режим камеры ---
 # "Статичная камера" — исходное поведение (зоны колец фиксированы во всех
@@ -618,12 +628,36 @@ def id_to_color(pid: int) -> Tuple[int, int, int]:
     return int(bgr_pixel[0]), int(bgr_pixel[1]), int(bgr_pixel[2])
 
 
+def draw_hoop_lines_on_frame(frame: Any, rings: List[RingZone]) -> Any:
+    """Рисует горизонтальные линии колец на кадре (для аннотированного видео)."""
+    h, w = frame.shape[:2]
+    colors = [(0, 140, 255), (255, 80, 0)]
+    for idx, ring in enumerate(rings):
+        color = colors[idx % len(colors)]
+        center_x = int(ring["x"])
+        line_y = int(ring["y"])
+        half_w = max(int(ring.get("half_width", ring.get("r", 40))), 1)
+        x1 = max(center_x - half_w, 0)
+        x2 = min(center_x + half_w, w - 1)
+        cv2.line(frame, (x1, line_y), (x2, line_y), color, 4, cv2.LINE_AA)
+        cv2.drawMarker(
+            frame, (center_x, line_y), color, markerType=cv2.MARKER_CROSS, markerSize=16, thickness=2
+        )
+        label_pos = (max(center_x - 45, 0), max(line_y - 22, 22))
+        cv2.putText(
+            frame, f"Кольцо {idx + 1}", label_pos,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA,
+        )
+    return frame
+
+
 def draw_annotations(
     frame,
     persons: List[Tuple[int, Tuple[float, float, float, float]]],
     ball: Optional[Tuple[float, float]],
     ball_trajectory: Optional[List[Tuple[float, float]]] = None,
     ball_source: Optional[str] = None,
+    excluded_ids: Optional[set] = None,
 ):
     """Рисует рамки игроков (с ID), траекторию мяча и маркер мяча на копии кадра.
 
@@ -633,15 +667,25 @@ def draw_annotations(
     получилось бы в другом разрешении, чем входное.
     """
     annotated = frame.copy()
-    if ball_trajectory and len(ball_trajectory) >= 2:
-        pts = [(int(x), int(y)) for x, y in ball_trajectory]
-        for i in range(1, len(pts)):
-            cv2.line(annotated, pts[i - 1], pts[i], (0, 255, 255), 3, cv2.LINE_AA)
+    excluded_ids = excluded_ids or set()
+    traj_pts: List[Tuple[int, int]] = []
+    if ball_trajectory:
+        traj_pts = [(int(x), int(y)) for x, y in ball_trajectory]
+    if ball is not None:
+        traj_pts.append((int(ball[0]), int(ball[1])))
+    if len(traj_pts) >= 2:
+        for i in range(1, len(traj_pts)):
+            cv2.line(
+                annotated, traj_pts[i - 1], traj_pts[i],
+                BALL_TRAJECTORY_COLOR_BGR, BALL_TRAJECTORY_THICKNESS, cv2.LINE_AA,
+            )
     for pid, (x1, y1, x2, y2) in persons:
-        color = id_to_color(pid)
+        excluded = pid in excluded_ids
+        color = (128, 128, 128) if excluded else id_to_color(pid)
         p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
-        cv2.rectangle(annotated, p1, p2, color, 2)
-        label = f"ID {pid}"
+        thickness = 1 if excluded else 2
+        cv2.rectangle(annotated, p1, p2, color, thickness)
+        label = f"ID {pid}" + (" [excl]" if excluded else "")
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         label_y1 = max(p1[1] - th - 8, 0)
         cv2.rectangle(annotated, (p1[0], label_y1), (p1[0] + tw + 6, p1[1]), color, -1)
@@ -1079,6 +1123,103 @@ class BallTracker:
         return None
 
 
+def extract_jersey_histogram(
+    frame_bgr: Any, box: Tuple[float, float, float, float]
+) -> Optional[np.ndarray]:
+    """HSV-гистограмма верхней части bbox (майка) для appearance-matching."""
+    if cv2 is None or frame_bgr is None:
+        return None
+    x1, y1, x2, y2 = box
+    h = max(y2 - y1, 1.0)
+    torso_y2 = y1 + h * 0.55
+    xi1, yi1 = max(int(x1), 0), max(int(y1), 0)
+    xi2, yi2 = min(int(x2), frame_bgr.shape[1]), min(int(torso_y2), frame_bgr.shape[0])
+    if xi2 <= xi1 or yi2 <= yi1:
+        return None
+    crop = frame_bgr[yi1:yi2, xi1:xi2]
+    if crop.size == 0:
+        return None
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist.flatten().astype(np.float32)
+
+
+def histogram_similarity(h1: np.ndarray, h2: np.ndarray) -> float:
+    return float(cv2.compareHist(h1.reshape(-1, 1), h2.reshape(-1, 1), cv2.HISTCMP_CORREL))
+
+
+class AppearanceMerger:
+    """Post-process поверх ByteTrack: склейка новых ID с недавно пропавшими по похожести майки."""
+
+    def __init__(
+        self,
+        similarity_threshold: float = APPEARANCE_SIMILARITY_DEFAULT,
+        lost_buffer_frames: int = APPEARANCE_LOST_BUFFER_FRAMES,
+    ) -> None:
+        self.similarity_threshold = similarity_threshold
+        self.lost_buffer_frames = lost_buffer_frames
+        self.raw_to_canonical: Dict[int, int] = {}
+        self.histograms: Dict[int, np.ndarray] = {}
+        self.last_seen: Dict[int, int] = {}
+        self.active_canonical: set = set()
+        self.merge_log: List[Dict[str, Any]] = []
+
+    def _update_histogram(self, canonical_id: int, hist: np.ndarray) -> None:
+        prev = self.histograms.get(canonical_id)
+        if prev is None:
+            self.histograms[canonical_id] = hist.copy()
+        else:
+            alpha = APPEARANCE_HIST_EMA_ALPHA
+            self.histograms[canonical_id] = (1.0 - alpha) * prev + alpha * hist
+
+    def _match_lost(self, hist: np.ndarray, frame_idx: int) -> Optional[int]:
+        best_id: Optional[int] = None
+        best_sim = -1.0
+        for canonical_id, app_hist in self.histograms.items():
+            if canonical_id in self.active_canonical:
+                continue
+            if frame_idx - self.last_seen.get(canonical_id, -10**9) > self.lost_buffer_frames:
+                continue
+            sim = histogram_similarity(hist, app_hist)
+            if sim >= self.similarity_threshold and sim > best_sim:
+                best_sim = sim
+                best_id = canonical_id
+        return best_id
+
+    def remap(
+        self,
+        frame_idx: int,
+        frame_bgr: Any,
+        persons: List[Tuple[int, Tuple[float, float, float, float]]],
+    ) -> List[Tuple[int, Tuple[float, float, float, float]]]:
+        self.active_canonical = set()
+        remapped: List[Tuple[int, Tuple[float, float, float, float]]] = []
+        for raw_id, box in persons:
+            hist = extract_jersey_histogram(frame_bgr, box)
+            if raw_id in self.raw_to_canonical:
+                canonical_id = self.raw_to_canonical[raw_id]
+            else:
+                canonical_id = self._match_lost(hist, frame_idx) if hist is not None else None
+                if canonical_id is None:
+                    canonical_id = int(raw_id)
+                elif canonical_id != raw_id:
+                    self.merge_log.append(
+                        {
+                            "Кадр": frame_idx,
+                            "Новый ID трекера": int(raw_id),
+                            "Склеен с ID": int(canonical_id),
+                        }
+                    )
+                self.raw_to_canonical[raw_id] = canonical_id
+            if hist is not None:
+                self._update_histogram(canonical_id, hist)
+            self.last_seen[canonical_id] = frame_idx
+            self.active_canonical.add(canonical_id)
+            remapped.append((canonical_id, box))
+        return remapped
+
+
 def detect_yolo_ball_on_frame(
     frame: Any,
     model,
@@ -1218,7 +1359,8 @@ def quick_player_scan(
     person_conf: float = PERSON_CONF_DEFAULT,
     ball_conf: float = BALL_CONF_DEFAULT,
     imgsz: int = IMGSZ_DEFAULT,
-) -> Dict[int, Any]:
+    appearance_similarity: float = APPEARANCE_SIMILARITY_DEFAULT,
+) -> Tuple[Dict[int, Any], List[Dict[str, Any]]]:
     """Короткий прогон трекера по первым max_seconds секундам видео.
 
     Цель — не полноценная аналитика, а быстрый сбор всех уникальных ID
@@ -1231,13 +1373,14 @@ def quick_player_scan(
     reset_tracker).
     """
     if model is None or cv2 is None:
-        return {}
+        return {}, []
 
     reset_tracker(model)
+    appearance = AppearanceMerger(similarity_threshold=appearance_similarity)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return {}
+        return {}, []
 
     fps = fps_hint or 25.0
     max_frames = max(int(fps * max_seconds), 1)
@@ -1262,32 +1405,30 @@ def quick_player_scan(
             imgsz=imgsz,
             verbose=False,
         )
-        result = results[0]
-        boxes = result.boxes
-        if boxes is not None and boxes.id is not None and len(boxes) > 0:
-            xyxy = boxes.xyxy.cpu().numpy()
-            cls = boxes.cls.cpu().numpy().astype(int)
-            ids = boxes.id.cpu().numpy().astype(int)
-            confs = boxes.conf.cpu().numpy()
-            h, w = detect_frame.shape[:2]
-            for box, c, tid, conf in zip(xyxy, cls, ids, confs):
-                if c != COCO_PERSON_CLASS_ID or float(conf) < person_conf:
-                    continue
-                x1, y1, x2, y2 = [int(v) for v in box]
-                area = max(x2 - x1, 0) * max(y2 - y1, 0)
-                score = float(conf) * area
-                prev = best_crops.get(int(tid))
-                if prev is None or score > prev[0]:
-                    x1c, y1c = max(x1, 0), max(y1, 0)
-                    x2c, y2c = min(x2, w), min(y2, h)
-                    crop = detect_frame[y1c:y2c, x1c:x2c].copy()
-                    if crop.size > 0:
-                        best_crops[int(tid)] = (score, crop)
+        persons, _, _ = parse_track_results(
+            results, person_conf_threshold=person_conf, ball_conf_threshold=ball_conf
+        )
+        if enhance_quality:
+            inv_scale = 1.0 / ENHANCE_UPSCALE_FACTOR
+            persons = [(pid, tuple(v * inv_scale for v in box)) for pid, box in persons]
+        persons = appearance.remap(frame_idx, frame, persons)
+        h, w = frame.shape[:2]
+        for pid, box in persons:
+            x1, y1, x2, y2 = [int(v) for v in box]
+            area = max(x2 - x1, 0) * max(y2 - y1, 0)
+            score = float(area)
+            prev = best_crops.get(int(pid))
+            if prev is None or score > prev[0]:
+                x1c, y1c = max(x1, 0), max(y1, 0)
+                x2c, y2c = min(x2, w), min(y2, h)
+                crop = frame[y1c:y2c, x1c:x2c].copy()
+                if crop.size > 0:
+                    best_crops[int(pid)] = (score, crop)
         frame_idx += 1
 
     cap.release()
     reset_tracker(model)  # не оставляем состояние "подвешенным" перед шагом 4
-    return {tid: crop for tid, (_, crop) in best_crops.items()}
+    return {tid: crop for tid, (_, crop) in best_crops.items()}, appearance.merge_log
 
 
 # ---------------------------------------------------------------------------
@@ -1313,6 +1454,8 @@ def process_video(
     max_predict_frames: int = BALL_MAX_PREDICT_FRAMES_DEFAULT,
     color_fallback: bool = BALL_COLOR_FALLBACK_DEFAULT,
     color_roi_half: int = BALL_COLOR_ROI_HALF_DEFAULT,
+    appearance_similarity: float = APPEARANCE_SIMILARITY_DEFAULT,
+    excluded_player_ids: Optional[set] = None,
     camera_transforms: Optional[List[np.ndarray]] = None,
     ring_reference_frame_idx: int = 0,
 ) -> Tuple[Dict[int, PlayerStats], Path, Dict[str, List[Dict[str, Any]]]]:
@@ -1369,6 +1512,8 @@ def process_video(
         color_fallback=color_fallback,
         color_roi_half=color_roi_half,
     )
+    appearance_merger = AppearanceMerger(similarity_threshold=appearance_similarity)
+    excluded_ids: set = set(excluded_player_ids or [])
 
     # Состояние владения мячом (для пасов и для "кто владел мячом перед голом").
     last_owner: Optional[int] = None
@@ -1426,18 +1571,14 @@ def process_video(
                 persons = [(pid, tuple(v * inv_scale for v in box)) for pid, box in persons]
                 if yolo_ball is not None:
                     yolo_ball = (yolo_ball[0] * inv_scale, yolo_ball[1] * inv_scale)
+            persons = appearance_merger.remap(frame_idx, frame, persons)
             ball_state = ball_tracker.update(frame_idx, frame, yolo_ball, yolo_ball_conf, persons)
             if ball_state is not None:
                 ball = (ball_state.x, ball_state.y)
                 ball_source = ball_state.source
-            annotated = draw_annotations(
-                frame, persons, ball, list(ball_trajectory), ball_source=ball_source
-            )
         else:
-            # Демо-режим: модель не загружена (нет интернета/GPU) — не роняем
-            # приложение, просто прокатываем видео без детекций.
-            annotated = frame.copy()
             persons = []
+            annotated = frame.copy()
             cv2.putText(
                 annotated,
                 "DEMO MODE: model YOLO not loaded",
@@ -1449,23 +1590,25 @@ def process_video(
                 cv2.LINE_AA,
             )
 
-        # Режим "камера в движении": пересчитываем позиции зон колец под
-        # текущий кадр относительно кадра, на котором они были заданы
-        # (см. compute_dynamic_rings), и рисуем их на аннотированном кадре —
-        # это одновременно и логика события (ниже), и визуальное подтверждение
-        # того, что виртуальное кольцо действительно "следует" за панорамой.
         if camera_transforms is not None:
             current_rings = compute_dynamic_rings(rings, camera_transforms, ring_reference_frame_idx, frame_idx)
         else:
             current_rings = rings
-        annotated = draw_zones_preview(annotated, current_rings)
 
-        # Устойчивый мяч: YOLO + Kalman/интерполяция + цветовой fallback (BallTracker).
         effective_ball: Optional[Tuple[float, float]] = ball
-
         if effective_ball is not None:
             ball_history.append((t, effective_ball[0], effective_ball[1]))
             ball_trajectory.append((effective_ball[0], effective_ball[1]))
+
+        event_persons = [(pid, box) for pid, box in persons if pid not in excluded_ids]
+        if model is not None:
+            annotated = draw_annotations(
+                frame, persons, effective_ball, list(ball_trajectory),
+                ball_source=ball_source, excluded_ids=excluded_ids,
+            )
+            annotated = draw_hoop_lines_on_frame(annotated, current_rings)
+        elif effective_ball is not None:
+            annotated = draw_hoop_lines_on_frame(annotated, current_rings)
 
         # -------------------------------------------------------------
         # ВЛАДЕНИЕ МЯЧОМ И ДЕТЕКЦИЯ ПЕРЕДАЧ (ПАСОВ)
@@ -1476,9 +1619,9 @@ def process_video(
         # кадров → Игрок_2 получил владение → +1 пас Игроку_1.
         # -------------------------------------------------------------
         current_owner: Optional[int] = None
-        if effective_ball is not None and persons:
+        if effective_ball is not None and event_persons:
             best_dist = None
-            for pid, box in persons:
+            for pid, box in event_persons:
                 d = distance_point_to_bbox(effective_ball[0], effective_ball[1], box)
                 if best_dist is None or d < best_dist:
                     best_dist, current_owner = d, pid
@@ -1488,6 +1631,8 @@ def process_video(
         if current_owner is not None:
             if (
                 pass_origin is not None
+                and pass_origin not in excluded_ids
+                and current_owner not in excluded_ids
                 and pass_origin != current_owner
                 and pass_min_frames <= free_ball_frames <= pass_max_frames
             ):
@@ -1532,7 +1677,7 @@ def process_video(
             free_ball_frames = 0
             last_owner = current_owner
         elif effective_ball is not None:
-            if last_owner is not None:
+            if last_owner is not None and last_owner not in excluded_ids:
                 if pass_origin is None:
                     pass_origin = last_owner
                 free_ball_frames += 1
@@ -1574,8 +1719,8 @@ def process_video(
                 last_goal_frame_per_ring[ring_idx] = frame_idx
                 credited_player = last_owner
                 if credited_player is None:
-                    credited_player = nearest_player_to_point(persons, (ring["x"], ring["y"]))
-                if credited_player is not None:
+                    credited_player = nearest_player_to_point(event_persons, (ring["x"], ring["y"]))
+                if credited_player is not None and credited_player not in excluded_ids:
                     stats.setdefault(credited_player, blank_stats())["shots"] += 1
                     stats[credited_player]["makes"] += 1
                     pending_highlights.append(
@@ -1621,6 +1766,8 @@ def process_video(
     cap.release()
     writer.release()
     output_path = reencode_for_browser(output_path)
+    if appearance_merger.merge_log:
+        debug_log["id_merges"] = appearance_merger.merge_log
     return stats, output_path, debug_log
 
 
@@ -1628,16 +1775,20 @@ def build_box_score(
     stats: Dict[int, PlayerStats],
     player_names: Optional[Dict[int, str]] = None,
     player_numbers: Optional[Dict[int, str]] = None,
+    excluded_player_ids: Optional[set] = None,
 ) -> pd.DataFrame:
     """Формирует итоговую таблицу статистики (Box Score) по игрокам."""
     player_names = player_names or {}
     player_numbers = player_numbers or {}
+    excluded = excluded_player_ids or set()
     columns = ["ID игрока", "Имя", "Номер", "Броски", "Попадания", "Точность (%)", "Сделано передач"]
     if not stats:
         return pd.DataFrame(columns=columns)
 
     rows = []
     for pid, s in sorted(stats.items()):
+        if pid in excluded:
+            continue
         shots, makes, passes = s["shots"], s["makes"], s["passes"]
         accuracy = round(100.0 * makes / shots, 1) if shots else 0.0
         name = (player_names.get(pid) or "").strip() or f"Игрок {pid}"
@@ -1697,6 +1848,9 @@ def init_session_state() -> None:
         "box_score_df": None,
         "debug_log": None,
         "last_output_video": None,
+        "excluded_player_ids": [],
+        "appearance_similarity": float(APPEARANCE_SIMILARITY_DEFAULT),
+        "id_merge_log": [],
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1716,8 +1870,17 @@ def reset_for_new_video() -> None:
         "auto_threshold_computed_for",
         "_last_ring_click_time",
         "ball_diagnostics",
+        "excluded_player_ids",
+        "id_merge_log",
     ):
-        st.session_state[key] = {} if key in ("player_crops", "player_names", "player_numbers") else None
+        if key in ("player_crops", "player_names", "player_numbers"):
+            st.session_state[key] = {}
+        elif key == "excluded_player_ids":
+            st.session_state[key] = []
+        elif key == "id_merge_log":
+            st.session_state[key] = []
+        else:
+            st.session_state[key] = None
 
 
 def go_to_step(step: int) -> None:
@@ -2118,6 +2281,16 @@ def render_step2_zones(device: str) -> None:
             help="Окно поиска оранжевого blob вокруг последней позиции мяча.",
         )
 
+    st.session_state["appearance_similarity"] = st.slider(
+        "Порог похожести игроков (склейка ID)",
+        min_value=APPEARANCE_SIMILARITY_MIN,
+        max_value=APPEARANCE_SIMILARITY_MAX,
+        value=float(st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)),
+        step=0.01,
+        help="Чем выше — тем агрессивнее ByteTrack-ID склеиваются по цвету майки, если игрок "
+        "временно пропал из кадра. Снижайте, если разных игроков ошибочно объединяет.",
+    )
+
     st.subheader("🔧 Качество детекции")
     st.session_state["enhance_quality"] = st.checkbox(
         "Улучшить качество кадра перед детекцией (апскейл + резкость)",
@@ -2190,14 +2363,18 @@ def render_step3_players(device: str) -> None:
             )
         else:
             with st.spinner("Сканирование..."):
-                crops = quick_player_scan(
+                crops, merge_log = quick_player_scan(
                     video_path, model, device, max_seconds=scan_seconds, fps_hint=meta["fps"],
                     enhance_quality=st.session_state.get("enhance_quality", False),
                     person_conf=float(st.session_state.get("person_conf", PERSON_CONF_DEFAULT)),
                     ball_conf=float(st.session_state.get("ball_conf", BALL_CONF_DEFAULT)),
                     imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
+                    appearance_similarity=float(
+                        st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)
+                    ),
                 )
             st.session_state["player_crops"] = crops
+            st.session_state["id_merge_log"] = merge_log
             if not crops:
                 st.warning("Игроки не найдены за это время — попробуйте увеличить длительность сканирования.")
             else:
@@ -2218,6 +2395,11 @@ def render_step3_players(device: str) -> None:
                     with st.container(border=True):
                         resized_crop = resize_crop_to_height(crops[pid], CROP_DISPLAY_HEIGHT)
                         st.image(cv2.cvtColor(resized_crop, cv2.COLOR_BGR2RGB), caption=f"ID {pid}")
+                        st.checkbox(
+                            "Исключить из статистики",
+                            key=f"exclude_player_{pid}",
+                            value=pid in (st.session_state.get("excluded_player_ids") or []),
+                        )
                         st.text_input("Имя", key=f"player_name_{pid}", placeholder=f"Игрок {pid}", label_visibility="collapsed")
                         st.text_input("Номер", key=f"player_number_{pid}", placeholder="Номер", label_visibility="collapsed")
     else:
@@ -2225,6 +2407,12 @@ def render_step3_players(device: str) -> None:
             "Пока нет данных — запустите сканирование выше, либо пропустите этот шаг: "
             "в итоговой таблице игроки будут отображаться как «Игрок {ID}»."
         )
+
+    merge_log = st.session_state.get("id_merge_log") or []
+    if merge_log:
+        with st.expander(f"🔗 Склейки ID по внешнему виду ({len(merge_log)})", expanded=False):
+            st.dataframe(pd.DataFrame(merge_log), use_container_width=True, hide_index=True)
+            st.caption("Новые ID трекера, переназначенные на ранее виденный ID (appearance-matching).")
 
     st.divider()
     st.subheader("🏀 Диагностика видимости мяча")
@@ -2298,9 +2486,13 @@ def render_step3_players(device: str) -> None:
             go_to_step(2)
     with colB:
         if st.button("Далее → Полный анализ", type="primary"):
+            excluded: List[int] = []
             for pid in crops.keys():
                 st.session_state["player_names"][pid] = st.session_state.get(f"player_name_{pid}", "")
                 st.session_state["player_numbers"][pid] = st.session_state.get(f"player_number_{pid}", "")
+                if st.session_state.get(f"exclude_player_{pid}", False):
+                    excluded.append(pid)
+            st.session_state["excluded_player_ids"] = excluded
             go_to_step(4)
 
 
@@ -2373,6 +2565,10 @@ def run_full_analysis(video_path: str, device: str) -> None:
             max_predict_frames=int(st.session_state.get("ball_max_predict_frames", BALL_MAX_PREDICT_FRAMES_DEFAULT)),
             color_fallback=bool(st.session_state.get("ball_color_fallback", BALL_COLOR_FALLBACK_DEFAULT)),
             color_roi_half=int(st.session_state.get("ball_color_roi_half", BALL_COLOR_ROI_HALF_DEFAULT)),
+            appearance_similarity=float(
+                st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)
+            ),
+            excluded_player_ids=set(st.session_state.get("excluded_player_ids") or []),
             camera_transforms=camera_transforms,
             ring_reference_frame_idx=ring_reference_frame_idx,
         )
@@ -2382,7 +2578,10 @@ def run_full_analysis(video_path: str, device: str) -> None:
 
     status_text.text("Обработка завершена ✅")
     st.session_state["box_score_df"] = build_box_score(
-        stats, st.session_state.get("player_names"), st.session_state.get("player_numbers")
+        stats,
+        st.session_state.get("player_names"),
+        st.session_state.get("player_numbers"),
+        excluded_player_ids=set(st.session_state.get("excluded_player_ids") or []),
     )
     st.session_state["last_output_video"] = str(output_path)
     st.session_state["debug_log"] = debug_log
@@ -2519,7 +2718,15 @@ def render_step4_run(device: str) -> None:
                 f"средняя дыра {diag.get('avg_gap_frames', 0):.1f} кадр."
             )
         n_players = len(st.session_state.get("player_names") or {})
-        st.write(f"Сопоставлено игроков (имя/номер): {n_players}")
+        n_excl = len(st.session_state.get("excluded_player_ids") or [])
+        st.write(
+            f"Сопоставлено игроков (имя/номер): {n_players}"
+            + (f" · исключено из статистики: {n_excl}" if n_excl else "")
+        )
+        st.write(
+            f"Порог похожести игроков (склейка ID): "
+            f"{float(st.session_state.get('appearance_similarity', APPEARANCE_SIMILARITY_DEFAULT)):.2f}"
+        )
 
     if st.button("🚀 Запустить полный анализ", type="primary"):
         run_full_analysis(video_path, device)
@@ -2560,14 +2767,12 @@ def main() -> None:
         st.warning(device_message)
 
     with st.sidebar:
-        st.header("ℹ️ Конфигурация трекера")
-        st.caption(f"Файл: `{TRACKER_CONFIG_PATH.name}` (генерируется автоматически)")
-        if TRACKER_CONFIG_PATH.exists():
-            st.code(TRACKER_CONFIG_PATH.read_text(encoding="utf-8"), language="yaml")
-        st.caption(
-            "Пошаговый процесс: загрузка видео → зоны колец и пороги → сопоставление "
-            "игроков → полный анализ. Переключайтесь между шагами кнопками «Назад/Далее»."
-        )
+        st.markdown("## 🏀 Basketball Tracking")
+        st.caption("Офлайн-аналитика тренировок")
+        if device_ok:
+            st.success("CUDA доступна")
+        else:
+            st.warning("Режим CPU / без GPU")
 
     step = st.session_state["step"]
     render_step_indicator(step)
