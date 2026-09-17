@@ -1158,6 +1158,18 @@ def render_step2_zones(device: str) -> None:
             go_to_step(1)
         return
 
+    # Клик по превью обновляет session_state["ring*_x"/"_y"] ДО того, как ниже
+    # инстанциируются number_input с теми же ключами (иначе — StreamlitAPIException
+    # "cannot be modified after the widget... is instantiated", см. комментарий
+    # у блока клика ниже). НО сам st.rerun() после этого откладывается до самого
+    # конца функции (см. ring_click_triggered_rerun ниже) — если вызвать rerun
+    # сразу, скрипт обрывается ДО того, как в этом прогоне вообще были созданы
+    # number_input для колец, и Streamlit считает их состояние "осиротевшим"
+    # (виджет не был отрисован в прогоне) и сбрасывает его к дефолтам на
+    # следующем прогоне. Поэтому rerun обязательно должен произойти ПОСЛЕ того,
+    # как все виджеты этого прогона (включая все 6 number_input) уже созданы.
+    ring_click_triggered_rerun = False
+
     meta = get_video_metadata(video_path)
 
     if st.session_state.get("rings_initialized_for") != video_path:
@@ -1213,24 +1225,61 @@ def render_step2_zones(device: str) -> None:
             "числовыми полями ниже (см. requirements.txt)."
         )
 
-    # ВАЖНО: у number_input ниже key совпадает с именем переменной в
-    # session_state (например key="ring1_x" для st.session_state["ring1_x"]).
-    # Это намеренно: клик по превью (см. streamlit_image_coordinates выше)
-    # программно обновляет st.session_state["ring1_x"]/["ring1_y"] ДО того,
-    # как здесь создаётся виджет — а Streamlit при создании виджета с уже
-    # существующим в session_state ключом использует именно это значение,
-    # игнорируя устаревший value=. Если бы ключ виджета отличался от ключа
-    # состояния (как было раньше: "in_ring1_x" vs "ring1_x"), клик по
-    # картинке обновлял бы состояние, но поля ввода продолжали бы показывать
-    # старое значение до следующего ручного изменения.
-    # ПРИМЕЧАНИЕ: у number_input ниже намеренно НЕ делается
-    # `st.session_state["ring1_x"] = st.number_input(..., key="ring1_x")` —
-    # Streamlit запрещает перезаписывать session_state[key] в том же прогоне
-    # СРАЗУ ПОСЛЕ создания виджета с этим же key (кидает StreamlitAPIException
-    # "cannot be modified after the widget... is instantiated"). Раз key
-    # совпадает с именем состояния, виджет и так сам пишет своё значение в
-    # st.session_state["ring1_x"] как побочный эффект — читать его дальше по
-    # коду можно напрямую из session_state, без явного присваивания.
+    # ВАЖНО: превью + обработка клика по картинке (streamlit_image_coordinates)
+    # ДОЛЖНЫ идти строго ДО того, как ниже создаются number_input с ключами
+    # "ring1_x"/"ring1_y"/"ring2_x"/"ring2_y". Обработчик клика программно
+    # пишет в st.session_state[f"{target}_x"]/["_y"] — если бы это происходило
+    # ПОСЛЕ инстанциирования виджетов с теми же ключами в этом же прогоне
+    # скрипта, Streamlit кидает StreamlitAPIException "cannot be modified
+    # after the widget ... is instantiated" (ровно так и было до этого
+    # фикса: блок клика был ниже number_input). Здесь клик только читает
+    # текущие ring*_x/y/r из session_state (виджеты с этими ключами в
+    # текущем прогоне ещё не создавались) — значит запись в эти ключи всё
+    # ещё разрешена. Сам st.rerun() при этом откладывается флагом
+    # ring_click_triggered_rerun до конца функции — см. комментарий там.
+    if frame is not None:
+        rings = [
+            {"x": st.session_state["ring1_x"], "y": st.session_state["ring1_y"], "r": st.session_state["ring1_r"]},
+            {"x": st.session_state["ring2_x"], "y": st.session_state["ring2_y"], "r": st.session_state["ring2_r"]},
+        ]
+        preview_bgr = draw_zones_preview(frame, rings, possession_threshold=st.session_state["possession_threshold"])
+        preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
+
+        if streamlit_image_coordinates is not None:
+            display_width = min(int(meta["width"]), PREVIEW_MAX_DISPLAY_WIDTH)
+            click_value = streamlit_image_coordinates(preview_rgb, key="ring_click_canvas", width=display_width)
+            if click_value is not None and click_value.get("x") is not None:
+                click_time = click_value.get("unix_time")
+                if click_time != st.session_state.get("_last_ring_click_time"):
+                    st.session_state["_last_ring_click_time"] = click_time
+                    disp_w = click_value.get("width") or display_width
+                    disp_h = click_value.get("height") or int(meta["height"] * display_width / meta["width"])
+                    scale_x = meta["width"] / disp_w if disp_w else 1.0
+                    scale_y = meta["height"] / disp_h if disp_h else 1.0
+                    orig_x = int(np.clip(click_value["x"] * scale_x, 0, meta["width"]))
+                    orig_y = int(np.clip(click_value["y"] * scale_y, 0, meta["height"]))
+                    target = "ring1" if st.session_state["click_target_ring"] == "Кольцо 1" else "ring2"
+                    st.session_state[f"{target}_x"] = orig_x
+                    st.session_state[f"{target}_y"] = orig_y
+                    ring_click_triggered_rerun = True
+        else:
+            st.image(preview_rgb, caption="Превью с зонами колец", use_container_width=True)
+    else:
+        st.error("Не удалось прочитать кадр из видео для превью.")
+
+    # ПРИМЕЧАНИЕ: у number_input ниже key совпадает с именем переменной в
+    # session_state (например key="ring1_x" для st.session_state["ring1_x"]),
+    # и намеренно НЕ делается `st.session_state["ring1_x"] = st.number_input(
+    # ..., key="ring1_x")` — обе конструкции подряд означали бы запись в
+    # session_state[key] уже после инстанциирования виджета с этим key
+    # (в случае присваивания — сразу после его же создания), что Streamlit
+    # запрещает. Раз key совпадает с именем состояния, виджет и так пишет
+    # своё значение в session_state как побочный эффект — читать его дальше
+    # по коду можно напрямую из session_state, без явного присваивания. Если
+    # бы ключ виджета отличался от ключа состояния (как было раньше:
+    # "in_ring1_x" vs "ring1_x"), клик по картинке обновлял бы состояние, но
+    # поля ввода продолжали бы показывать старое значение до следующего
+    # ручного изменения.
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Кольцо №1**")
@@ -1256,36 +1305,6 @@ def render_step2_zones(device: str) -> None:
             "Радиус 2 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
             value=int(st.session_state["ring2_r"]), key="ring2_r",
         )
-
-    if frame is not None:
-        rings = [
-            {"x": st.session_state["ring1_x"], "y": st.session_state["ring1_y"], "r": st.session_state["ring1_r"]},
-            {"x": st.session_state["ring2_x"], "y": st.session_state["ring2_y"], "r": st.session_state["ring2_r"]},
-        ]
-        preview_bgr = draw_zones_preview(frame, rings, possession_threshold=st.session_state["possession_threshold"])
-        preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
-
-        if streamlit_image_coordinates is not None:
-            display_width = min(int(meta["width"]), PREVIEW_MAX_DISPLAY_WIDTH)
-            click_value = streamlit_image_coordinates(preview_rgb, key="ring_click_canvas", width=display_width)
-            if click_value is not None and click_value.get("x") is not None:
-                click_time = click_value.get("unix_time")
-                if click_time != st.session_state.get("_last_ring_click_time"):
-                    st.session_state["_last_ring_click_time"] = click_time
-                    disp_w = click_value.get("width") or display_width
-                    disp_h = click_value.get("height") or int(meta["height"] * display_width / meta["width"])
-                    scale_x = meta["width"] / disp_w if disp_w else 1.0
-                    scale_y = meta["height"] / disp_h if disp_h else 1.0
-                    orig_x = int(np.clip(click_value["x"] * scale_x, 0, meta["width"]))
-                    orig_y = int(np.clip(click_value["y"] * scale_y, 0, meta["height"]))
-                    target = "ring1" if st.session_state["click_target_ring"] == "Кольцо 1" else "ring2"
-                    st.session_state[f"{target}_x"] = orig_x
-                    st.session_state[f"{target}_y"] = orig_y
-                    st.rerun()
-        else:
-            st.image(preview_rgb, caption="Превью с зонами колец", use_container_width=True)
-    else:
-        st.error("Не удалось прочитать кадр из видео для превью.")
 
     colcal1, colcal2 = st.columns([3, 1])
     with colcal1:
@@ -1369,6 +1388,13 @@ def render_step2_zones(device: str) -> None:
     with colB:
         if st.button("Далее → Сопоставление игроков", type="primary"):
             go_to_step(3)
+
+    # Отложенный rerun после клика по превью (см. комментарий у
+    # ring_click_triggered_rerun в начале функции) — на этом этапе ВСЕ виджеты
+    # текущего прогона (все 6 number_input, слайдеры, чекбокс, кнопки) уже
+    # инстанциированы, поэтому rerun здесь больше не "осиротит" их состояние.
+    if ring_click_triggered_rerun:
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
