@@ -5,17 +5,28 @@ Basketball Tracking Analytics
 Полностью автономное (офлайн) приложение на Streamlit для аналитики баскетбольных
 тренировок по видео со статичной камеры.
 
+Пошаговый пользовательский путь:
+    1. Загрузка видео.
+    2. Превью кадра + настройка ДВУХ зон колец и порогов владения/передач.
+    3. Быстрое предварительное сканирование трекера для сбора списка ID
+       игроков и ручное сопоставление ID → Имя/Номер (номеров на форме нет,
+       поэтому распознать их автоматически невозможно).
+    4. Полный прогон трекинга + аналитики, итоговый Box Score и хайлайты.
+
 Возможности:
     * Детекция и трекинг игроков и мяча моделью YOLO11x (Ultralytics) с трекером
       BoT-SORT + ReID (игроки не имеют номеров на майках, поэтому идентификация
       строится на визуальных признаках формы/обуви, а не на OCR номеров).
-    * Математическая детекция бросков/попаданий по заданной пользователем
-      окружности (зона кольца) с кулдауном событий.
+    * Математическая детекция бросков/попаданий по ДВУМ окружностям колец,
+      заданным пользователем, с кулдауном событий.
     * Детекция передач (пасов) на основе смены владельца мяча в ограниченном
-      временном окне.
+      временном окне, с "памятью" мяча при кратковременной потере детекции.
+    * Отладочный таймлайн владения мячом — виден каждый переход владения и
+      причина, по которой передача была засчитана или отклонена.
     * Автоматическая нарезка автономных MP4-хайлайтов (5 сек до события +
       2 сек после) с помощью OpenCV.
-    * Итоговая статистика по игрокам (Box Score) и встроенный просмотр хайлайтов.
+    * Итоговая статистика по игрокам (Box Score с именем/номером) и встроенный
+      просмотр хайлайтов.
 
 Запуск:
     streamlit run app.py
@@ -32,7 +43,7 @@ import tempfile
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -109,8 +120,37 @@ BALL_HISTORY_MAXLEN = 20
 # засчитывается (защита от дребезга детекций одного кадра).
 PASS_MIN_TIME_SECONDS = 0.0
 
+# --- Дефолты и диапазоны настраиваемых через GUI порогов ---
+# ВАЖНО: на реальном видео исходный жёсткий порог владения (65 px) оказался
+# слишком строгим — при чуть более высоком разрешении/дальнем плане камеры
+# рука/мяч игрока легко выходит за пределы этого расстояния от рамки, и
+# смена владельца никогда не засчитывалась как пас. Дефолт увеличен, а сам
+# порог и окно передачи полностью управляются слайдерами в GUI (шаг 2).
+POSSESSION_THRESHOLD_DEFAULT = 90
+POSSESSION_THRESHOLD_MIN = 20
+POSSESSION_THRESHOLD_MAX = 250
+
+PASS_WINDOW_DEFAULT = 1.8
+PASS_WINDOW_MIN = 0.3
+PASS_WINDOW_MAX = 3.0
+
+SHOT_COOLDOWN_DEFAULT = 3.0
+SHOT_COOLDOWN_MIN = 1.0
+SHOT_COOLDOWN_MAX = 6.0
+
+# "Память" мяча: если детектор не нашёл мяч в текущем кадре (блики, смаз
+# движения, быстрый полёт), сколько секунд продолжать считать его находящимся
+# в последней известной точке. Без этого короткие пропуски детекции мяча
+# ровно в момент приёма пасующим партнёром обрывали цепочку "владелец A → Б".
+BALL_MEMORY_SECONDS_DEFAULT = 0.3
+BALL_MEMORY_SECONDS_MIN = 0.0
+BALL_MEMORY_SECONDS_MAX = 1.0
+
+QUICK_SCAN_SECONDS_DEFAULT = 15
+
 
 PlayerStats = Dict[str, int]
+RingZone = Dict[str, float]
 
 
 def blank_stats() -> PlayerStats:
@@ -223,6 +263,21 @@ def load_model(device: str):
     return None, last_error or "Неизвестная ошибка загрузки модели"
 
 
+def reset_tracker(model) -> None:
+    """Сбрасывает внутреннее состояние трекера BoT-SORT перед новой независимой
+    сессией трекинга (быстрое сканирование ID и финальный полный прогон должны
+    оба стартовать "с чистого листа" на кадре 0 — иначе ID из предыдущего
+    прогона исказят нумерацию и сопоставление игрок → имя/номер разойдётся
+    с финальной статистикой).
+    """
+    if model is None:
+        return
+    try:
+        model.predictor = None  # заставит ultralytics создать трекер заново
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Геометрия и вспомогательные вычисления
 # ---------------------------------------------------------------------------
@@ -286,7 +341,9 @@ def ball_is_falling_through(
 # ---------------------------------------------------------------------------
 # Разбор результатов детекции/трекинга Ultralytics
 # ---------------------------------------------------------------------------
-def parse_results(results) -> Tuple["np.ndarray", List[Tuple[int, Tuple[float, float, float, float]]], Optional[Tuple[float, float]]]:
+def parse_results(
+    results,
+) -> Tuple[Any, List[Tuple[int, Tuple[float, float, float, float]]], Optional[Tuple[float, float]]]:
     """Извлекает из результата YOLO кадр с аннотациями, список игроков и мяч."""
     result = results[0]
     annotated = result.plot()  # BGR-кадр с нарисованными боксами и ID треков
@@ -320,10 +377,10 @@ class PendingHighlight:
 
     __slots__ = ("filename", "past_frames", "future_frames", "frames_needed")
 
-    def __init__(self, filename: str, past_frames: List["np.ndarray"], frames_needed: int):
+    def __init__(self, filename: str, past_frames: List[Any], frames_needed: int):
         self.filename = filename
         self.past_frames = past_frames
-        self.future_frames: List["np.ndarray"] = []
+        self.future_frames: List[Any] = []
         self.frames_needed = frames_needed
 
     def is_ready(self) -> bool:
@@ -343,21 +400,146 @@ def save_highlight_clip(highlight: PendingHighlight, fps: float, width: int, hei
 
 
 # ---------------------------------------------------------------------------
-# Основной цикл обработки видео
+# Видео-утилиты (метаданные, извлечение кадра, отрисовка зон)
+# ---------------------------------------------------------------------------
+def get_video_metadata(video_path: str) -> Dict[str, float]:
+    """Возвращает fps/ширину/высоту/число кадров/длительность видео."""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if fps <= 1e-3:
+        fps = 25.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    cap.release()
+    duration = total_frames / fps if total_frames else 0.0
+    return {"fps": fps, "width": width, "height": height, "total_frames": total_frames, "duration": duration}
+
+
+def extract_frame_at_time(video_path: str, t_seconds: float):
+    """Извлекает один кадр видео на заданной секунде (для превью настройки зон)."""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    frame_idx = max(int(t_seconds * fps), 0)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    cap.release()
+    return frame if ret else None
+
+
+def default_ring_zones(width: int, height: int) -> Tuple[RingZone, RingZone]:
+    """Разумные дефолтные координаты для двух колец (по краям площадки)."""
+    r = max(int(min(width, height) * 0.05), 20)
+    ring1 = {"x": float(int(width * 0.10)), "y": float(int(height * 0.35)), "r": float(r)}
+    ring2 = {"x": float(int(width * 0.90)), "y": float(int(height * 0.35)), "r": float(r)}
+    return ring1, ring2
+
+
+def draw_zones_preview(frame, rings: List[RingZone]):
+    """Рисует окружности зон колец на копии кадра для наглядной проверки в GUI."""
+    preview = frame.copy()
+    colors = [(0, 140, 255), (255, 80, 0)]
+    for idx, ring in enumerate(rings):
+        color = colors[idx % len(colors)]
+        center = (int(ring["x"]), int(ring["y"]))
+        radius = max(int(ring["r"]), 1)
+        cv2.circle(preview, center, radius, color, 3)
+        cv2.drawMarker(preview, center, color, markerType=cv2.MARKER_CROSS, markerSize=14, thickness=2)
+        label_pos = (max(center[0] - 45, 0), max(center[1] - radius - 12, 20))
+        cv2.putText(preview, f"Кольцо {idx + 1}", label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+    return preview
+
+
+# ---------------------------------------------------------------------------
+# Быстрое предварительное сканирование для сбора списка игроков (шаг 3)
+# ---------------------------------------------------------------------------
+def quick_player_scan(
+    video_path: str, model, device: str, max_seconds: float, fps_hint: float
+) -> Dict[int, Any]:
+    """Короткий прогон трекера по первым max_seconds секундам видео.
+
+    Цель — не полноценная аналитика, а быстрый сбор всех уникальных ID
+    игроков и одного репрезентативного кропа (самой уверенной/крупной
+    детекции) на каждого, чтобы пользователь мог вручную вписать имя/номер.
+    Разрешение НЕ уменьшается и кадры не пропускаются, чтобы ID трекера
+    совпадали с ID, которые получатся при финальном полном прогоне на шаге 4
+    (тот же трекер, тот же конфиг, тот же сброс состояния — см. reset_tracker).
+    """
+    if model is None or cv2 is None:
+        return {}
+
+    reset_tracker(model)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return {}
+
+    fps = fps_hint or 25.0
+    max_frames = max(int(fps * max_seconds), 1)
+
+    best_crops: Dict[int, Tuple[float, Any]] = {}
+    frame_idx = 0
+    while frame_idx < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        results = model.track(
+            frame,
+            persist=True,
+            tracker=str(TRACKER_CONFIG_PATH),
+            device=device,
+            classes=[COCO_PERSON_CLASS_ID, COCO_BALL_CLASS_ID],
+            verbose=False,
+        )
+        result = results[0]
+        boxes = result.boxes
+        if boxes is not None and boxes.id is not None and len(boxes) > 0:
+            xyxy = boxes.xyxy.cpu().numpy()
+            cls = boxes.cls.cpu().numpy().astype(int)
+            ids = boxes.id.cpu().numpy().astype(int)
+            confs = boxes.conf.cpu().numpy()
+            h, w = frame.shape[:2]
+            for box, c, tid, conf in zip(xyxy, cls, ids, confs):
+                if c != COCO_PERSON_CLASS_ID:
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in box]
+                area = max(x2 - x1, 0) * max(y2 - y1, 0)
+                score = float(conf) * area
+                prev = best_crops.get(int(tid))
+                if prev is None or score > prev[0]:
+                    x1c, y1c = max(x1, 0), max(y1, 0)
+                    x2c, y2c = min(x2, w), min(y2, h)
+                    crop = frame[y1c:y2c, x1c:x2c].copy()
+                    if crop.size > 0:
+                        best_crops[int(tid)] = (score, crop)
+        frame_idx += 1
+
+    cap.release()
+    reset_tracker(model)  # не оставляем состояние "подвешенным" перед шагом 4
+    return {tid: crop for tid, (_, crop) in best_crops.items()}
+
+
+# ---------------------------------------------------------------------------
+# Основной цикл обработки видео (шаг 4)
 # ---------------------------------------------------------------------------
 def process_video(
     video_path: str,
     model,
     device: str,
-    ring_center: Tuple[float, float],
-    ring_radius: float,
+    rings: List[RingZone],
     possession_threshold: float,
     pass_max_time: float,
     shot_cooldown: float,
+    ball_memory_seconds: float,
     progress_bar,
     status_text,
-) -> Tuple[Dict[int, PlayerStats], Path]:
-    """Обрабатывает видео покадрово: детекция, трекинг, события, хайлайты."""
+) -> Tuple[Dict[int, PlayerStats], Path, Dict[str, List[Dict[str, Any]]]]:
+    """Обрабатывает видео покадрово: детекция, трекинг, события, хайлайты.
+
+    Возвращает (стата по игрокам, путь к аннотированному видео, отладочный лог
+    владения мячом для GUI-таймлайна).
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError("Не удалось открыть видеофайл (повреждён или неподдерживаемый формат)")
@@ -374,18 +556,27 @@ def process_video(
     buffer_len = max(int(fps * BUFFER_SECONDS), 1)
     future_frames_needed = max(int(fps * FUTURE_SECONDS), 1)
     shot_verdict_delay_frames = max(int(fps * SHOT_VERDICT_DELAY_SECONDS), 1)
+    sample_every = max(int(fps // 2), 1)  # ~2 отсчёта в секунду для таймлайна отладки
 
-    frame_buffer: Deque["np.ndarray"] = deque(maxlen=buffer_len)
+    frame_buffer: Deque[Any] = deque(maxlen=buffer_len)
     ball_history: Deque[Tuple[float, float, float]] = deque(maxlen=BALL_HISTORY_MAXLEN)
     pending_highlights: List[PendingHighlight] = []
-    pending_shot_verdicts: List[Dict] = []
+    pending_shot_verdicts: List[Dict[str, Any]] = []
 
     stats: Dict[int, PlayerStats] = {}
+    debug_log: Dict[str, List[Dict[str, Any]]] = {"ownership_changes": [], "sampled_timeline": []}
 
     # Состояние владения мячом (для пасов и для "кто владел мячом перед броском").
     last_owner: Optional[int] = None
     last_owner_time: Optional[float] = None
-    last_shot_time = -1e9  # для кулдауна событий у кольца
+    last_shot_time_per_ring = [-1e9 for _ in rings]
+
+    # "Память" мяча: держим последнюю известную позицию, если детектор
+    # временно "потерял" мяч (см. константу BALL_MEMORY_SECONDS_DEFAULT).
+    last_known_ball: Optional[Tuple[float, float]] = None
+    last_real_ball_time = -1e9
+
+    reset_tracker(model)  # независимая от возможного шага 3 сессия трекинга
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = OUTPUT_DIR / f"processed_{Path(video_path).stem}_{timestamp}.mp4"
@@ -429,61 +620,110 @@ def process_video(
             )
 
         # -------------------------------------------------------------
+        # "ПАМЯТЬ" МЯЧА
+        #
+        # Если ровно в кадре, где мяч перелетает от игрока А к игроку Б,
+        # детектор его не находит (смаз движения, блик, частичное перекрытие),
+        # цепочка владения обрывалась и передача никогда не засчитывалась.
+        # Поэтому в течение ball_memory_seconds после последней РЕАЛЬНОЙ
+        # детекции мяча мы продолжаем считать его находящимся в последней
+        # известной точке (effective_ball) — это не заменяет детекцию,
+        # а лишь сглаживает короткие пропуски.
+        # -------------------------------------------------------------
+        if ball is not None:
+            last_known_ball = ball
+            last_real_ball_time = t
+
+        effective_ball: Optional[Tuple[float, float]] = None
+        if last_known_ball is not None and (t - last_real_ball_time) <= ball_memory_seconds:
+            effective_ball = last_known_ball
+
+        if effective_ball is not None:
+            ball_history.append((t, effective_ball[0], effective_ball[1]))
+
+        # -------------------------------------------------------------
         # ВЛАДЕНИЕ МЯЧОМ И ДЕТЕКЦИЯ ПЕРЕДАЧ (ПАСОВ)
         #
         # Игрок считается владеющим мячом, если центр мяча находится не
         # дальше possession_threshold пикселей от его рамки (0, если центр
         # мяча внутри рамки). Если владелец сменился (мяч "долетел" от
         # игрока А к игроку Б) в течение не более pass_max_time секунд —
-        # это успешная передача: игроку А засчитывается +1 пас.
+        # это успешная передача: игроку А засчитывается +1 пас. Все смены
+        # владения (в т.ч. отклонённые из-за долгого перелёта) логируются
+        # в debug_log для отладочного таймлайна в GUI.
         # -------------------------------------------------------------
         current_owner: Optional[int] = None
-        if ball is not None and persons:
+        if effective_ball is not None and persons:
             best_dist = None
             for pid, box in persons:
-                d = distance_point_to_bbox(ball[0], ball[1], box)
+                d = distance_point_to_bbox(effective_ball[0], effective_ball[1], box)
                 if best_dist is None or d < best_dist:
                     best_dist, current_owner = d, pid
             if best_dist is not None and best_dist > possession_threshold:
                 current_owner = None  # мяч ничейный/в полёте — слишком далеко от всех игроков
 
-        if ball is not None:
-            ball_history.append((t, ball[0], ball[1]))
+        if current_owner is not None and current_owner != last_owner:
+            elapsed = (t - last_owner_time) if last_owner_time is not None else None
+            if last_owner is None:
+                reason = "первое владение в кадре"
+            elif elapsed is not None and PASS_MIN_TIME_SECONDS <= elapsed <= pass_max_time:
+                reason = "✅ передача засчитана"
+                stats.setdefault(last_owner, blank_stats())["passes"] += 1
+                stats.setdefault(current_owner, blank_stats())  # чтобы получатель тоже был в таблице
+                pending_highlights.append(
+                    PendingHighlight(
+                        filename=f"pass_from_ID{last_owner}_to_ID{current_owner}_frame_{frame_idx}.mp4",
+                        past_frames=list(frame_buffer),
+                        frames_needed=future_frames_needed,
+                    )
+                )
+            else:
+                reason = f"❌ отклонено (Δt={elapsed:.2f}с > окно {pass_max_time:.2f}с)" if elapsed is not None else "❌ отклонено"
+
+            debug_log["ownership_changes"].append(
+                {
+                    "Кадр": frame_idx,
+                    "Время, с": round(t, 2),
+                    "От игрока": last_owner if last_owner is not None else "—",
+                    "К игроку": current_owner,
+                    "Δt, с": round(elapsed, 2) if elapsed is not None else None,
+                    "Результат": reason,
+                }
+            )
 
         if current_owner is not None:
-            if last_owner is not None and current_owner != last_owner and last_owner_time is not None:
-                elapsed = t - last_owner_time
-                if PASS_MIN_TIME_SECONDS <= elapsed <= pass_max_time:
-                    # Мяч перелетел от last_owner к current_owner достаточно быстро —
-                    # засчитываем передачу пасующему игроку (last_owner).
-                    stats.setdefault(last_owner, blank_stats())["passes"] += 1
-                    stats.setdefault(current_owner, blank_stats())  # чтобы получатель тоже был в таблице
-                    pending_highlights.append(
-                        PendingHighlight(
-                            filename=f"pass_from_ID{last_owner}_to_ID{current_owner}_frame_{frame_idx}.mp4",
-                            past_frames=list(frame_buffer),
-                            frames_needed=future_frames_needed,
-                        )
-                    )
             last_owner = current_owner
             last_owner_time = t
 
+        if frame_idx % sample_every == 0:
+            debug_log["sampled_timeline"].append(
+                {
+                    "Время, с": round(t, 2),
+                    "Владелец (ID)": float(current_owner) if current_owner is not None else float("nan"),
+                }
+            )
+
         # -------------------------------------------------------------
-        # ЗОНА КОЛЬЦА: ФИКСАЦИЯ БРОСКА И ВЕРДИКТ "ГОЛ/ПРОМАХ"
+        # ЗОНЫ КОЛЕЦ: ФИКСАЦИЯ БРОСКА И ВЕРДИКТ "ГОЛ/ПРОМАХ"
         #
-        # Если центр мяча входит в окружность (ring_center, ring_radius) и
-        # с прошлого события у кольца прошло не меньше shot_cooldown секунд —
-        # регистрируем бросок. Бросок засчитывается игроку, который последним
-        # владел мячом (last_owner); если такого нет — ближайшему к кольцу
-        # игроку. Окончательный вердикт "попадание/промах" выносится чуть
-        # позже (см. pending_shot_verdicts) по направлению полёта мяча.
+        # Если центр мяча входит в одну из окружностей колец (ring_center,
+        # ring_radius) и с прошлого события у ЭТОГО кольца прошло не меньше
+        # shot_cooldown секунд — регистрируем бросок. Бросок засчитывается
+        # игроку, который последним владел мячом (last_owner); если такого
+        # нет — ближайшему к кольцу игроку. Окончательный вердикт
+        # "попадание/промах" выносится чуть позже (см. pending_shot_verdicts)
+        # по направлению полёта мяча.
         # -------------------------------------------------------------
-        if ball is not None and point_in_circle(ball[0], ball[1], ring_center[0], ring_center[1], ring_radius):
-            if (t - last_shot_time) >= shot_cooldown:
-                last_shot_time = t
+        if effective_ball is not None:
+            for ring_idx, ring in enumerate(rings):
+                if not point_in_circle(effective_ball[0], effective_ball[1], ring["x"], ring["y"], ring["r"]):
+                    continue
+                if (t - last_shot_time_per_ring[ring_idx]) < shot_cooldown:
+                    continue
+                last_shot_time_per_ring[ring_idx] = t
                 credited_player = last_owner
                 if credited_player is None:
-                    credited_player = nearest_player_to_point(persons, ring_center)
+                    credited_player = nearest_player_to_point(persons, (ring["x"], ring["y"]))
                 if credited_player is not None:
                     stats.setdefault(credited_player, blank_stats())["shots"] += 1
                     pending_shot_verdicts.append(
@@ -491,6 +731,9 @@ def process_video(
                             "player": credited_player,
                             "frames_left": shot_verdict_delay_frames,
                             "frame_idx": frame_idx,
+                            "ring_idx": ring_idx,
+                            "ring_center": (ring["x"], ring["y"]),
+                            "ring_radius": ring["r"],
                         }
                     )
 
@@ -499,11 +742,11 @@ def process_video(
         for verdict in pending_shot_verdicts:
             verdict["frames_left"] -= 1
             if verdict["frames_left"] <= 0:
-                if ball_is_falling_through(ball_history, ring_center, ring_radius):
+                if ball_is_falling_through(ball_history, verdict["ring_center"], verdict["ring_radius"]):
                     stats[verdict["player"]]["makes"] += 1
                     pending_highlights.append(
                         PendingHighlight(
-                            filename=f"goal_ID{verdict['player']}_frame_{verdict['frame_idx']}.mp4",
+                            filename=f"goal_ring{verdict['ring_idx'] + 1}_ID{verdict['player']}_frame_{verdict['frame_idx']}.mp4",
                             past_frames=list(frame_buffer),
                             frames_needed=future_frames_needed,
                         )
@@ -543,12 +786,18 @@ def process_video(
 
     cap.release()
     writer.release()
-    return stats, output_path
+    return stats, output_path, debug_log
 
 
-def build_box_score(stats: Dict[int, PlayerStats]) -> pd.DataFrame:
+def build_box_score(
+    stats: Dict[int, PlayerStats],
+    player_names: Optional[Dict[int, str]] = None,
+    player_numbers: Optional[Dict[int, str]] = None,
+) -> pd.DataFrame:
     """Формирует итоговую таблицу статистики (Box Score) по игрокам."""
-    columns = ["ID игрока", "Броски", "Попадания", "Точность (%)", "Сделано передач"]
+    player_names = player_names or {}
+    player_numbers = player_numbers or {}
+    columns = ["ID игрока", "Имя", "Номер", "Броски", "Попадания", "Точность (%)", "Сделано передач"]
     if not stats:
         return pd.DataFrame(columns=columns)
 
@@ -556,9 +805,13 @@ def build_box_score(stats: Dict[int, PlayerStats]) -> pd.DataFrame:
     for pid, s in sorted(stats.items()):
         shots, makes, passes = s["shots"], s["makes"], s["passes"]
         accuracy = round(100.0 * makes / shots, 1) if shots else 0.0
+        name = (player_names.get(pid) or "").strip() or f"Игрок {pid}"
+        number = (player_numbers.get(pid) or "").strip() or "—"
         rows.append(
             {
                 "ID игрока": pid,
+                "Имя": name,
+                "Номер": number,
                 "Броски": shots,
                 "Попадания": makes,
                 "Точность (%)": accuracy,
@@ -569,22 +822,305 @@ def build_box_score(stats: Dict[int, PlayerStats]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Streamlit GUI
+# Streamlit GUI — общая инициализация состояния
 # ---------------------------------------------------------------------------
-def run_analysis(
-    uploaded_file,
-    device: str,
-    ring_x: float,
-    ring_y: float,
-    ring_radius: float,
-    possession_threshold: float,
-    pass_window: float,
-    shot_cooldown: float,
-) -> None:
+def init_session_state() -> None:
+    defaults: Dict[str, Any] = {
+        "step": 1,
+        "video_path": None,
+        "video_name": None,
+        "rings_initialized_for": None,
+        "ring1_x": 0.0,
+        "ring1_y": 0.0,
+        "ring1_r": 40.0,
+        "ring2_x": 0.0,
+        "ring2_y": 0.0,
+        "ring2_r": 40.0,
+        "possession_threshold": float(POSSESSION_THRESHOLD_DEFAULT),
+        "pass_window": float(PASS_WINDOW_DEFAULT),
+        "ball_memory": float(BALL_MEMORY_SECONDS_DEFAULT),
+        "shot_cooldown": float(SHOT_COOLDOWN_DEFAULT),
+        "preview_time": 0.0,
+        "player_crops": {},
+        "player_names": {},
+        "player_numbers": {},
+        "box_score_df": None,
+        "debug_log": None,
+        "last_output_video": None,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def reset_for_new_video() -> None:
+    """Сбрасывает всё, что зависит от конкретного видео (при загрузке нового)."""
+    for key in (
+        "rings_initialized_for",
+        "player_crops",
+        "player_names",
+        "player_numbers",
+        "box_score_df",
+        "debug_log",
+        "last_output_video",
+    ):
+        st.session_state[key] = {} if key in ("player_crops", "player_names", "player_numbers") else None
+
+
+def go_to_step(step: int) -> None:
+    st.session_state["step"] = step
+    st.rerun()
+
+
+def render_step_indicator(current: int) -> None:
+    labels = ["1. Видео", "2. Зоны и пороги", "3. Игроки", "4. Анализ"]
+    parts = []
+    for i, label in enumerate(labels, start=1):
+        if i == current:
+            parts.append(f"**➡️ {label}**")
+        elif i < current:
+            parts.append(f"✅ {label}")
+        else:
+            parts.append(f"◽ {label}")
+    st.markdown(" &nbsp;→&nbsp; ".join(parts))
+    st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Шаг 1 — загрузка видео
+# ---------------------------------------------------------------------------
+def render_step1_upload() -> None:
+    st.header("Шаг 1 — Загрузка видео")
+    st.write("Загрузите видео тренировки со статичной камеры, снятое так, чтобы кольцо(-а) и площадка были в кадре.")
+
     if cv2 is None:
         st.error(f"Библиотека opencv-python не установлена: {CV2_IMPORT_ERROR}. Установите зависимости из requirements.txt.")
+
+    uploaded_file = st.file_uploader("Видеофайл тренировки (MP4/MOV)", type=["mp4", "mov"])
+
+    if uploaded_file is not None and cv2 is not None:
+        if st.session_state.get("video_name") != uploaded_file.name:
+            suffix = Path(uploaded_file.name).suffix or ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(uploaded_file.getbuffer())
+                st.session_state["video_path"] = tmp.name
+            st.session_state["video_name"] = uploaded_file.name
+            reset_for_new_video()
+
+    video_path = st.session_state.get("video_path")
+    if video_path and Path(video_path).exists():
+        meta = get_video_metadata(video_path)
+        st.success(f"Видео загружено: {st.session_state.get('video_name')}")
+        st.caption(
+            f"Длительность: {meta['duration']:.1f} сек · {meta['fps']:.1f} fps · "
+            f"{meta['width']}×{meta['height']} · {int(meta['total_frames'])} кадров"
+        )
+        if st.button("Далее → Настройка зон и порогов", type="primary"):
+            go_to_step(2)
+    else:
+        st.info("Загрузите видеофайл тренировки, чтобы продолжить.")
+
+
+# ---------------------------------------------------------------------------
+# Шаг 2 — превью + зоны колец + пороги владения/передач
+# ---------------------------------------------------------------------------
+def render_step2_zones() -> None:
+    st.header("Шаг 2 — Превью и настройка зон")
+    video_path = st.session_state.get("video_path")
+    if not video_path or not Path(video_path).exists():
+        st.warning("Сначала загрузите видео на шаге 1.")
+        if st.button("← Назад к загрузке"):
+            go_to_step(1)
         return
 
+    meta = get_video_metadata(video_path)
+
+    if st.session_state.get("rings_initialized_for") != video_path:
+        ring1, ring2 = default_ring_zones(int(meta["width"]), int(meta["height"]))
+        st.session_state["ring1_x"], st.session_state["ring1_y"], st.session_state["ring1_r"] = (
+            ring1["x"],
+            ring1["y"],
+            ring1["r"],
+        )
+        st.session_state["ring2_x"], st.session_state["ring2_y"], st.session_state["ring2_r"] = (
+            ring2["x"],
+            ring2["y"],
+            ring2["r"],
+        )
+        st.session_state["rings_initialized_for"] = video_path
+
+    max_t = max(meta["duration"] - 0.05, 0.0)
+    st.session_state["preview_time"] = st.slider(
+        "Кадр для превью (сек)", min_value=0.0, max_value=max_t if max_t > 0 else 0.1,
+        value=min(st.session_state["preview_time"], max_t), step=0.5,
+    )
+    frame = extract_frame_at_time(video_path, st.session_state["preview_time"])
+
+    st.subheader("🎯 Зоны обоих колец")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Кольцо №1**")
+        st.session_state["ring1_x"] = st.number_input(
+            "X1 (px)", min_value=0, max_value=int(meta["width"]), value=int(st.session_state["ring1_x"]), key="in_ring1_x"
+        )
+        st.session_state["ring1_y"] = st.number_input(
+            "Y1 (px)", min_value=0, max_value=int(meta["height"]), value=int(st.session_state["ring1_y"]), key="in_ring1_y"
+        )
+        st.session_state["ring1_r"] = st.number_input(
+            "Радиус 1 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
+            value=int(st.session_state["ring1_r"]), key="in_ring1_r",
+        )
+    with col2:
+        st.markdown("**Кольцо №2**")
+        st.session_state["ring2_x"] = st.number_input(
+            "X2 (px)", min_value=0, max_value=int(meta["width"]), value=int(st.session_state["ring2_x"]), key="in_ring2_x"
+        )
+        st.session_state["ring2_y"] = st.number_input(
+            "Y2 (px)", min_value=0, max_value=int(meta["height"]), value=int(st.session_state["ring2_y"]), key="in_ring2_y"
+        )
+        st.session_state["ring2_r"] = st.number_input(
+            "Радиус 2 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
+            value=int(st.session_state["ring2_r"]), key="in_ring2_r",
+        )
+
+    if frame is not None:
+        rings = [
+            {"x": st.session_state["ring1_x"], "y": st.session_state["ring1_y"], "r": st.session_state["ring1_r"]},
+            {"x": st.session_state["ring2_x"], "y": st.session_state["ring2_y"], "r": st.session_state["ring2_r"]},
+        ]
+        preview = draw_zones_preview(frame, rings)
+        st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), caption="Превью с зонами колец", use_container_width=True)
+    else:
+        st.error("Не удалось прочитать кадр из видео для превью.")
+
+    st.subheader("🤝 Владение мячом, передачи и кулдаун")
+    st.caption(
+        "Если на реальном видео передачи не засчитываются — увеличьте порог владения "
+        "и/или окно передачи ниже, и проверьте отладочный таймлайн на шаге 4."
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.session_state["possession_threshold"] = st.slider(
+            "Порог владения мячом (px)",
+            min_value=POSSESSION_THRESHOLD_MIN,
+            max_value=POSSESSION_THRESHOLD_MAX,
+            value=int(st.session_state["possession_threshold"]),
+            step=5,
+            help="Максимальное расстояние от центра мяча до рамки игрока, при котором игрок считается владеющим мячом.",
+        )
+    with c2:
+        st.session_state["pass_window"] = st.slider(
+            "Максимальное время передачи (сек)",
+            min_value=PASS_WINDOW_MIN,
+            max_value=PASS_WINDOW_MAX,
+            value=float(st.session_state["pass_window"]),
+            step=0.1,
+            help="Сколько секунд может лететь мяч от одного игрока к другому, чтобы это засчиталось как пас.",
+        )
+    with c3:
+        st.session_state["ball_memory"] = st.slider(
+            "Память мяча при потере детекции (сек)",
+            min_value=BALL_MEMORY_SECONDS_MIN,
+            max_value=BALL_MEMORY_SECONDS_MAX,
+            value=float(st.session_state["ball_memory"]),
+            step=0.05,
+            help="Сколько секунд считать мяч в последней известной точке, если детектор его временно не находит.",
+        )
+
+    st.session_state["shot_cooldown"] = st.slider(
+        "Кулдаун события у кольца (сек)",
+        min_value=SHOT_COOLDOWN_MIN,
+        max_value=SHOT_COOLDOWN_MAX,
+        value=float(st.session_state["shot_cooldown"]),
+        step=0.5,
+        help="Минимальный промежуток между двумя засчитанными бросками у одного и того же кольца.",
+    )
+
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("← Назад к загрузке"):
+            go_to_step(1)
+    with colB:
+        if st.button("Далее → Сопоставление игроков", type="primary"):
+            go_to_step(3)
+
+
+# ---------------------------------------------------------------------------
+# Шаг 3 — сопоставление игроков (ID → имя/номер)
+# ---------------------------------------------------------------------------
+def render_step3_players(device: str) -> None:
+    st.header("Шаг 3 — Сопоставление игроков")
+    video_path = st.session_state.get("video_path")
+    if not video_path or not Path(video_path).exists():
+        st.warning("Сначала загрузите видео на шаге 1.")
+        if st.button("← Назад к загрузке"):
+            go_to_step(1)
+        return
+
+    meta = get_video_metadata(video_path)
+    st.write(
+        "Короткое предварительное сканирование первых секунд видео собирает список ID игроков "
+        "и по одному характерному кадру-кропу на каждого. Номера на форме не видны камере и "
+        "распознать их автоматически невозможно — впишите имя/номер вручную по кропам."
+    )
+
+    max_scan = max(int(min(meta["duration"], 60)), 5)
+    scan_seconds = st.slider(
+        "Сколько секунд видео сканировать", min_value=5, max_value=max_scan,
+        value=min(QUICK_SCAN_SECONDS_DEFAULT, max_scan), step=5,
+    )
+
+    if st.button("🔍 Запустить предварительное сканирование", type="primary"):
+        model, model_error = load_model(device)
+        if model is None:
+            st.warning(
+                f"⚠️ Модель YOLO11x не загружена ({model_error}). Список игроков не может быть собран "
+                "автоматически в этой среде — на рабочем ПК с RTX 4080 и интернетом для первого "
+                "скачивания весов сканирование сработает штатно. Этот шаг можно пропустить: имена по "
+                "умолчанию останутся как «Игрок {ID}»."
+            )
+        else:
+            with st.spinner("Сканирование..."):
+                crops = quick_player_scan(video_path, model, device, max_seconds=scan_seconds, fps_hint=meta["fps"])
+            st.session_state["player_crops"] = crops
+            if not crops:
+                st.warning("Игроки не найдены за это время — попробуйте увеличить длительность сканирования.")
+            else:
+                st.success(f"Найдено {len(crops)} уникальных ID игроков.")
+
+    crops: Dict[int, Any] = st.session_state.get("player_crops") or {}
+    if crops:
+        cols_per_row = 4
+        ids_sorted = sorted(crops.keys())
+        for row_start in range(0, len(ids_sorted), cols_per_row):
+            row_ids = ids_sorted[row_start : row_start + cols_per_row]
+            cols = st.columns(len(row_ids))
+            for col, pid in zip(cols, row_ids):
+                with col:
+                    st.image(cv2.cvtColor(crops[pid], cv2.COLOR_BGR2RGB), caption=f"ID {pid}", use_container_width=True)
+                    st.text_input("Имя", key=f"player_name_{pid}", placeholder=f"Игрок {pid}")
+                    st.text_input("Номер", key=f"player_number_{pid}", placeholder="—")
+    else:
+        st.info(
+            "Пока нет данных — запустите сканирование выше, либо пропустите этот шаг: "
+            "в итоговой таблице игроки будут отображаться как «Игрок {ID}»."
+        )
+
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("← Назад к зонам и порогам"):
+            go_to_step(2)
+    with colB:
+        if st.button("Далее → Полный анализ", type="primary"):
+            for pid in crops.keys():
+                st.session_state["player_names"][pid] = st.session_state.get(f"player_name_{pid}", "")
+                st.session_state["player_numbers"][pid] = st.session_state.get(f"player_number_{pid}", "")
+            go_to_step(4)
+
+
+# ---------------------------------------------------------------------------
+# Шаг 4 — полный прогон и итоговая статистика
+# ---------------------------------------------------------------------------
+def run_full_analysis(video_path: str, device: str) -> None:
     ensure_directories()
     ensure_tracker_config()
 
@@ -599,39 +1135,37 @@ def run_analysis(
             "полноценно."
         )
 
-    suffix = Path(uploaded_file.name).suffix or ".mp4"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        video_path = tmp.name
+    rings = [
+        {"x": st.session_state["ring1_x"], "y": st.session_state["ring1_y"], "r": st.session_state["ring1_r"]},
+        {"x": st.session_state["ring2_x"], "y": st.session_state["ring2_y"], "r": st.session_state["ring2_r"]},
+    ]
 
     progress_bar = st.progress(0.0)
     status_text = st.empty()
 
     try:
-        stats, output_path = process_video(
+        stats, output_path, debug_log = process_video(
             video_path=video_path,
             model=model,
             device=device,
-            ring_center=(float(ring_x), float(ring_y)),
-            ring_radius=float(ring_radius),
-            possession_threshold=float(possession_threshold),
-            pass_max_time=float(pass_window),
-            shot_cooldown=float(shot_cooldown),
+            rings=rings,
+            possession_threshold=float(st.session_state["possession_threshold"]),
+            pass_max_time=float(st.session_state["pass_window"]),
+            shot_cooldown=float(st.session_state["shot_cooldown"]),
+            ball_memory_seconds=float(st.session_state["ball_memory"]),
             progress_bar=progress_bar,
             status_text=status_text,
         )
     except Exception as exc:
         st.error(f"Ошибка при обработке видео: {exc}")
         return
-    finally:
-        try:
-            os.remove(video_path)
-        except OSError:
-            pass
 
     status_text.text("Обработка завершена ✅")
-    st.session_state["box_score_df"] = build_box_score(stats)
+    st.session_state["box_score_df"] = build_box_score(
+        stats, st.session_state.get("player_names"), st.session_state.get("player_numbers")
+    )
     st.session_state["last_output_video"] = str(output_path)
+    st.session_state["debug_log"] = debug_log
     st.success(f"Готово! Полное аннотированное видео сохранено: {output_path}")
 
 
@@ -644,6 +1178,25 @@ def render_results_section() -> None:
         st.info("Видео обработано, но события (броски/передачи) не были зафиксированы.")
     else:
         st.info("Здесь появится итоговая таблица статистики после обработки видео.")
+
+    debug_log = st.session_state.get("debug_log")
+    if debug_log is not None:
+        with st.expander("🔍 Отладка: таймлайн владения мячом (почему пас засчитан/отклонён)"):
+            changes = debug_log.get("ownership_changes") or []
+            if changes:
+                changes_df = pd.DataFrame(changes)
+                st.dataframe(changes_df, use_container_width=True, hide_index=True)
+                accepted = sum(1 for c in changes if "засчитана" in c["Результат"])
+                rejected = len(changes) - accepted
+                st.caption(f"Смен владения: {len(changes)} · засчитано передач: {accepted} · отклонено: {rejected}")
+            else:
+                st.info("Смен владения мячом не зафиксировано — мяч либо не был обнаружен, либо всё время был у одного игрока.")
+
+            sampled = debug_log.get("sampled_timeline") or []
+            if sampled:
+                st.caption("Владелец мяча (ID) во времени — разрывы означают, что мяч в этот момент ничей/не найден.")
+                sampled_df = pd.DataFrame(sampled).set_index("Время, с")
+                st.line_chart(sampled_df)
 
     last_output_video = st.session_state.get("last_output_video")
     if last_output_video and Path(last_output_video).exists():
@@ -662,10 +1215,58 @@ def render_results_section() -> None:
         st.video(str(hf))
 
 
+def render_step4_run(device: str) -> None:
+    st.header("Шаг 4 — Полный анализ и статистика")
+    video_path = st.session_state.get("video_path")
+    if not video_path or not Path(video_path).exists():
+        st.warning("Сначала загрузите видео на шаге 1.")
+        if st.button("← Назад к загрузке"):
+            go_to_step(1)
+        return
+
+    with st.expander("⚙️ Текущие настройки анализа", expanded=False):
+        st.write(
+            f"Кольцо 1: X={int(st.session_state['ring1_x'])}, Y={int(st.session_state['ring1_y'])}, "
+            f"R={int(st.session_state['ring1_r'])} · Кольцо 2: X={int(st.session_state['ring2_x'])}, "
+            f"Y={int(st.session_state['ring2_y'])}, R={int(st.session_state['ring2_r'])}"
+        )
+        st.write(
+            f"Порог владения: {int(st.session_state['possession_threshold'])} px · "
+            f"Окно передачи: {st.session_state['pass_window']:.1f} с · "
+            f"Память мяча: {st.session_state['ball_memory']:.2f} с · "
+            f"Кулдаун кольца: {st.session_state['shot_cooldown']:.1f} с"
+        )
+        n_players = len(st.session_state.get("player_names") or {})
+        st.write(f"Сопоставлено игроков (имя/номер): {n_players}")
+
+    if st.button("🚀 Запустить полный анализ", type="primary"):
+        run_full_analysis(video_path, device)
+
+    render_results_section()
+
+    st.divider()
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("← Назад к сопоставлению игроков"):
+            go_to_step(3)
+    with colB:
+        if st.button("🔄 Начать заново с новым видео"):
+            old_path = st.session_state.get("video_path")
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            if old_path:
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
+            st.rerun()
+
+
 def main() -> None:
     st.set_page_config(page_title="Basketball Tracking Analytics", page_icon="🏀", layout="wide")
     ensure_directories()
     ensure_tracker_config()
+    init_session_state()
 
     st.title("🏀 Basketball Tracking Analytics")
     st.caption("Офлайн-аналитика баскетбольных тренировок по видео со статичной камеры (YOLO11x + BoT-SORT/ReID)")
@@ -677,46 +1278,26 @@ def main() -> None:
         st.warning(device_message)
 
     with st.sidebar:
-        st.header("⚙️ Настройки обработки")
-        uploaded_file = st.file_uploader("Видеофайл тренировки", type=["mp4", "mov"])
-
-        st.subheader("🎯 Зона кольца")
-        ring_x = st.number_input("Центр кольца, X (px)", min_value=0, value=960, step=1)
-        ring_y = st.number_input("Центр кольца, Y (px)", min_value=0, value=200, step=1)
-        ring_radius = st.number_input("Радиус зоны кольца (px)", min_value=5, value=60, step=1)
-
-        st.subheader("🤝 Владение мячом и передачи")
-        possession_threshold = st.slider("Порог владения мячом (px)", min_value=30, max_value=120, value=65, step=5)
-        pass_window = st.slider("Максимальное время передачи (сек)", min_value=0.5, max_value=2.0, value=1.5, step=0.1)
-
-        st.subheader("⏱️ Кулдаун событий у кольца")
-        shot_cooldown = st.slider("Кулдаун (сек)", min_value=1.0, max_value=6.0, value=3.0, step=0.5)
-
-        run_button = st.button(
-            "🚀 Запустить обработку",
-            type="primary",
-            use_container_width=True,
-            disabled=uploaded_file is None,
+        st.header("ℹ️ Конфигурация трекера")
+        st.caption(f"Файл: `{TRACKER_CONFIG_PATH.name}` (генерируется автоматически)")
+        if TRACKER_CONFIG_PATH.exists():
+            st.code(TRACKER_CONFIG_PATH.read_text(encoding="utf-8"), language="yaml")
+        st.caption(
+            "Пошаговый процесс: загрузка видео → зоны колец и пороги → сопоставление "
+            "игроков → полный анализ. Переключайтесь между шагами кнопками «Назад/Далее»."
         )
 
-        with st.expander("ℹ️ Конфигурация трекера"):
-            st.caption(f"Файл: `{TRACKER_CONFIG_PATH.name}` (генерируется автоматически)")
-            if TRACKER_CONFIG_PATH.exists():
-                st.code(TRACKER_CONFIG_PATH.read_text(encoding="utf-8"), language="yaml")
+    step = st.session_state["step"]
+    render_step_indicator(step)
 
-    if run_button and uploaded_file is not None:
-        run_analysis(
-            uploaded_file=uploaded_file,
-            device=device,
-            ring_x=ring_x,
-            ring_y=ring_y,
-            ring_radius=ring_radius,
-            possession_threshold=possession_threshold,
-            pass_window=pass_window,
-            shot_cooldown=shot_cooldown,
-        )
-
-    render_results_section()
+    if step == 1:
+        render_step1_upload()
+    elif step == 2:
+        render_step2_zones()
+    elif step == 3:
+        render_step3_players(device)
+    else:
+        render_step4_run(device)
 
 
 if __name__ == "__main__":
