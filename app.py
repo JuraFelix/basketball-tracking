@@ -161,6 +161,52 @@ BALL_MEMORY_SECONDS_MAX = 1.0
 
 QUICK_SCAN_SECONDS_DEFAULT = 15
 
+# --- Пороги уверенности детекции и разрешение инференса ---
+# Мяч ('sports ball') — гораздо более мелкий и часто смазанный объект, чем
+# игрок, и на видео низкого качества/при быстром полёте его confidence нередко
+# заметно ниже, чем у игроков. Единый жёсткий порог (например, дефолтные
+# 0.25 в ultralytics) в таком случае либо пропускает мяч (низкий порог, но
+# тогда растёт число ложных срабатываний по игрокам/фону), либо теряет мяч
+# почти всегда (высокий порог). Поэтому используются РАЗНЫЕ пороги: у
+# model.track()/model.predict() нет параметра per-class conf, поэтому на
+# инференс подаётся МИНИМАЛЬНЫЙ из двух порогов (чтобы мяч точно не был
+# отфильтрован на этом этапе), а затем детекции класса person и sports ball
+# фильтруются постфактум каждая своим порогом (см. parse_track_results).
+BALL_CONF_DEFAULT = 0.18
+BALL_CONF_MIN = 0.05
+BALL_CONF_MAX = 0.5
+
+PERSON_CONF_DEFAULT = 0.3
+PERSON_CONF_MIN = 0.1
+PERSON_CONF_MAX = 0.8
+
+# Разрешение, до которого YOLO letterbox-ит кадр перед инференсом. Дефолт
+# ultralytics — 640px, чего часто недостаточно для мелкого мяча на кадре
+# высокого разрешения (после ресайза до 640px мяч может занимать буквально
+# несколько пикселей). Увеличение imgsz даёт мячу больше пикселей ценой
+# более медленного инференса — поэтому вынесено в настраиваемый GUI-параметр.
+IMGSZ_DEFAULT = 640
+IMGSZ_OPTIONS = [640, 768, 896, 1024, 1152, 1280]
+
+# Сколько кадров сэмплировать по всему видео при диагностике видимости мяча
+# (шаг 3) — не весь ролик, чтобы диагностика оставалась быстрой (секунды, а
+# не минуты), но достаточно равномерно распределённых кадров для честной
+# оценки % обнаружения и средней уверенности.
+BALL_DIAGNOSTIC_MAX_SAMPLES = 120
+
+# --- Режим камеры ---
+# "Статичная камера" — исходное поведение (зоны колец фиксированы во всех
+# кадрах). "Камера в движении" — экспериментальный режим для видео с плавной
+# панорамой/наклоном камеры: позиции обеих зон колец, заданные пользователем
+# на кадре превью, пересчитываются в каждом кадре с учётом накопленного
+# сдвига камеры (см. estimate_camera_transforms/compute_dynamic_rings).
+CAMERA_MODE_STATIC = "static"
+CAMERA_MODE_PANNING = "panning"
+CAMERA_MODE_LABELS = {
+    CAMERA_MODE_STATIC: "📷 Статичная камера (стандартный режим)",
+    CAMERA_MODE_PANNING: "🎥 Камера в движении / панорама (экспериментально)",
+}
+
 # Доля от средней диагонали рамки игрока на видео, используемая как
 # авто-предложенный порог владения мячом (вместо фиксированных 90 px) —
 # на видео с дальней/близкой камерой игроки занимают разное число пикселей,
@@ -375,16 +421,138 @@ def ball_is_falling_through(
 
 
 # ---------------------------------------------------------------------------
+# Экспериментальный режим "камера в движении": оценка сдвига камеры между
+# кадрами и пересчёт позиций зон колец под панораму/наклон.
+# ---------------------------------------------------------------------------
+def estimate_camera_transforms(
+    video_path: str, progress_callback: Optional[Any] = None
+) -> List[np.ndarray]:
+    """Оценивает покадровый сдвиг камеры методом оптического потока Лукаса-Канаде
+    по устойчивым фоновым фичам (линии площадки, трибуны, стены и т.п.).
+
+    Возвращает список накопленных 3x3 матриц гомографии длиной в число кадров
+    видео, где transforms[i] переводит точку из системы координат КАДРА 0 в
+    систему координат КАДРА i. transforms[0] всегда единичная матрица.
+
+    Это ЭКСПЕРИМЕНТАЛЬНАЯ оценка: RANSAC внутри estimateAffinePartial2D
+    достаточно устойчив к перемещающимся игрокам (они занимают меньшую часть
+    кадра, чем статичный фон), но метод рассчитан на ПЛАВНУЮ панораму/наклон
+    камеры. Резкий зум, сильная тряска или смена плана (склейка) могут сбить
+    накопленную оценку — поэтому режим явно помечен как экспериментальный
+    в GUI, и статичный режим (весь фон предположения) остаётся дефолтным и
+    полностью независимым путём кода.
+    """
+    if cv2 is None:
+        return [np.eye(3, dtype=np.float64)]
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return [np.eye(3, dtype=np.float64)]
+
+    ret, prev_frame = cap.read()
+    if not ret:
+        cap.release()
+        return [np.eye(3, dtype=np.float64)]
+
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    cumulative: List[np.ndarray] = [np.eye(3, dtype=np.float64)]
+
+    feature_params = dict(maxCorners=250, qualityLevel=0.01, minDistance=12, blockSize=7)
+    lk_params = dict(
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        incremental = np.eye(3, dtype=np.float64)
+        prev_pts = cv2.goodFeaturesToTrack(prev_gray, mask=None, **feature_params)
+        if prev_pts is not None and len(prev_pts) >= 6:
+            next_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts, None, **lk_params)
+            if next_pts is not None and status is not None:
+                status_flat = status.flatten() == 1
+                good_prev = prev_pts[status_flat]
+                good_next = next_pts[status_flat]
+                if len(good_prev) >= 6:
+                    m, _inliers = cv2.estimateAffinePartial2D(
+                        good_prev, good_next, method=cv2.RANSAC, ransacReprojThreshold=3.0
+                    )
+                    if m is not None:
+                        incremental[:2, :] = m
+
+        cumulative.append(incremental @ cumulative[-1])
+        prev_gray = gray
+
+        if progress_callback is not None and len(cumulative) % 15 == 0:
+            try:
+                progress_callback(min(len(cumulative) / total_frames, 1.0))
+            except Exception:
+                pass
+
+    cap.release()
+    if progress_callback is not None:
+        try:
+            progress_callback(1.0)
+        except Exception:
+            pass
+    return cumulative
+
+
+def compute_dynamic_rings(
+    rings: List[RingZone],
+    camera_transforms: List[np.ndarray],
+    ref_frame_idx: int,
+    frame_idx: int,
+) -> List[RingZone]:
+    """Пересчитывает позиции (и радиус, с учётом лёгкого зума) зон колец из
+    системы координат кадра, на котором пользователь их задал (ref_frame_idx),
+    в систему координат текущего кадра (frame_idx), используя накопленные
+    трансформации камеры из estimate_camera_transforms."""
+    if not camera_transforms:
+        return rings
+    n = len(camera_transforms)
+    ref_idx = int(np.clip(ref_frame_idx, 0, n - 1))
+    cur_idx = int(np.clip(frame_idx, 0, n - 1))
+    try:
+        ref_inv = np.linalg.inv(camera_transforms[ref_idx])
+    except np.linalg.LinAlgError:
+        return rings
+    transform = camera_transforms[cur_idx] @ ref_inv
+    scale = math.hypot(transform[0, 0], transform[1, 0]) or 1.0
+
+    dynamic_rings: List[RingZone] = []
+    for ring in rings:
+        point = transform @ np.array([ring["x"], ring["y"], 1.0], dtype=np.float64)
+        dynamic_rings.append({"x": float(point[0]), "y": float(point[1]), "r": float(ring["r"] * scale)})
+    return dynamic_rings
+
+
+# ---------------------------------------------------------------------------
 # Разбор результатов детекции/трекинга Ultralytics и отрисовка аннотаций
 # ---------------------------------------------------------------------------
 def parse_track_results(
     results,
+    person_conf_threshold: float = 0.0,
+    ball_conf_threshold: float = 0.0,
 ) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], Optional[Tuple[float, float]]]:
     """Извлекает из результата YOLO список игроков (ID, рамка) и центр мяча.
 
     Координаты возвращаются в системе координат кадра, который был передан
     в model.track() — если перед детекцией применялось "улучшение качества"
     (апскейл), их нужно масштабировать обратно (см. process_video).
+
+    person_conf_threshold/ball_conf_threshold — постфактум-фильтрация по
+    классам: инференс (см. вызывающий код) намеренно идёт с ЕДИНЫМ низким
+    conf (не выше минимального из двух порогов), чтобы не потерять мяч на
+    этапе NMS модели, а затем каждый класс фильтруется своим порогом здесь —
+    так игроки не "засоряются" ложными детекциями низкой уверенности, а мяч
+    при этом всё ещё может быть обнаружен на низком пороге.
     """
     result = results[0]
     persons: List[Tuple[int, Tuple[float, float, float, float]]] = []
@@ -399,11 +567,17 @@ def parse_track_results(
 
         best_ball_conf = -1.0
         for box, c, tid, conf in zip(xyxy, cls, ids, confs):
+            conf = float(conf)
             if c == COCO_PERSON_CLASS_ID:
+                if conf < person_conf_threshold:
+                    continue
                 persons.append((int(tid), (float(box[0]), float(box[1]), float(box[2]), float(box[3]))))
-            elif c == COCO_BALL_CLASS_ID and conf > best_ball_conf:
-                best_ball_conf = float(conf)
-                ball = ((float(box[0]) + float(box[2])) / 2.0, (float(box[1]) + float(box[3])) / 2.0)
+            elif c == COCO_BALL_CLASS_ID:
+                if conf < ball_conf_threshold:
+                    continue
+                if conf > best_ball_conf:
+                    best_ball_conf = conf
+                    ball = ((float(box[0]) + float(box[2])) / 2.0, (float(box[1]) + float(box[3])) / 2.0)
 
     return persons, ball
 
@@ -622,7 +796,9 @@ def resize_crop_to_height(crop: Any, target_height: int = CROP_DISPLAY_HEIGHT) -
     return cv2.resize(crop, (new_w, target_height), interpolation=interpolation)
 
 
-def estimate_player_scale(frame, model, device: str) -> Optional[float]:
+def estimate_player_scale(
+    frame, model, device: str, person_conf: float = PERSON_CONF_DEFAULT, imgsz: int = IMGSZ_DEFAULT
+) -> Optional[float]:
     """Быстрый однократный проход детектора по кадру (без трекинга) — считает
     средний размер (диагональ рамки) игроков, чтобы предложить адаптивный
     дефолт порога владения мячом под масштаб конкретного видео вместо
@@ -630,7 +806,9 @@ def estimate_player_scale(frame, model, device: str) -> Optional[float]:
     if model is None or frame is None:
         return None
     try:
-        results = model.predict(frame, classes=[COCO_PERSON_CLASS_ID], device=device, verbose=False)
+        results = model.predict(
+            frame, classes=[COCO_PERSON_CLASS_ID], conf=person_conf, imgsz=imgsz, device=device, verbose=False
+        )
     except Exception:
         return None
     if not results:
@@ -654,20 +832,101 @@ def suggest_possession_threshold(avg_player_diagonal: Optional[float]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Диагностика видимости мяча (шаг 3) — отличить "проблема в порогах" от
+# "модель в принципе не видит мяч на этом видео".
+# ---------------------------------------------------------------------------
+def diagnose_ball_visibility(
+    video_path: str,
+    model,
+    device: str,
+    ball_conf_threshold: float,
+    imgsz: int,
+    enhance_quality: bool = False,
+    max_samples: int = BALL_DIAGNOSTIC_MAX_SAMPLES,
+) -> Optional[Dict[str, Any]]:
+    """Сэмплирует до max_samples равномерно распределённых по всему видео
+    кадров и считает, в каком проценте из них модель вообще обнаруживает мяч
+    (на текущем ball_conf_threshold/imgsz), плюс среднюю уверенность по
+    обнаруженным кадрам. Если процент низкий даже на сниженном пороге — это
+    сильный сигнал, что дело не в порогах, а в самой видимости мяча на видео
+    (качество, освещение, расстояние до камеры, смаз при быстром полёте).
+    """
+    if model is None or cv2 is None:
+        return None
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    if total_frames <= 0:
+        cap.release()
+        return None
+
+    step = max(total_frames // max_samples, 1)
+    sampled = 0
+    detected = 0
+    conf_sum = 0.0
+    frame_idx = 0
+
+    while frame_idx < total_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        detect_frame = enhance_frame_for_detection(frame) if enhance_quality else frame
+        try:
+            results = model.predict(
+                detect_frame,
+                classes=[COCO_BALL_CLASS_ID],
+                conf=ball_conf_threshold,
+                imgsz=imgsz,
+                device=device,
+                verbose=False,
+            )
+        except Exception:
+            break
+        sampled += 1
+        boxes = results[0].boxes
+        if boxes is not None and len(boxes) > 0:
+            confs = boxes.conf.cpu().numpy()
+            detected += 1
+            conf_sum += float(np.max(confs))
+        frame_idx += step
+
+    cap.release()
+    if sampled == 0:
+        return None
+    return {
+        "sampled_frames": sampled,
+        "frames_with_ball": detected,
+        "detection_rate": detected / sampled,
+        "avg_confidence": (conf_sum / detected) if detected else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Быстрое предварительное сканирование для сбора списка игроков (шаг 3)
 # ---------------------------------------------------------------------------
 def quick_player_scan(
-    video_path: str, model, device: str, max_seconds: float, fps_hint: float, enhance_quality: bool = False
+    video_path: str,
+    model,
+    device: str,
+    max_seconds: float,
+    fps_hint: float,
+    enhance_quality: bool = False,
+    person_conf: float = PERSON_CONF_DEFAULT,
+    ball_conf: float = BALL_CONF_DEFAULT,
+    imgsz: int = IMGSZ_DEFAULT,
 ) -> Dict[int, Any]:
     """Короткий прогон трекера по первым max_seconds секундам видео.
 
     Цель — не полноценная аналитика, а быстрый сбор всех уникальных ID
     игроков и одного репрезентативного кропа (самой уверенной/крупной
     детекции) на каждого, чтобы пользователь мог вручную вписать имя/номер.
-    Кадры не пропускаются, а enhance_quality применяется точно так же, как в
-    финальном прогоне (process_video) — чтобы ID трекера совпадали с ID,
-    которые получатся на шаге 4 (тот же трекер, тот же конфиг, тот же сброс
-    состояния — см. reset_tracker).
+    Кадры не пропускаются, а enhance_quality/person_conf/ball_conf/imgsz
+    применяются точно так же, как в финальном прогоне (process_video) —
+    чтобы ID трекера совпадали с ID, которые получатся на шаге 4 (тот же
+    трекер, тот же конфиг, те же пороги, тот же сброс состояния — см.
+    reset_tracker).
     """
     if model is None or cv2 is None:
         return {}
@@ -695,6 +954,8 @@ def quick_player_scan(
             tracker=str(TRACKER_CONFIG_PATH),
             device=device,
             classes=[COCO_PERSON_CLASS_ID, COCO_BALL_CLASS_ID],
+            conf=min(person_conf, ball_conf),
+            imgsz=imgsz,
             verbose=False,
         )
         result = results[0]
@@ -706,7 +967,7 @@ def quick_player_scan(
             confs = boxes.conf.cpu().numpy()
             h, w = detect_frame.shape[:2]
             for box, c, tid, conf in zip(xyxy, cls, ids, confs):
-                if c != COCO_PERSON_CLASS_ID:
+                if c != COCO_PERSON_CLASS_ID or float(conf) < person_conf:
                     continue
                 x1, y1, x2, y2 = [int(v) for v in box]
                 area = max(x2 - x1, 0) * max(y2 - y1, 0)
@@ -740,8 +1001,26 @@ def process_video(
     progress_bar,
     status_text,
     enhance_quality: bool = False,
+    person_conf: float = PERSON_CONF_DEFAULT,
+    ball_conf: float = BALL_CONF_DEFAULT,
+    imgsz: int = IMGSZ_DEFAULT,
+    camera_transforms: Optional[List[np.ndarray]] = None,
+    ring_reference_frame_idx: int = 0,
 ) -> Tuple[Dict[int, PlayerStats], Path, Dict[str, List[Dict[str, Any]]]]:
     """Обрабатывает видео покадрово: детекция, трекинг, события, хайлайты.
+
+    person_conf/ball_conf/imgsz — см. константы BALL_CONF_*/PERSON_CONF_*/
+    IMGSZ_* выше: инференс идёт с единым низким conf=min(person_conf,
+    ball_conf), а классы фильтруются раздельно постфактум в
+    parse_track_results (мяч — более мелкий и часто менее уверенный объект,
+    чем игрок, поэтому его порог обычно значительно ниже).
+
+    camera_transforms/ring_reference_frame_idx — экспериментальный режим
+    "камера в движении": если camera_transforms передан (список накопленных
+    матриц из estimate_camera_transforms), позиции зон колец пересчитываются
+    для каждого кадра относительно кадра ring_reference_frame_idx (на котором
+    пользователь их задал на шаге 2), см. compute_dynamic_rings. Если None —
+    поведение идентично исходному статичному режиму (зоны неподвижны).
 
     Возвращает (стата по игрокам, путь к аннотированному видео, отладочный лог
     владения мячом для GUI-таймлайна).
@@ -805,15 +1084,23 @@ def process_video(
             # кадре, чтобы выходное видео сохранило исходное разрешение.
             detect_frame = enhance_frame_for_detection(frame) if enhance_quality else frame
             # persist=True сохраняет ID треков между кадрами одного видео.
+            # conf=min(person_conf, ball_conf) — намеренно ЕДИНЫЙ низкий порог на
+            # инференсе (per-class conf в ultralytics track()/predict() не
+            # поддерживается), чтобы не потерять мяч на этапе NMS модели; более
+            # строгая фильтрация по каждому классу — ниже, в parse_track_results.
             results = model.track(
                 detect_frame,
                 persist=True,
                 tracker=tracker_path,
                 device=device,
                 classes=[COCO_PERSON_CLASS_ID, COCO_BALL_CLASS_ID],
+                conf=min(person_conf, ball_conf),
+                imgsz=imgsz,
                 verbose=False,
             )
-            persons, ball = parse_track_results(results)
+            persons, ball = parse_track_results(
+                results, person_conf_threshold=person_conf, ball_conf_threshold=ball_conf
+            )
             if enhance_quality:
                 inv_scale = 1.0 / ENHANCE_UPSCALE_FACTOR
                 persons = [(pid, tuple(v * inv_scale for v in box)) for pid, box in persons]
@@ -835,6 +1122,17 @@ def process_video(
                 2,
                 cv2.LINE_AA,
             )
+
+        # Режим "камера в движении": пересчитываем позиции зон колец под
+        # текущий кадр относительно кадра, на котором они были заданы
+        # (см. compute_dynamic_rings), и рисуем их на аннотированном кадре —
+        # это одновременно и логика события (ниже), и визуальное подтверждение
+        # того, что виртуальное кольцо действительно "следует" за панорамой.
+        if camera_transforms is not None:
+            current_rings = compute_dynamic_rings(rings, camera_transforms, ring_reference_frame_idx, frame_idx)
+            annotated = draw_zones_preview(annotated, current_rings)
+        else:
+            current_rings = rings
 
         # -------------------------------------------------------------
         # "ПАМЯТЬ" МЯЧА
@@ -932,7 +1230,7 @@ def process_video(
         # по направлению полёта мяча.
         # -------------------------------------------------------------
         if effective_ball is not None:
-            for ring_idx, ring in enumerate(rings):
+            for ring_idx, ring in enumerate(current_rings):
                 if not point_in_circle(effective_ball[0], effective_ball[1], ring["x"], ring["y"], ring["r"]):
                     continue
                 if (t - last_shot_time_per_ring[ring_idx]) < shot_cooldown:
@@ -1059,6 +1357,11 @@ def init_session_state() -> None:
         "ball_memory": float(BALL_MEMORY_SECONDS_DEFAULT),
         "shot_cooldown": float(SHOT_COOLDOWN_DEFAULT),
         "enhance_quality": False,
+        "person_conf": float(PERSON_CONF_DEFAULT),
+        "ball_conf": float(BALL_CONF_DEFAULT),
+        "imgsz": int(IMGSZ_DEFAULT),
+        "camera_mode": CAMERA_MODE_STATIC,
+        "ball_diagnostics": None,
         "preview_time": 0.0,
         "avg_player_diagonal": None,
         "auto_threshold_computed_for": None,
@@ -1088,6 +1391,7 @@ def reset_for_new_video() -> None:
         "avg_player_diagonal",
         "auto_threshold_computed_for",
         "_last_ring_click_time",
+        "ball_diagnostics",
     ):
         st.session_state[key] = {} if key in ("player_crops", "player_names", "player_numbers") else None
 
@@ -1116,7 +1420,29 @@ def render_step_indicator(current: int) -> None:
 # ---------------------------------------------------------------------------
 def render_step1_upload() -> None:
     st.header("Шаг 1 — Загрузка видео")
-    st.write("Загрузите видео тренировки со статичной камеры, снятое так, чтобы кольцо(-а) и площадка были в кадре.")
+
+    st.subheader("📷 Режим камеры")
+    camera_mode_label = st.radio(
+        "Как снято видео?",
+        options=[CAMERA_MODE_LABELS[CAMERA_MODE_STATIC], CAMERA_MODE_LABELS[CAMERA_MODE_PANNING]],
+        index=0 if st.session_state.get("camera_mode", CAMERA_MODE_STATIC) == CAMERA_MODE_STATIC else 1,
+        help="Выбор влияет на то, как обрабатываются зоны колец на шаге 4.",
+    )
+    st.session_state["camera_mode"] = (
+        CAMERA_MODE_PANNING if camera_mode_label == CAMERA_MODE_LABELS[CAMERA_MODE_PANNING] else CAMERA_MODE_STATIC
+    )
+    if st.session_state["camera_mode"] == CAMERA_MODE_PANNING:
+        st.warning(
+            "⚠️ Экспериментальный режим. Позиции обеих зон колец, заданные на шаге 2, будут "
+            "автоматически пересчитываться под сдвиг камеры на каждом кадре (оптический поток "
+            "по фоновым фичам). Надёжно работает для **плавной** панорамы/наклона камеры — при "
+            "резком зуме, сильной тряске или смене плана оценка сдвига может потерять точность, "
+            "и виртуальные зоны колец разъедутся с реальными кольцами на площадке."
+        )
+    else:
+        st.caption("Зоны колец, заданные на шаге 2, останутся неподвижными во всех кадрах (как раньше).")
+
+    st.write("Загрузите видео тренировки, снятое так, чтобы кольцо(-а) и площадка были в кадре.")
 
     if cv2 is None:
         st.error(f"Библиотека opencv-python не установлена: {CV2_IMPORT_ERROR}. Установите зависимости из requirements.txt.")
@@ -1202,11 +1528,23 @@ def render_step2_zones(device: str) -> None:
         model, _ = load_model(device)
         if model is not None:
             with st.spinner("Авто-калибровка порога владения по кадру..."):
-                avg_diag = estimate_player_scale(frame, model, device)
+                avg_diag = estimate_player_scale(
+                    frame, model, device,
+                    person_conf=float(st.session_state.get("person_conf", PERSON_CONF_DEFAULT)),
+                    imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
+                )
             if avg_diag:
                 st.session_state["avg_player_diagonal"] = avg_diag
                 st.session_state["possession_threshold"] = suggest_possession_threshold(avg_diag)
         st.session_state["auto_threshold_computed_for"] = video_path
+
+    if st.session_state.get("camera_mode") == CAMERA_MODE_PANNING:
+        st.info(
+            "🎥 Режим «камера в движении» включён: зоны колец задаются здесь на выбранном кадре "
+            "превью, а на шаге 4 их позиции будут автоматически пересчитываться под сдвиг камеры "
+            "относительно ИМЕННО ЭТОГО кадра. Если поменяете секунду превью выше — точка отсчёта "
+            "для пересчёта сдвинется вместе с ней."
+        )
 
     st.subheader("🎯 Зоны обоих колец")
     if streamlit_image_coordinates is not None and cv2 is not None:
@@ -1367,6 +1705,38 @@ def render_step2_zones(device: str) -> None:
         help="Минимальный промежуток между двумя засчитанными бросками у одного и того же кольца.",
     )
 
+    st.subheader("🏀 Детекция мяча и производительность")
+    st.caption(
+        "Мяч — маленький и часто смазанный объект, его уверенность детекции обычно заметно ниже, "
+        "чем у игроков. Поэтому порог для мяча по умолчанию ниже, чем для игроков. Если события "
+        "(броски/передачи) не фиксируются — сначала запустите диагностику видимости мяча на шаге 3."
+    )
+    cconf1, cconf2 = st.columns(2)
+    with cconf1:
+        st.session_state["ball_conf"] = st.slider(
+            "Порог уверенности для мяча (conf)",
+            min_value=BALL_CONF_MIN, max_value=BALL_CONF_MAX,
+            value=float(st.session_state["ball_conf"]), step=0.01,
+            help="Ниже — мяч обнаруживается чаще, но растёт риск ложных срабатываний на бликах/похожих объектах.",
+        )
+    with cconf2:
+        st.session_state["person_conf"] = st.slider(
+            "Порог уверенности для игроков (conf)",
+            min_value=PERSON_CONF_MIN, max_value=PERSON_CONF_MAX,
+            value=float(st.session_state["person_conf"]), step=0.05,
+            help="Выше — меньше ложных рамок на фоне/зрителях, но риск пропустить игрока в сложной позе/перекрытии.",
+        )
+    st.session_state["imgsz"] = st.select_slider(
+        "Разрешение инференса (imgsz, px)",
+        options=IMGSZ_OPTIONS,
+        value=int(st.session_state["imgsz"]) if int(st.session_state["imgsz"]) in IMGSZ_OPTIONS else IMGSZ_DEFAULT,
+        help="Выше — мяч (мелкий объект) занимает больше пикселей после ресайза модели и его легче "
+        "обнаружить, но обработка заметно замедляется. 640 — дефолт ultralytics, 960-1280 рекомендуется "
+        "для видео с плохо видимым мячом.",
+    )
+    if int(st.session_state["imgsz"]) > IMGSZ_DEFAULT:
+        st.caption(f"⚠️ imgsz={int(st.session_state['imgsz'])} заметно медленнее дефолтных {IMGSZ_DEFAULT}px, особенно на CPU.")
+
     st.subheader("🔧 Качество детекции")
     st.session_state["enhance_quality"] = st.checkbox(
         "Улучшить качество кадра перед детекцией (апскейл + резкость)",
@@ -1442,6 +1812,9 @@ def render_step3_players(device: str) -> None:
                 crops = quick_player_scan(
                     video_path, model, device, max_seconds=scan_seconds, fps_hint=meta["fps"],
                     enhance_quality=st.session_state.get("enhance_quality", False),
+                    person_conf=float(st.session_state.get("person_conf", PERSON_CONF_DEFAULT)),
+                    ball_conf=float(st.session_state.get("ball_conf", BALL_CONF_DEFAULT)),
+                    imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
                 )
             st.session_state["player_crops"] = crops
             if not crops:
@@ -1471,6 +1844,58 @@ def render_step3_players(device: str) -> None:
             "Пока нет данных — запустите сканирование выше, либо пропустите этот шаг: "
             "в итоговой таблице игроки будут отображаться как «Игрок {ID}»."
         )
+
+    st.divider()
+    st.subheader("🏀 Диагностика видимости мяча")
+    st.caption(
+        "Если на шаге 4 фиксируется 0 бросков/передач — сначала проверьте здесь, вообще ли модель "
+        "видит мяч на этом видео при текущем пороге уверенности (настраивается на шаге 2), прежде "
+        "чем менять пороги владения/передач."
+    )
+    if st.button("🔍 Проверить видимость мяча"):
+        model, model_error = load_model(device)
+        if model is None:
+            st.warning(f"⚠️ Модель YOLO11x не загружена ({model_error}) — диагностика недоступна в этой среде.")
+        else:
+            with st.spinner("Сэмплирование кадров по всему видео..."):
+                diag = diagnose_ball_visibility(
+                    video_path, model, device,
+                    ball_conf_threshold=float(st.session_state.get("ball_conf", BALL_CONF_DEFAULT)),
+                    imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
+                    enhance_quality=st.session_state.get("enhance_quality", False),
+                )
+            st.session_state["ball_diagnostics"] = diag
+            if diag is None:
+                st.error("Не удалось выполнить диагностику (не открылось видео или сбой модели).")
+
+    diag = st.session_state.get("ball_diagnostics")
+    if diag:
+        rate_pct = diag["detection_rate"] * 100.0
+        st.caption(
+            f"Сэмплировано кадров: {diag['sampled_frames']} · мяч обнаружен в "
+            f"{diag['frames_with_ball']} из них ({rate_pct:.0f}%) · средняя уверенность по "
+            f"обнаруженным кадрам: {diag['avg_confidence']:.2f}"
+        )
+        if rate_pct >= 50:
+            st.success(
+                f"✅ Мяч обнаруживается стабильно ({rate_pct:.0f}% кадров, средняя уверенность "
+                f"{diag['avg_confidence']:.2f}). Если события всё равно не фиксируются — дело, скорее "
+                "всего, в порогах владения/передач или кулдауне (шаг 2), а не в видимости мяча."
+            )
+        elif rate_pct >= 20:
+            st.warning(
+                f"⚠️ Мяч обнаруживается умеренно часто ({rate_pct:.0f}% кадров, средняя уверенность "
+                f"{diag['avg_confidence']:.2f}) — вероятно проблема с качеством видео/освещением/"
+                "дистанцией съёмки. Попробуйте повысить imgsz и/или включить улучшение качества кадра "
+                "на шаге 2, либо ещё немного снизить порог уверенности для мяча."
+            )
+        else:
+            st.error(
+                f"❌ Мяч обнаружен лишь в {rate_pct:.0f}% кадров (средняя уверенность "
+                f"{diag['avg_confidence']:.2f}) — вероятно проблема в качестве видео/освещении/"
+                "расстоянии до камеры, а не в порогах. Броски и передачи почти наверняка будут "
+                "фиксироваться редко или не будут вовсе, пока мяч физически не виден модели чаще."
+            )
 
     colA, colB = st.columns(2)
     with colA:
@@ -1507,6 +1932,20 @@ def run_full_analysis(video_path: str, device: str) -> None:
         {"x": st.session_state["ring2_x"], "y": st.session_state["ring2_y"], "r": st.session_state["ring2_r"]},
     ]
 
+    camera_transforms: Optional[List[np.ndarray]] = None
+    ring_reference_frame_idx = 0
+    if st.session_state.get("camera_mode") == CAMERA_MODE_PANNING and cv2 is not None:
+        meta = get_video_metadata(video_path)
+        ring_reference_frame_idx = int(round(float(st.session_state.get("preview_time", 0.0)) * meta["fps"]))
+        st.info("🎥 Экспериментальный режим «камера в движении»: оцениваю сдвиг камеры по всему видео...")
+        cam_progress = st.progress(0.0)
+        try:
+            camera_transforms = estimate_camera_transforms(video_path, progress_callback=cam_progress.progress)
+        except Exception as exc:
+            st.warning(f"⚠️ Не удалось оценить движение камеры ({exc}) — зоны колец останутся фиксированными.")
+            camera_transforms = None
+        cam_progress.progress(1.0)
+
     progress_bar = st.progress(0.0)
     status_text = st.empty()
 
@@ -1523,6 +1962,11 @@ def run_full_analysis(video_path: str, device: str) -> None:
             progress_bar=progress_bar,
             status_text=status_text,
             enhance_quality=bool(st.session_state.get("enhance_quality", False)),
+            person_conf=float(st.session_state.get("person_conf", PERSON_CONF_DEFAULT)),
+            ball_conf=float(st.session_state.get("ball_conf", BALL_CONF_DEFAULT)),
+            imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
+            camera_transforms=camera_transforms,
+            ring_reference_frame_idx=ring_reference_frame_idx,
         )
     except Exception as exc:
         st.error(f"Ошибка при обработке видео: {exc}")
@@ -1642,6 +2086,21 @@ def render_step4_run(device: str) -> None:
             "Улучшение качества кадра перед детекцией: "
             + ("включено ✅" if st.session_state.get("enhance_quality") else "выключено")
         )
+        st.write(
+            f"Порог уверенности: мяч {float(st.session_state.get('ball_conf', BALL_CONF_DEFAULT)):.2f} · "
+            f"игроки {float(st.session_state.get('person_conf', PERSON_CONF_DEFAULT)):.2f} · "
+            f"imgsz {int(st.session_state.get('imgsz', IMGSZ_DEFAULT))}px"
+        )
+        st.write(
+            "Режим камеры: "
+            + CAMERA_MODE_LABELS.get(st.session_state.get("camera_mode", CAMERA_MODE_STATIC), "статичная")
+        )
+        diag = st.session_state.get("ball_diagnostics")
+        if diag:
+            st.write(
+                f"Диагностика видимости мяча: обнаружен в {diag['detection_rate'] * 100:.0f}% "
+                f"сэмплированных кадров (средняя уверенность {diag['avg_confidence']:.2f})"
+            )
         n_players = len(st.session_state.get("player_names") or {})
         st.write(f"Сопоставлено игроков (имя/номер): {n_players}")
 
