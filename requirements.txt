@@ -11,6 +11,7 @@
 # из README ПЕРЕД этим файлом.
 
 streamlit==1.40.2
+streamlit-image-coordinates==0.4.1
 ultralytics==8.3.28
 torch==2.4.1
 torchvision==0.19.1
@@ -19,3 +20,10 @@ numpy==1.26.4
 pandas==2.2.2
 PyYAML==6.0.2
 Pillow==10.4.0
+
+# ffmpeg — НЕ python-пакет, устанавливается отдельно системным менеджером
+# пакетов (sudo apt install ffmpeg / brew install ffmpeg / winget install
+# ffmpeg). Не обязателен для работы приложения, но настоятельно рекомендуется:
+# без него аннотированное видео и хайлайты пишутся в кодеке OpenCV по
+# умолчанию, который не во всех браузерах проигрывается через встроенный
+# плеер Streamlit (см. README.md, раздел "Воспроизведение видео в браузере").

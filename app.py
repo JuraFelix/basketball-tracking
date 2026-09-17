@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
+import subprocess
 import tempfile
 from collections import deque
 from datetime import datetime
@@ -84,6 +86,17 @@ try:
 except Exception as exc:  # pragma: no cover - защита от отсутствия opencv
     cv2 = None  # type: ignore[assignment]
     CV2_IMPORT_ERROR = str(exc)
+
+# streamlit-image-coordinates — необязательная лёгкая зависимость для клика
+# мышкой по превью (шаг 2). Если пакета нет — GUI просто скрывает кликабельный
+# режим и оставляет числовые поля/слайдеры как единственный способ ввода.
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+
+    IMAGE_COORDINATES_IMPORT_ERROR: Optional[str] = None
+except Exception as exc:  # pragma: no cover - защита от отсутствия пакета
+    streamlit_image_coordinates = None  # type: ignore[assignment]
+    IMAGE_COORDINATES_IMPORT_ERROR = str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +160,29 @@ BALL_MEMORY_SECONDS_MIN = 0.0
 BALL_MEMORY_SECONDS_MAX = 1.0
 
 QUICK_SCAN_SECONDS_DEFAULT = 15
+
+# Доля от средней диагонали рамки игрока на видео, используемая как
+# авто-предложенный порог владения мячом (вместо фиксированных 90 px) —
+# на видео с дальней/близкой камерой игроки занимают разное число пикселей,
+# и порог должен масштабироваться вместе с ними.
+POSSESSION_THRESHOLD_DIAGONAL_FRACTION = 0.5
+
+# Во сколько раз апскейлить кадр перед детекцией при включённой опции
+# "улучшить качество кадра" (шаг 2). Помогает трекеру/ReID на видео низкого
+# разрешения, но не является панацеей при изначально плохом качестве видео.
+ENHANCE_UPSCALE_FACTOR = 1.6
+
+# Высота, до которой приводятся все кропы игроков в сетке на шаге 3
+# (пропорции сохраняются) — делает сетку компактной и аккуратной.
+CROP_DISPLAY_HEIGHT = 160
+
+# Максимальная ширина превью-изображения для кликабельного выбора кольца
+# на шаге 2 (большие кадры уменьшаются для компактности интерфейса).
+PREVIEW_MAX_DISPLAY_WIDTH = 900
+
+# Путь к системному ffmpeg (если установлен) — используется для перекодировки
+# видео в H.264, совместимый с браузерным <video> (см. reencode_for_browser).
+FFMPEG_PATH = shutil.which("ffmpeg")
 
 
 PlayerStats = Dict[str, int]
@@ -339,15 +375,18 @@ def ball_is_falling_through(
 
 
 # ---------------------------------------------------------------------------
-# Разбор результатов детекции/трекинга Ultralytics
+# Разбор результатов детекции/трекинга Ultralytics и отрисовка аннотаций
 # ---------------------------------------------------------------------------
-def parse_results(
+def parse_track_results(
     results,
-) -> Tuple[Any, List[Tuple[int, Tuple[float, float, float, float]]], Optional[Tuple[float, float]]]:
-    """Извлекает из результата YOLO кадр с аннотациями, список игроков и мяч."""
-    result = results[0]
-    annotated = result.plot()  # BGR-кадр с нарисованными боксами и ID треков
+) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], Optional[Tuple[float, float]]]:
+    """Извлекает из результата YOLO список игроков (ID, рамка) и центр мяча.
 
+    Координаты возвращаются в системе координат кадра, который был передан
+    в model.track() — если перед детекцией применялось "улучшение качества"
+    (апскейл), их нужно масштабировать обратно (см. process_video).
+    """
+    result = results[0]
     persons: List[Tuple[int, Tuple[float, float, float, float]]] = []
     ball: Optional[Tuple[float, float]] = None
 
@@ -366,7 +405,68 @@ def parse_results(
                 best_ball_conf = float(conf)
                 ball = ((float(box[0]) + float(box[2])) / 2.0, (float(box[1]) + float(box[3])) / 2.0)
 
-    return annotated, persons, ball
+    return persons, ball
+
+
+def id_to_color(pid: int) -> Tuple[int, int, int]:
+    """Детерминированный BGR-цвет по ID трека — чтобы игроки визуально
+    отличались друг от друга на аннотированном видео."""
+    hue = (int(pid) * 47) % 180
+    hsv_pixel = np.uint8([[[hue, 220, 255]]])
+    bgr_pixel = cv2.cvtColor(hsv_pixel, cv2.COLOR_HSV2BGR)[0][0]
+    return int(bgr_pixel[0]), int(bgr_pixel[1]), int(bgr_pixel[2])
+
+
+def draw_annotations(
+    frame,
+    persons: List[Tuple[int, Tuple[float, float, float, float]]],
+    ball: Optional[Tuple[float, float]],
+):
+    """Рисует рамки игроков (с ID) и маркер мяча на копии кадра.
+
+    Заменяет result.plot() из ultralytics: при включённом "улучшении
+    качества" детекция идёт на увеличенном кадре, а рисовать нужно на
+    ОРИГИНАЛЬНОМ (после пересчёта координат обратно) — иначе выходное видео
+    получилось бы в другом разрешении, чем входное.
+    """
+    annotated = frame.copy()
+    for pid, (x1, y1, x2, y2) in persons:
+        color = id_to_color(pid)
+        p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
+        cv2.rectangle(annotated, p1, p2, color, 2)
+        label = f"ID {pid}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        label_y1 = max(p1[1] - th - 8, 0)
+        cv2.rectangle(annotated, (p1[0], label_y1), (p1[0] + tw + 6, p1[1]), color, -1)
+        cv2.putText(
+            annotated, label, (p1[0] + 3, max(p1[1] - 5, th)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA,
+        )
+    if ball is not None:
+        center = (int(ball[0]), int(ball[1]))
+        cv2.circle(annotated, center, 9, (0, 215, 255), -1)
+        cv2.circle(annotated, center, 9, (0, 0, 0), 2)
+        cv2.putText(
+            annotated, "ball", (center[0] + 12, center[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 215, 255), 2, cv2.LINE_AA,
+        )
+    return annotated
+
+
+def enhance_frame_for_detection(frame):
+    """Апскейл + лёгкая резкость перед детекцией (опция "улучшить качество").
+
+    Может помочь трекеру/ReID отличать игроков на видео низкого разрешения
+    за счёт более крупных/чётких признаков на входе модели, но НЕ панацея:
+    если исходное видео сильно сжато или изначально низкого качества, апскейл
+    не восстановит потерянные детали.
+    """
+    upscaled = cv2.resize(
+        frame, None, fx=ENHANCE_UPSCALE_FACTOR, fy=ENHANCE_UPSCALE_FACTOR, interpolation=cv2.INTER_LANCZOS4
+    )
+    blurred = cv2.GaussianBlur(upscaled, (0, 0), sigmaX=1.0)
+    sharpened = cv2.addWeighted(upscaled, 1.5, blurred, -0.5, 0)
+    return sharpened
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +487,41 @@ class PendingHighlight:
         return len(self.future_frames) >= self.frames_needed
 
 
+def reencode_for_browser(path: Path) -> Path:
+    """Перекодирует mp4 в H.264 (yuv420p, +faststart) через системный ffmpeg.
+
+    cv2.VideoWriter пишет валидный MP4, но кодеком по умолчанию (обычно
+    mp4v/MPEG-4 Part 2), который многие браузеры НЕ умеют проигрывать через
+    HTML5 <video> (а именно так работает st.video) — файл при этом открывается
+    внешними плеерами, но выглядит "битым" во встроенном плеере Streamlit.
+    H.264 поддерживается практически всеми браузерами. Если ffmpeg не найден
+    в системе или перекодирование не удалось — возвращаем исходный файл без
+    изменений; GUI в этом случае покажет предупреждение и кнопку скачивания.
+    """
+    if not FFMPEG_PATH or not path.exists() or path.stat().st_size == 0:
+        return path
+    tmp_out = path.with_name(path.stem + "_h264" + path.suffix)
+    try:
+        result = subprocess.run(
+            [
+                FFMPEG_PATH, "-y", "-i", str(path),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an",
+                str(tmp_out),
+            ],
+            capture_output=True,
+            timeout=600,
+        )
+        if result.returncode == 0 and tmp_out.exists() and tmp_out.stat().st_size > 0:
+            path.unlink(missing_ok=True)
+            tmp_out.rename(path)
+        else:
+            tmp_out.unlink(missing_ok=True)
+    except Exception:
+        tmp_out.unlink(missing_ok=True)
+    return path
+
+
 def save_highlight_clip(highlight: PendingHighlight, fps: float, width: int, height: int) -> Path:
     """Сохраняет буфер прошлого + будущего в автономный MP4-файл в highlights/."""
     frames = highlight.past_frames + highlight.future_frames
@@ -396,7 +531,7 @@ def save_highlight_clip(highlight: PendingHighlight, fps: float, width: int, hei
     for frame in frames:
         writer.write(frame)
     writer.release()
-    return out_path
+    return reencode_for_browser(out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -435,8 +570,18 @@ def default_ring_zones(width: int, height: int) -> Tuple[RingZone, RingZone]:
     return ring1, ring2
 
 
-def draw_zones_preview(frame, rings: List[RingZone]):
-    """Рисует окружности зон колец на копии кадра для наглядной проверки в GUI."""
+def draw_zones_preview(
+    frame,
+    rings: List[RingZone],
+    possession_threshold: Optional[float] = None,
+) -> Any:
+    """Рисует окружности зон колец на копии кадра для наглядной проверки в GUI.
+
+    Если передан possession_threshold — дополнительно рисует в углу кадра
+    эталонный полупрозрачный круг такого радиуса с подписью в пикселях, чтобы
+    пользователь видел порог владения мячом в реальном масштабе кадра, а не
+    гадал по числу пикселей.
+    """
     preview = frame.copy()
     colors = [(0, 140, 255), (255, 80, 0)]
     for idx, ring in enumerate(rings):
@@ -447,23 +592,82 @@ def draw_zones_preview(frame, rings: List[RingZone]):
         cv2.drawMarker(preview, center, color, markerType=cv2.MARKER_CROSS, markerSize=14, thickness=2)
         label_pos = (max(center[0] - 45, 0), max(center[1] - radius - 12, 20))
         cv2.putText(preview, f"Кольцо {idx + 1}", label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+
+    if possession_threshold and possession_threshold > 0:
+        h, w = preview.shape[:2]
+        r = int(possession_threshold)
+        margin = r + 20
+        hint_center = (min(margin, w - 1), max(h - margin, 1))
+        overlay = preview.copy()
+        cv2.circle(overlay, hint_center, r, (0, 255, 0), -1)
+        preview = cv2.addWeighted(overlay, 0.18, preview, 0.82, 0)
+        cv2.circle(preview, hint_center, r, (0, 255, 0), 2, lineType=cv2.LINE_AA)
+        label = f"Порог владения: {r}px"
+        cv2.putText(
+            preview, label, (min(margin - r, w - 10), max(h - margin - r - 10, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA,
+        )
     return preview
+
+
+def resize_crop_to_height(crop: Any, target_height: int = CROP_DISPLAY_HEIGHT) -> Any:
+    """Приводит кроп игрока к фиксированной высоте с сохранением пропорций —
+    чтобы сетка кропов на шаге 3 выглядела аккуратно и компактно."""
+    h, w = crop.shape[:2]
+    if h <= 0 or w <= 0:
+        return crop
+    scale = target_height / float(h)
+    new_w = max(int(round(w * scale)), 1)
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    return cv2.resize(crop, (new_w, target_height), interpolation=interpolation)
+
+
+def estimate_player_scale(frame, model, device: str) -> Optional[float]:
+    """Быстрый однократный проход детектора по кадру (без трекинга) — считает
+    средний размер (диагональ рамки) игроков, чтобы предложить адаптивный
+    дефолт порога владения мячом под масштаб конкретного видео вместо
+    фиксированных пикселей."""
+    if model is None or frame is None:
+        return None
+    try:
+        results = model.predict(frame, classes=[COCO_PERSON_CLASS_ID], device=device, verbose=False)
+    except Exception:
+        return None
+    if not results:
+        return None
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        return None
+    xyxy = boxes.xyxy.cpu().numpy()
+    diagonals = [math.hypot(x2 - x1, y2 - y1) for x1, y1, x2, y2 in xyxy]
+    if not diagonals:
+        return None
+    return float(np.mean(diagonals))
+
+
+def suggest_possession_threshold(avg_player_diagonal: Optional[float]) -> int:
+    """Переводит средний размер игрока в рекомендованный порог владения мячом."""
+    if not avg_player_diagonal or avg_player_diagonal <= 0:
+        return POSSESSION_THRESHOLD_DEFAULT
+    suggestion = avg_player_diagonal * POSSESSION_THRESHOLD_DIAGONAL_FRACTION
+    return int(np.clip(suggestion, POSSESSION_THRESHOLD_MIN, POSSESSION_THRESHOLD_MAX))
 
 
 # ---------------------------------------------------------------------------
 # Быстрое предварительное сканирование для сбора списка игроков (шаг 3)
 # ---------------------------------------------------------------------------
 def quick_player_scan(
-    video_path: str, model, device: str, max_seconds: float, fps_hint: float
+    video_path: str, model, device: str, max_seconds: float, fps_hint: float, enhance_quality: bool = False
 ) -> Dict[int, Any]:
     """Короткий прогон трекера по первым max_seconds секундам видео.
 
     Цель — не полноценная аналитика, а быстрый сбор всех уникальных ID
     игроков и одного репрезентативного кропа (самой уверенной/крупной
     детекции) на каждого, чтобы пользователь мог вручную вписать имя/номер.
-    Разрешение НЕ уменьшается и кадры не пропускаются, чтобы ID трекера
-    совпадали с ID, которые получатся при финальном полном прогоне на шаге 4
-    (тот же трекер, тот же конфиг, тот же сброс состояния — см. reset_tracker).
+    Кадры не пропускаются, а enhance_quality применяется точно так же, как в
+    финальном прогоне (process_video) — чтобы ID трекера совпадали с ID,
+    которые получатся на шаге 4 (тот же трекер, тот же конфиг, тот же сброс
+    состояния — см. reset_tracker).
     """
     if model is None or cv2 is None:
         return {}
@@ -484,8 +688,9 @@ def quick_player_scan(
         if not ret:
             break
 
+        detect_frame = enhance_frame_for_detection(frame) if enhance_quality else frame
         results = model.track(
-            frame,
+            detect_frame,
             persist=True,
             tracker=str(TRACKER_CONFIG_PATH),
             device=device,
@@ -499,7 +704,7 @@ def quick_player_scan(
             cls = boxes.cls.cpu().numpy().astype(int)
             ids = boxes.id.cpu().numpy().astype(int)
             confs = boxes.conf.cpu().numpy()
-            h, w = frame.shape[:2]
+            h, w = detect_frame.shape[:2]
             for box, c, tid, conf in zip(xyxy, cls, ids, confs):
                 if c != COCO_PERSON_CLASS_ID:
                     continue
@@ -510,7 +715,7 @@ def quick_player_scan(
                 if prev is None or score > prev[0]:
                     x1c, y1c = max(x1, 0), max(y1, 0)
                     x2c, y2c = min(x2, w), min(y2, h)
-                    crop = frame[y1c:y2c, x1c:x2c].copy()
+                    crop = detect_frame[y1c:y2c, x1c:x2c].copy()
                     if crop.size > 0:
                         best_crops[int(tid)] = (score, crop)
         frame_idx += 1
@@ -534,6 +739,7 @@ def process_video(
     ball_memory_seconds: float,
     progress_bar,
     status_text,
+    enhance_quality: bool = False,
 ) -> Tuple[Dict[int, PlayerStats], Path, Dict[str, List[Dict[str, Any]]]]:
     """Обрабатывает видео покадрово: детекция, трекинг, события, хайлайты.
 
@@ -593,16 +799,27 @@ def process_video(
         t = frame_idx / fps
 
         if model is not None:
+            # Опционально апскейлим+резчим кадр перед детекцией (помогает
+            # трекеру/ReID на видео низкого разрешения), затем пересчитываем
+            # координаты обратно в исходный масштаб и рисуем на ОРИГИНАЛЬНОМ
+            # кадре, чтобы выходное видео сохранило исходное разрешение.
+            detect_frame = enhance_frame_for_detection(frame) if enhance_quality else frame
             # persist=True сохраняет ID треков между кадрами одного видео.
             results = model.track(
-                frame,
+                detect_frame,
                 persist=True,
                 tracker=tracker_path,
                 device=device,
                 classes=[COCO_PERSON_CLASS_ID, COCO_BALL_CLASS_ID],
                 verbose=False,
             )
-            annotated, persons, ball = parse_results(results)
+            persons, ball = parse_track_results(results)
+            if enhance_quality:
+                inv_scale = 1.0 / ENHANCE_UPSCALE_FACTOR
+                persons = [(pid, tuple(v * inv_scale for v in box)) for pid, box in persons]
+                if ball is not None:
+                    ball = (ball[0] * inv_scale, ball[1] * inv_scale)
+            annotated = draw_annotations(frame, persons, ball)
         else:
             # Демо-режим: модель не загружена (нет интернета/GPU) — не роняем
             # приложение, просто прокатываем видео без детекций.
@@ -786,6 +1003,7 @@ def process_video(
 
     cap.release()
     writer.release()
+    output_path = reencode_for_browser(output_path)
     return stats, output_path, debug_log
 
 
@@ -840,7 +1058,12 @@ def init_session_state() -> None:
         "pass_window": float(PASS_WINDOW_DEFAULT),
         "ball_memory": float(BALL_MEMORY_SECONDS_DEFAULT),
         "shot_cooldown": float(SHOT_COOLDOWN_DEFAULT),
+        "enhance_quality": False,
         "preview_time": 0.0,
+        "avg_player_diagonal": None,
+        "auto_threshold_computed_for": None,
+        "click_target_ring": "Кольцо 1",
+        "_last_ring_click_time": None,
         "player_crops": {},
         "player_names": {},
         "player_numbers": {},
@@ -862,6 +1085,9 @@ def reset_for_new_video() -> None:
         "box_score_df",
         "debug_log",
         "last_output_video",
+        "avg_player_diagonal",
+        "auto_threshold_computed_for",
+        "_last_ring_click_time",
     ):
         st.session_state[key] = {} if key in ("player_crops", "player_names", "player_numbers") else None
 
@@ -923,7 +1149,7 @@ def render_step1_upload() -> None:
 # ---------------------------------------------------------------------------
 # Шаг 2 — превью + зоны колец + пороги владения/передач
 # ---------------------------------------------------------------------------
-def render_step2_zones() -> None:
+def render_step2_zones(device: str) -> None:
     st.header("Шаг 2 — Превью и настройка зон")
     video_path = st.session_state.get("video_path")
     if not video_path or not Path(video_path).exists():
@@ -937,14 +1163,14 @@ def render_step2_zones() -> None:
     if st.session_state.get("rings_initialized_for") != video_path:
         ring1, ring2 = default_ring_zones(int(meta["width"]), int(meta["height"]))
         st.session_state["ring1_x"], st.session_state["ring1_y"], st.session_state["ring1_r"] = (
-            ring1["x"],
-            ring1["y"],
-            ring1["r"],
+            int(ring1["x"]),
+            int(ring1["y"]),
+            int(ring1["r"]),
         )
         st.session_state["ring2_x"], st.session_state["ring2_y"], st.session_state["ring2_r"] = (
-            ring2["x"],
-            ring2["y"],
-            ring2["r"],
+            int(ring2["x"]),
+            int(ring2["y"]),
+            int(ring2["r"]),
         )
         st.session_state["rings_initialized_for"] = video_path
 
@@ -955,31 +1181,80 @@ def render_step2_zones() -> None:
     )
     frame = extract_frame_at_time(video_path, st.session_state["preview_time"])
 
+    # --- Авто-калибровка порога владения по среднему размеру игрока на кадре ---
+    # Фиксированный порог в пикселях не учитывает масштаб конкретного видео
+    # (камера близко/далеко, разное разрешение) — поэтому один раз на видео
+    # (и по кнопке повторно) считаем средний размер рамки игрока и предлагаем
+    # адаптивный дефолт вместо жёстких 90px.
+    if frame is not None and st.session_state.get("auto_threshold_computed_for") != video_path:
+        model, _ = load_model(device)
+        if model is not None:
+            with st.spinner("Авто-калибровка порога владения по кадру..."):
+                avg_diag = estimate_player_scale(frame, model, device)
+            if avg_diag:
+                st.session_state["avg_player_diagonal"] = avg_diag
+                st.session_state["possession_threshold"] = suggest_possession_threshold(avg_diag)
+        st.session_state["auto_threshold_computed_for"] = video_path
+
     st.subheader("🎯 Зоны обоих колец")
+    if streamlit_image_coordinates is not None and cv2 is not None:
+        st.caption(
+            "Кликните по превью, чтобы поставить центр выбранного кольца, либо используйте "
+            "числовые поля ниже для точной донастройки."
+        )
+        st.session_state["click_target_ring"] = st.radio(
+            "Клик по превью ставит центр:", ["Кольцо 1", "Кольцо 2"],
+            horizontal=True, key="click_target_ring_radio",
+            index=0 if st.session_state.get("click_target_ring", "Кольцо 1") == "Кольцо 1" else 1,
+        )
+    else:
+        st.caption(
+            "Пакет streamlit-image-coordinates не установлен — доступна только точная настройка "
+            "числовыми полями ниже (см. requirements.txt)."
+        )
+
+    # ВАЖНО: у number_input ниже key совпадает с именем переменной в
+    # session_state (например key="ring1_x" для st.session_state["ring1_x"]).
+    # Это намеренно: клик по превью (см. streamlit_image_coordinates выше)
+    # программно обновляет st.session_state["ring1_x"]/["ring1_y"] ДО того,
+    # как здесь создаётся виджет — а Streamlit при создании виджета с уже
+    # существующим в session_state ключом использует именно это значение,
+    # игнорируя устаревший value=. Если бы ключ виджета отличался от ключа
+    # состояния (как было раньше: "in_ring1_x" vs "ring1_x"), клик по
+    # картинке обновлял бы состояние, но поля ввода продолжали бы показывать
+    # старое значение до следующего ручного изменения.
+    # ПРИМЕЧАНИЕ: у number_input ниже намеренно НЕ делается
+    # `st.session_state["ring1_x"] = st.number_input(..., key="ring1_x")` —
+    # Streamlit запрещает перезаписывать session_state[key] в том же прогоне
+    # СРАЗУ ПОСЛЕ создания виджета с этим же key (кидает StreamlitAPIException
+    # "cannot be modified after the widget... is instantiated"). Раз key
+    # совпадает с именем состояния, виджет и так сам пишет своё значение в
+    # st.session_state["ring1_x"] как побочный эффект — читать его дальше по
+    # коду можно напрямую из session_state, без явного присваивания.
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Кольцо №1**")
-        st.session_state["ring1_x"] = st.number_input(
-            "X1 (px)", min_value=0, max_value=int(meta["width"]), value=int(st.session_state["ring1_x"]), key="in_ring1_x"
+        st.number_input(
+            "X1 (px)", min_value=0, max_value=int(meta["width"]), value=int(st.session_state["ring1_x"]), key="ring1_x"
         )
-        st.session_state["ring1_y"] = st.number_input(
-            "Y1 (px)", min_value=0, max_value=int(meta["height"]), value=int(st.session_state["ring1_y"]), key="in_ring1_y"
+        st.number_input(
+            "Y1 (px)", min_value=0, max_value=int(meta["height"]), value=int(st.session_state["ring1_y"]), key="ring1_y"
         )
-        st.session_state["ring1_r"] = st.number_input(
+        st.number_input(
             "Радиус 1 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
-            value=int(st.session_state["ring1_r"]), key="in_ring1_r",
+            value=int(st.session_state["ring1_r"]), key="ring1_r",
         )
     with col2:
         st.markdown("**Кольцо №2**")
-        st.session_state["ring2_x"] = st.number_input(
-            "X2 (px)", min_value=0, max_value=int(meta["width"]), value=int(st.session_state["ring2_x"]), key="in_ring2_x"
+        st.number_input(
+            "X2 (px)", min_value=0, max_value=int(meta["width"]), value=int(st.session_state["ring2_x"]), key="ring2_x"
         )
-        st.session_state["ring2_y"] = st.number_input(
-            "Y2 (px)", min_value=0, max_value=int(meta["height"]), value=int(st.session_state["ring2_y"]), key="in_ring2_y"
+        st.number_input(
+            "Y2 (px)", min_value=0, max_value=int(meta["height"]), value=int(st.session_state["ring2_y"]), key="ring2_y"
         )
-        st.session_state["ring2_r"] = st.number_input(
+        st.number_input(
             "Радиус 2 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
-            value=int(st.session_state["ring2_r"]), key="in_ring2_r",
+            value=int(st.session_state["ring2_r"]), key="ring2_r",
         )
 
     if frame is not None:
@@ -987,10 +1262,48 @@ def render_step2_zones() -> None:
             {"x": st.session_state["ring1_x"], "y": st.session_state["ring1_y"], "r": st.session_state["ring1_r"]},
             {"x": st.session_state["ring2_x"], "y": st.session_state["ring2_y"], "r": st.session_state["ring2_r"]},
         ]
-        preview = draw_zones_preview(frame, rings)
-        st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), caption="Превью с зонами колец", use_container_width=True)
+        preview_bgr = draw_zones_preview(frame, rings, possession_threshold=st.session_state["possession_threshold"])
+        preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
+
+        if streamlit_image_coordinates is not None:
+            display_width = min(int(meta["width"]), PREVIEW_MAX_DISPLAY_WIDTH)
+            click_value = streamlit_image_coordinates(preview_rgb, key="ring_click_canvas", width=display_width)
+            if click_value is not None and click_value.get("x") is not None:
+                click_time = click_value.get("unix_time")
+                if click_time != st.session_state.get("_last_ring_click_time"):
+                    st.session_state["_last_ring_click_time"] = click_time
+                    disp_w = click_value.get("width") or display_width
+                    disp_h = click_value.get("height") or int(meta["height"] * display_width / meta["width"])
+                    scale_x = meta["width"] / disp_w if disp_w else 1.0
+                    scale_y = meta["height"] / disp_h if disp_h else 1.0
+                    orig_x = int(np.clip(click_value["x"] * scale_x, 0, meta["width"]))
+                    orig_y = int(np.clip(click_value["y"] * scale_y, 0, meta["height"]))
+                    target = "ring1" if st.session_state["click_target_ring"] == "Кольцо 1" else "ring2"
+                    st.session_state[f"{target}_x"] = orig_x
+                    st.session_state[f"{target}_y"] = orig_y
+                    st.rerun()
+        else:
+            st.image(preview_rgb, caption="Превью с зонами колец", use_container_width=True)
     else:
         st.error("Не удалось прочитать кадр из видео для превью.")
+
+    colcal1, colcal2 = st.columns([3, 1])
+    with colcal1:
+        if st.session_state.get("avg_player_diagonal"):
+            st.caption(
+                f"📏 Средний размер игрока на этом кадре: ~{st.session_state['avg_player_diagonal']:.0f}px по "
+                f"диагонали рамки → авто-порог владения ~{suggest_possession_threshold(st.session_state['avg_player_diagonal'])}px "
+                "(уже применён ниже, можно скорректировать слайдером)."
+            )
+        else:
+            st.caption(
+                "Авто-калибровка порога недоступна (модель не загружена или игроки не найдены на этом "
+                f"кадре) — используется дефолт {POSSESSION_THRESHOLD_DEFAULT}px."
+            )
+    with colcal2:
+        if st.button("🔄 Пересчитать по кадру", use_container_width=True):
+            st.session_state["auto_threshold_computed_for"] = None
+            st.rerun()
 
     st.subheader("🤝 Владение мячом, передачи и кулдаун")
     st.caption(
@@ -1035,6 +1348,20 @@ def render_step2_zones() -> None:
         help="Минимальный промежуток между двумя засчитанными бросками у одного и того же кольца.",
     )
 
+    st.subheader("🔧 Качество детекции")
+    st.session_state["enhance_quality"] = st.checkbox(
+        "Улучшить качество кадра перед детекцией (апскейл + резкость)",
+        value=st.session_state.get("enhance_quality", False),
+        help="Может помочь трекеру/ReID различать игроков на видео низкого разрешения. "
+        "Не панацея: если исходное видео изначально сильно сжато/размыто, апскейл не "
+        "восстановит потерянные детали. Замедляет обработку.",
+    )
+    if st.session_state["enhance_quality"]:
+        st.caption(
+            "⚠️ Это не панацея при изначально плохом качестве видео — лишь может немного помочь "
+            "трекеру на видео низкого разрешения, ценой более медленной обработки."
+        )
+
     colA, colB = st.columns(2)
     with colA:
         if st.button("← Назад к загрузке"):
@@ -1064,10 +1391,16 @@ def render_step3_players(device: str) -> None:
     )
 
     max_scan = max(int(min(meta["duration"], 60)), 5)
-    scan_seconds = st.slider(
-        "Сколько секунд видео сканировать", min_value=5, max_value=max_scan,
-        value=min(QUICK_SCAN_SECONDS_DEFAULT, max_scan), step=5,
-    )
+    if max_scan <= 5:
+        # Очень короткое видео (≤5 сек) — слайдер с равными min/max упал бы с
+        # ошибкой Streamlit, поэтому просто сканируем его целиком.
+        scan_seconds = max_scan
+        st.caption(f"Видео короткое — сканируется целиком ({scan_seconds} сек).")
+    else:
+        scan_seconds = st.slider(
+            "Сколько секунд видео сканировать", min_value=5, max_value=max_scan,
+            value=min(QUICK_SCAN_SECONDS_DEFAULT, max_scan), step=5,
+        )
 
     if st.button("🔍 Запустить предварительное сканирование", type="primary"):
         model, model_error = load_model(device)
@@ -1080,7 +1413,10 @@ def render_step3_players(device: str) -> None:
             )
         else:
             with st.spinner("Сканирование..."):
-                crops = quick_player_scan(video_path, model, device, max_seconds=scan_seconds, fps_hint=meta["fps"])
+                crops = quick_player_scan(
+                    video_path, model, device, max_seconds=scan_seconds, fps_hint=meta["fps"],
+                    enhance_quality=st.session_state.get("enhance_quality", False),
+                )
             st.session_state["player_crops"] = crops
             if not crops:
                 st.warning("Игроки не найдены за это время — попробуйте увеличить длительность сканирования.")
@@ -1089,16 +1425,21 @@ def render_step3_players(device: str) -> None:
 
     crops: Dict[int, Any] = st.session_state.get("player_crops") or {}
     if crops:
-        cols_per_row = 4
+        # Компактная сетка: все кропы приводятся к одинаковой высоте (пропорции
+        # сохраняются), поэтому карточки игроков ровные независимо от того,
+        # насколько разного размера/ориентации были исходные рамки детекций.
+        cols_per_row = 6
         ids_sorted = sorted(crops.keys())
         for row_start in range(0, len(ids_sorted), cols_per_row):
             row_ids = ids_sorted[row_start : row_start + cols_per_row]
-            cols = st.columns(len(row_ids))
+            cols = st.columns(cols_per_row)
             for col, pid in zip(cols, row_ids):
                 with col:
-                    st.image(cv2.cvtColor(crops[pid], cv2.COLOR_BGR2RGB), caption=f"ID {pid}", use_container_width=True)
-                    st.text_input("Имя", key=f"player_name_{pid}", placeholder=f"Игрок {pid}")
-                    st.text_input("Номер", key=f"player_number_{pid}", placeholder="—")
+                    with st.container(border=True):
+                        resized_crop = resize_crop_to_height(crops[pid], CROP_DISPLAY_HEIGHT)
+                        st.image(cv2.cvtColor(resized_crop, cv2.COLOR_BGR2RGB), caption=f"ID {pid}")
+                        st.text_input("Имя", key=f"player_name_{pid}", placeholder=f"Игрок {pid}", label_visibility="collapsed")
+                        st.text_input("Номер", key=f"player_number_{pid}", placeholder="Номер", label_visibility="collapsed")
     else:
         st.info(
             "Пока нет данных — запустите сканирование выше, либо пропустите этот шаг: "
@@ -1155,6 +1496,7 @@ def run_full_analysis(video_path: str, device: str) -> None:
             ball_memory_seconds=float(st.session_state["ball_memory"]),
             progress_bar=progress_bar,
             status_text=status_text,
+            enhance_quality=bool(st.session_state.get("enhance_quality", False)),
         )
     except Exception as exc:
         st.error(f"Ошибка при обработке видео: {exc}")
@@ -1167,6 +1509,40 @@ def run_full_analysis(video_path: str, device: str) -> None:
     st.session_state["last_output_video"] = str(output_path)
     st.session_state["debug_log"] = debug_log
     st.success(f"Готово! Полное аннотированное видео сохранено: {output_path}")
+
+
+def render_video_with_fallback(video_path: Path, label: str, widget_key: str) -> None:
+    """Показывает видео через st.video() с понятной обработкой отказа.
+
+    st.video() рендерит обычный HTML5 <video> — если файл закодирован
+    кодеком, который браузер пользователя не поддерживает (см.
+    reencode_for_browser), плеер в браузере выглядит "битым", хотя сам файл
+    валиден. Т.к. это происходит на стороне браузера, сервер не может это
+    детектировать программно — поэтому ниже ВСЕГДА дополнительно показывается
+    кнопка скачивания файла как гарантированный запасной вариант.
+    """
+    if not video_path.exists() or video_path.stat().st_size == 0:
+        st.error(f"⚠️ Файл «{label}» не найден или пуст: {video_path}")
+        return
+
+    st.video(str(video_path))
+
+    if FFMPEG_PATH is None:
+        st.caption(
+            "ℹ️ ffmpeg не найден в системе — видео сохранено в кодеке OpenCV по умолчанию, который "
+            "не во всех браузерах проигрывается через встроенный плеер. Установите ffmpeg "
+            "(`sudo apt install ffmpeg` / `brew install ffmpeg` / `winget install ffmpeg`) для "
+            "автоматической перекодировки в H.264, либо воспользуйтесь кнопкой скачивания ниже."
+        )
+
+    try:
+        with open(video_path, "rb") as f:
+            data = f.read()
+        st.download_button(
+            f"⬇️ Скачать «{label}»", data=data, file_name=video_path.name, mime="video/mp4", key=widget_key
+        )
+    except OSError as exc:
+        st.error(f"Не удалось прочитать файл для скачивания: {exc}")
 
 
 def render_results_section() -> None:
@@ -1200,8 +1576,8 @@ def render_results_section() -> None:
 
     last_output_video = st.session_state.get("last_output_video")
     if last_output_video and Path(last_output_video).exists():
-        with st.expander("🎥 Полное видео с аннотациями"):
-            st.video(last_output_video)
+        with st.expander("🎥 Полное видео с аннотациями", expanded=False):
+            render_video_with_fallback(Path(last_output_video), "полное аннотированное видео", "dl_full_output")
 
     st.header("🎬 Хайлайты (броски и передачи)")
     ensure_directories()
@@ -1212,7 +1588,7 @@ def render_results_section() -> None:
 
     for hf in highlight_files:
         st.subheader(hf.name)
-        st.video(str(hf))
+        render_video_with_fallback(hf, hf.name, f"dl_{hf.stem}")
 
 
 def render_step4_run(device: str) -> None:
@@ -1235,6 +1611,10 @@ def render_step4_run(device: str) -> None:
             f"Окно передачи: {st.session_state['pass_window']:.1f} с · "
             f"Память мяча: {st.session_state['ball_memory']:.2f} с · "
             f"Кулдаун кольца: {st.session_state['shot_cooldown']:.1f} с"
+        )
+        st.write(
+            "Улучшение качества кадра перед детекцией: "
+            + ("включено ✅" if st.session_state.get("enhance_quality") else "выключено")
         )
         n_players = len(st.session_state.get("player_names") or {})
         st.write(f"Сопоставлено игроков (имя/номер): {n_players}")
@@ -1293,7 +1673,7 @@ def main() -> None:
     if step == 1:
         render_step1_upload()
     elif step == 2:
-        render_step2_zones()
+        render_step2_zones(device)
     elif step == 3:
         render_step3_players(device)
     else:
