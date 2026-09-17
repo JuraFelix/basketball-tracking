@@ -20,8 +20,9 @@ Basketball Tracking Analytics
     * Векторная детекция голов: пересечение траектории мяча с горизонтальной
       линией кольца (задаётся пользователем), с кулдауном 90 кадров.
     * Детекция передач (пасов): игрок владел мячом → мяч летел без владельца
-      10–60 кадров → другой игрок получил владение, с "памятью" мяча при
-      кратковременной потере детекции.
+      10–60 кадров → другой игрок получил владение.
+    * Устойчивый трекинг мяча при пропусках YOLO: Kalman + интерполяция +
+      цветовой fallback (оранжевый blob в ROI).
     * Отладочный таймлайн владения мячом — виден каждый переход владения и
       причина, по которой передача была засчитана или отклонена.
     * Автоматическая нарезка автономных MP4-хайлайтов (5 сек до события +
@@ -44,6 +45,7 @@ import shutil
 import subprocess
 import tempfile
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -198,6 +200,36 @@ IMGSZ_OPTIONS = [640, 768, 896, 1024, 1152, 1280]
 # не минуты), но достаточно равномерно распределённых кадров для честной
 # оценки % обнаружения и средней уверенности.
 BALL_DIAGNOSTIC_MAX_SAMPLES = 120
+# Макс. кадров диагностики подряд (≈30 сек при 30 fps) — полный последовательный
+# прогон для честной оценки дыр YOLO и эффекта interpolation/color fallback.
+BALL_DIAGNOSTIC_MAX_FRAMES = 900
+
+# --- Устойчивый трекинг мяча при пропусках YOLO ---
+BALL_MAX_GAP_FRAMES_DEFAULT = 20
+BALL_MAX_GAP_FRAMES_MIN = 10
+BALL_MAX_GAP_FRAMES_MAX = 40
+
+BALL_MAX_PREDICT_FRAMES_DEFAULT = 25
+BALL_MAX_PREDICT_FRAMES_MIN = 15
+BALL_MAX_PREDICT_FRAMES_MAX = 40
+
+BALL_COLOR_FALLBACK_DEFAULT = True
+BALL_COLOR_ROI_HALF_DEFAULT = 120
+BALL_COLOR_ROI_HALF_MIN = 40
+BALL_COLOR_ROI_HALF_MAX = 300
+
+# HSV-диапазоны типичного оранжевого баскетбольного мяча (OpenCV H: 0–180).
+ORANGE_HSV_LOWER1 = np.array([5, 70, 70], dtype=np.uint8)
+ORANGE_HSV_UPPER1 = np.array([25, 255, 255], dtype=np.uint8)
+ORANGE_HSV_LOWER2 = np.array([0, 70, 70], dtype=np.uint8)
+ORANGE_HSV_UPPER2 = np.array([4, 255, 255], dtype=np.uint8)
+
+BALL_SOURCE_COLORS_BGR = {
+    "yolo": (0, 215, 255),
+    "color": (0, 140, 255),
+    "interp": (0, 255, 255),
+    "kalman": (180, 255, 255),
+}
 
 # --- Режим камеры ---
 # "Статичная камера" — исходное поведение (зоны колец фиксированы во всех
@@ -535,7 +567,7 @@ def parse_track_results(
     results,
     person_conf_threshold: float = 0.0,
     ball_conf_threshold: float = 0.0,
-) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], Optional[Tuple[float, float]]]:
+) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], Optional[Tuple[float, float]], float]:
     """Извлекает из результата YOLO список игроков (ID, рамка) и центр мяча.
 
     Координаты возвращаются в системе координат кадра, который был передан
@@ -574,7 +606,7 @@ def parse_track_results(
                     best_ball_conf = conf
                     ball = ((float(box[0]) + float(box[2])) / 2.0, (float(box[1]) + float(box[3])) / 2.0)
 
-    return persons, ball
+    return persons, ball, best_ball_conf if ball is not None else 0.0
 
 
 def id_to_color(pid: int) -> Tuple[int, int, int]:
@@ -591,6 +623,7 @@ def draw_annotations(
     persons: List[Tuple[int, Tuple[float, float, float, float]]],
     ball: Optional[Tuple[float, float]],
     ball_trajectory: Optional[List[Tuple[float, float]]] = None,
+    ball_source: Optional[str] = None,
 ):
     """Рисует рамки игроков (с ID), траекторию мяча и маркер мяча на копии кадра.
 
@@ -618,11 +651,14 @@ def draw_annotations(
         )
     if ball is not None:
         center = (int(ball[0]), int(ball[1]))
-        cv2.circle(annotated, center, 9, (0, 215, 255), -1)
+        src = ball_source or "yolo"
+        color = BALL_SOURCE_COLORS_BGR.get(src, (0, 215, 255))
+        cv2.circle(annotated, center, 9, color, -1)
         cv2.circle(annotated, center, 9, (0, 0, 0), 2)
+        label = f"ball/{src}"
         cv2.putText(
-            annotated, "ball", (center[0] + 12, center[1] - 8),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 215, 255), 2, cv2.LINE_AA,
+            annotated, label, (center[0] + 12, center[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA,
         )
     return annotated
 
@@ -838,6 +874,245 @@ def suggest_possession_threshold(avg_player_diagonal: Optional[float]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Устойчивый трекинг мяча: Kalman + интерполяция + цветовой fallback
+# ---------------------------------------------------------------------------
+@dataclass
+class BallTrackState:
+    x: float
+    y: float
+    conf: float
+    source: str  # yolo | color | interp | kalman
+
+
+class BallKalmanFilter:
+    """Простой Kalman (x,y,vx,vy) для предсказания позиции мяча между детекциями."""
+
+    def __init__(self) -> None:
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.transitionMatrix = np.array(
+            [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32
+        )
+        self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.05
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.8
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+        self.initialized = False
+
+    def init(self, x: float, y: float) -> None:
+        self.kf.statePost = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
+        self.initialized = True
+
+    def predict(self) -> Optional[Tuple[float, float]]:
+        if not self.initialized:
+            return None
+        pred = self.kf.predict()
+        return float(pred[0]), float(pred[1])
+
+    def correct(self, x: float, y: float) -> None:
+        if not self.initialized:
+            self.init(x, y)
+            return
+        self.kf.correct(np.array([[x], [y]], dtype=np.float32))
+
+
+def detect_orange_ball_color(
+    frame_bgr: Any,
+    hint_xy: Tuple[float, float],
+    roi_half: int,
+    persons: List[Tuple[int, Tuple[float, float, float, float]]],
+) -> Optional[Tuple[float, float, float]]:
+    """Ищет оранжевый круглый blob в ROI вокруг подсказки (не по всему кадру)."""
+    if cv2 is None or frame_bgr is None:
+        return None
+    h, w = frame_bgr.shape[:2]
+    cx, cy = int(hint_xy[0]), int(hint_xy[1])
+    x1, y1 = max(cx - roi_half, 0), max(cy - roi_half, 0)
+    x2, y2 = min(cx + roi_half, w), min(cy + roi_half, h)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None
+
+    roi = frame_bgr[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, ORANGE_HSV_LOWER1, ORANGE_HSV_UPPER1) | cv2.inRange(
+        hsv, ORANGE_HSV_LOWER2, ORANGE_HSV_UPPER2
+    )
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    person_diags = [math.hypot(b[2] - b[0], b[3] - b[1]) for _, b in persons]
+    ref_size = float(np.mean(person_diags)) if person_diags else min(h, w) * 0.12
+    min_area = max(16.0, (ref_size * 0.04) ** 2)
+    max_area = max(min_area * 4.0, (ref_size * 0.22) ** 2)
+
+    best: Optional[Tuple[float, float, float]] = None
+    best_score = -1.0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter < 1e-3:
+            continue
+        circularity = 4.0 * math.pi * area / (perimeter * perimeter)
+        if circularity < 0.45:
+            continue
+        moments = cv2.moments(cnt)
+        if abs(moments["m00"]) < 1e-3:
+            continue
+        bx = moments["m10"] / moments["m00"] + x1
+        by = moments["m01"] / moments["m00"] + y1
+        dist = math.hypot(bx - hint_xy[0], by - hint_xy[1])
+        if dist > roi_half * 1.25:
+            continue
+        score = circularity * math.sqrt(area) / (1.0 + dist * 0.05)
+        if score > best_score:
+            best_score = score
+            best = (float(bx), float(by), float(min(1.0, circularity)))
+    return best
+
+
+class BallTracker:
+    """Сглаживает пропуски YOLO: Kalman-предсказание, линейная экстраполяция, цвет."""
+
+    def __init__(
+        self,
+        max_gap_frames: int = BALL_MAX_GAP_FRAMES_DEFAULT,
+        max_predict_frames: int = BALL_MAX_PREDICT_FRAMES_DEFAULT,
+        color_fallback: bool = BALL_COLOR_FALLBACK_DEFAULT,
+        color_roi_half: int = BALL_COLOR_ROI_HALF_DEFAULT,
+    ) -> None:
+        self.max_gap_frames = max_gap_frames
+        self.max_predict_frames = max_predict_frames
+        self.color_fallback = color_fallback
+        self.color_roi_half = color_roi_half
+        self.kalman = BallKalmanFilter()
+        self.last_confident_frame: Optional[int] = None
+        self.last_confident_pos: Optional[Tuple[float, float]] = None
+        self.prev_confident_frame: Optional[int] = None
+        self.prev_confident_pos: Optional[Tuple[float, float]] = None
+        self.frames_since_yolo = 10**6
+        self.frames_since_any = 10**6
+
+    def _record_confident(self, frame_idx: int, x: float, y: float) -> None:
+        if self.last_confident_frame is not None:
+            self.prev_confident_frame = self.last_confident_frame
+            self.prev_confident_pos = self.last_confident_pos
+        self.last_confident_frame = frame_idx
+        self.last_confident_pos = (x, y)
+
+    def _linear_extrapolate(self, frame_idx: int) -> Optional[Tuple[float, float]]:
+        if (
+            self.prev_confident_frame is None
+            or self.prev_confident_pos is None
+            or self.last_confident_frame is None
+            or self.last_confident_pos is None
+        ):
+            return None
+        f0, p0 = self.prev_confident_frame, self.prev_confident_pos
+        f1, p1 = self.last_confident_frame, self.last_confident_pos
+        if f1 <= f0 or frame_idx <= f1:
+            return None
+        gap = frame_idx - f1
+        if gap > self.max_gap_frames:
+            return None
+        dt = float(f1 - f0)
+        vx = (p1[0] - p0[0]) / dt
+        vy = (p1[1] - p0[1]) / dt
+        return p1[0] + vx * gap, p1[1] + vy * gap
+
+    def update(
+        self,
+        frame_idx: int,
+        frame_bgr: Any,
+        yolo_ball: Optional[Tuple[float, float]],
+        yolo_conf: float,
+        persons: List[Tuple[int, Tuple[float, float, float, float]]],
+    ) -> Optional[BallTrackState]:
+        if yolo_ball is not None:
+            x, y = yolo_ball
+            self._record_confident(frame_idx, x, y)
+            if self.kalman.initialized:
+                self.kalman.predict()
+            self.kalman.correct(x, y)
+            self.frames_since_yolo = 0
+            self.frames_since_any = 0
+            return BallTrackState(x, y, yolo_conf, "yolo")
+
+        self.frames_since_yolo += 1
+        if self.frames_since_any >= self.max_predict_frames:
+            return None
+
+        predicted = self.kalman.predict() if self.kalman.initialized else None
+        hint = predicted or self.last_confident_pos
+
+        if self.color_fallback and hint is not None:
+            color_hit = detect_orange_ball_color(frame_bgr, hint, self.color_roi_half, persons)
+            if color_hit is not None:
+                x, y, score = color_hit
+                if self.kalman.initialized:
+                    self.kalman.predict()
+                self.kalman.correct(x, y)
+                self.frames_since_any = 0
+                return BallTrackState(x, y, score * 0.5, "color")
+
+        if self.frames_since_yolo > self.max_gap_frames:
+            self.frames_since_any += 1
+            return None
+
+        linear = self._linear_extrapolate(frame_idx)
+        if linear is not None:
+            self.frames_since_any += 1
+            return BallTrackState(linear[0], linear[1], 0.0, "interp")
+
+        if predicted is not None:
+            self.frames_since_any += 1
+            return BallTrackState(predicted[0], predicted[1], 0.0, "kalman")
+
+        if self.last_confident_pos is not None and self.frames_since_yolo <= self.max_gap_frames:
+            self.frames_since_any += 1
+            return BallTrackState(
+                self.last_confident_pos[0], self.last_confident_pos[1], 0.0, "interp"
+            )
+
+        self.frames_since_any += 1
+        return None
+
+
+def detect_yolo_ball_on_frame(
+    frame: Any,
+    model,
+    device: str,
+    ball_conf_threshold: float,
+    imgsz: int,
+) -> Tuple[Optional[Tuple[float, float]], float]:
+    """Однокадровая детекция мяча YOLO (для диагностики без трекера)."""
+    if model is None:
+        return None, 0.0
+    try:
+        results = model.predict(
+            frame,
+            classes=[COCO_BALL_CLASS_ID],
+            conf=ball_conf_threshold,
+            imgsz=imgsz,
+            device=device,
+            verbose=False,
+        )
+    except Exception:
+        return None, 0.0
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        return None, 0.0
+    xyxy = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()
+    best_i = int(np.argmax(confs))
+    box = xyxy[best_i]
+    conf = float(confs[best_i])
+    center = ((float(box[0]) + float(box[2])) / 2.0, (float(box[1]) + float(box[3])) / 2.0)
+    return center, conf
+
+
+# ---------------------------------------------------------------------------
 # Диагностика видимости мяча (шаг 3) — отличить "проблема в порогах" от
 # "модель в принципе не видит мяч на этом видео".
 # ---------------------------------------------------------------------------
@@ -848,15 +1123,15 @@ def diagnose_ball_visibility(
     ball_conf_threshold: float,
     imgsz: int,
     enhance_quality: bool = False,
-    max_samples: int = BALL_DIAGNOSTIC_MAX_SAMPLES,
+    max_gap_frames: int = BALL_MAX_GAP_FRAMES_DEFAULT,
+    max_predict_frames: int = BALL_MAX_PREDICT_FRAMES_DEFAULT,
+    color_fallback: bool = BALL_COLOR_FALLBACK_DEFAULT,
+    color_roi_half: int = BALL_COLOR_ROI_HALF_DEFAULT,
+    max_frames: int = BALL_DIAGNOSTIC_MAX_FRAMES,
 ) -> Optional[Dict[str, Any]]:
-    """Сэмплирует до max_samples равномерно распределённых по всему видео
-    кадров и считает, в каком проценте из них модель вообще обнаруживает мяч
-    (на текущем ball_conf_threshold/imgsz), плюс среднюю уверенность по
-    обнаруженным кадрам. Если процент низкий даже на сниженном пороге — это
-    сильный сигнал, что дело не в порогах, а в самой видимости мяча на видео
-    (качество, освещение, расстояние до камеры, смаз при быстром полёте).
-    """
+    """Последовательно прогоняет видео и сравнивает видимость мяча: только YOLO
+    vs YOLO + Kalman/интерполяция + цветовой fallback. Считает среднюю длину
+    дыр между YOLO-детекциями."""
     if model is None or cv2 is None:
         return None
     cap = cv2.VideoCapture(video_path)
@@ -867,45 +1142,66 @@ def diagnose_ball_visibility(
         cap.release()
         return None
 
-    step = max(total_frames // max_samples, 1)
-    sampled = 0
-    detected = 0
-    conf_sum = 0.0
-    frame_idx = 0
+    frames_to_process = min(total_frames, max_frames)
+    tracker = BallTracker(
+        max_gap_frames=max_gap_frames,
+        max_predict_frames=max_predict_frames,
+        color_fallback=color_fallback,
+        color_roi_half=color_roi_half,
+    )
 
-    while frame_idx < total_frames:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    yolo_hits = 0
+    enhanced_hits = 0
+    yolo_conf_sum = 0.0
+    source_counts: Dict[str, int] = {"yolo": 0, "color": 0, "interp": 0, "kalman": 0}
+    gaps: List[int] = []
+    current_gap = 0
+
+    for frame_idx in range(frames_to_process):
         ret, frame = cap.read()
         if not ret:
             break
         detect_frame = enhance_frame_for_detection(frame) if enhance_quality else frame
-        try:
-            results = model.predict(
-                detect_frame,
-                classes=[COCO_BALL_CLASS_ID],
-                conf=ball_conf_threshold,
-                imgsz=imgsz,
-                device=device,
-                verbose=False,
-            )
-        except Exception:
-            break
-        sampled += 1
-        boxes = results[0].boxes
-        if boxes is not None and len(boxes) > 0:
-            confs = boxes.conf.cpu().numpy()
-            detected += 1
-            conf_sum += float(np.max(confs))
-        frame_idx += step
+        yolo_ball, yolo_conf = detect_yolo_ball_on_frame(
+            detect_frame, model, device, ball_conf_threshold, imgsz
+        )
+        if enhance_quality and yolo_ball is not None:
+            inv = 1.0 / ENHANCE_UPSCALE_FACTOR
+            yolo_ball = (yolo_ball[0] * inv, yolo_ball[1] * inv)
+
+        if yolo_ball is not None:
+            yolo_hits += 1
+            yolo_conf_sum += yolo_conf
+            if current_gap > 0:
+                gaps.append(current_gap)
+                current_gap = 0
+        else:
+            current_gap += 1
+
+        state = tracker.update(frame_idx, frame, yolo_ball, yolo_conf, [])
+        if state is not None:
+            enhanced_hits += 1
+            source_counts[state.source] = source_counts.get(state.source, 0) + 1
 
     cap.release()
-    if sampled == 0:
+    if frames_to_process <= 0:
         return None
+
+    yolo_rate = yolo_hits / frames_to_process
+    enhanced_rate = enhanced_hits / frames_to_process
     return {
-        "sampled_frames": sampled,
-        "frames_with_ball": detected,
-        "detection_rate": detected / sampled,
-        "avg_confidence": (conf_sum / detected) if detected else 0.0,
+        "sampled_frames": frames_to_process,
+        "frames_with_ball_yolo": yolo_hits,
+        "yolo_detection_rate": yolo_rate,
+        "frames_with_ball_enhanced": enhanced_hits,
+        "enhanced_detection_rate": enhanced_rate,
+        "avg_confidence": (yolo_conf_sum / yolo_hits) if yolo_hits else 0.0,
+        "avg_gap_frames": float(np.mean(gaps)) if gaps else 0.0,
+        "max_gap_frames": int(max(gaps)) if gaps else 0,
+        "source_counts": source_counts,
+        # Обратная совместимость со старыми ключами GUI
+        "frames_with_ball": yolo_hits,
+        "detection_rate": yolo_rate,
     }
 
 
@@ -1013,6 +1309,10 @@ def process_video(
     person_conf: float = PERSON_CONF_DEFAULT,
     ball_conf: float = BALL_CONF_DEFAULT,
     imgsz: int = IMGSZ_DEFAULT,
+    max_gap_frames: int = BALL_MAX_GAP_FRAMES_DEFAULT,
+    max_predict_frames: int = BALL_MAX_PREDICT_FRAMES_DEFAULT,
+    color_fallback: bool = BALL_COLOR_FALLBACK_DEFAULT,
+    color_roi_half: int = BALL_COLOR_ROI_HALF_DEFAULT,
     camera_transforms: Optional[List[np.ndarray]] = None,
     ring_reference_frame_idx: int = 0,
 ) -> Tuple[Dict[int, PlayerStats], Path, Dict[str, List[Dict[str, Any]]]]:
@@ -1057,7 +1357,18 @@ def process_video(
     pending_highlights: List[PendingHighlight] = []
 
     stats: Dict[int, PlayerStats] = {}
-    debug_log: Dict[str, List[Dict[str, Any]]] = {"ownership_changes": [], "sampled_timeline": []}
+    debug_log: Dict[str, List[Dict[str, Any]]] = {
+        "ownership_changes": [],
+        "sampled_timeline": [],
+        "ball_sources": [],
+    }
+    predict_limit = max(max_predict_frames, int(ball_memory_seconds * fps))
+    ball_tracker = BallTracker(
+        max_gap_frames=max_gap_frames,
+        max_predict_frames=predict_limit,
+        color_fallback=color_fallback,
+        color_roi_half=color_roi_half,
+    )
 
     # Состояние владения мячом (для пасов и для "кто владел мячом перед голом").
     last_owner: Optional[int] = None
@@ -1065,11 +1376,6 @@ def process_video(
     free_ball_frames: int = 0
     last_goal_frame_per_ring = [-10**9 for _ in rings]
     prev_ball_xy: Optional[Tuple[float, float]] = None
-
-    # "Память" мяча: держим последнюю известную позицию, если детектор
-    # временно "потерял" мяч (см. константу BALL_MEMORY_SECONDS_DEFAULT).
-    last_known_ball: Optional[Tuple[float, float]] = None
-    last_real_ball_time = -1e9
 
     reset_tracker(model)  # независимая от возможного шага 3 сессия трекинга
 
@@ -1086,6 +1392,8 @@ def process_video(
             break
 
         t = frame_idx / fps
+        ball: Optional[Tuple[float, float]] = None
+        ball_source: Optional[str] = None
 
         if model is not None:
             # Опционально апскейлим+резчим кадр перед детекцией (помогает
@@ -1110,20 +1418,26 @@ def process_video(
                 imgsz=imgsz,
                 verbose=False,
             )
-            persons, ball = parse_track_results(
+            persons, yolo_ball, yolo_ball_conf = parse_track_results(
                 results, person_conf_threshold=person_conf, ball_conf_threshold=ball_conf
             )
             if enhance_quality:
                 inv_scale = 1.0 / ENHANCE_UPSCALE_FACTOR
                 persons = [(pid, tuple(v * inv_scale for v in box)) for pid, box in persons]
-                if ball is not None:
-                    ball = (ball[0] * inv_scale, ball[1] * inv_scale)
-            annotated = draw_annotations(frame, persons, ball, list(ball_trajectory))
+                if yolo_ball is not None:
+                    yolo_ball = (yolo_ball[0] * inv_scale, yolo_ball[1] * inv_scale)
+            ball_state = ball_tracker.update(frame_idx, frame, yolo_ball, yolo_ball_conf, persons)
+            if ball_state is not None:
+                ball = (ball_state.x, ball_state.y)
+                ball_source = ball_state.source
+            annotated = draw_annotations(
+                frame, persons, ball, list(ball_trajectory), ball_source=ball_source
+            )
         else:
             # Демо-режим: модель не загружена (нет интернета/GPU) — не роняем
             # приложение, просто прокатываем видео без детекций.
             annotated = frame.copy()
-            persons, ball = [], None
+            persons = []
             cv2.putText(
                 annotated,
                 "DEMO MODE: model YOLO not loaded",
@@ -1146,24 +1460,8 @@ def process_video(
             current_rings = rings
         annotated = draw_zones_preview(annotated, current_rings)
 
-        # -------------------------------------------------------------
-        # "ПАМЯТЬ" МЯЧА
-        #
-        # Если ровно в кадре, где мяч перелетает от игрока А к игроку Б,
-        # детектор его не находит (смаз движения, блик, частичное перекрытие),
-        # цепочка владения обрывалась и передача никогда не засчитывалась.
-        # Поэтому в течение ball_memory_seconds после последней РЕАЛЬНОЙ
-        # детекции мяча мы продолжаем считать его находящимся в последней
-        # известной точке (effective_ball) — это не заменяет детекцию,
-        # а лишь сглаживает короткие пропуски.
-        # -------------------------------------------------------------
-        if ball is not None:
-            last_known_ball = ball
-            last_real_ball_time = t
-
-        effective_ball: Optional[Tuple[float, float]] = None
-        if last_known_ball is not None and (t - last_real_ball_time) <= ball_memory_seconds:
-            effective_ball = last_known_ball
+        # Устойчивый мяч: YOLO + Kalman/интерполяция + цветовой fallback (BallTracker).
+        effective_ball: Optional[Tuple[float, float]] = ball
 
         if effective_ball is not None:
             ball_history.append((t, effective_ball[0], effective_ball[1]))
@@ -1252,6 +1550,10 @@ def process_video(
                     "Владелец (ID)": float(current_owner) if current_owner is not None else float("nan"),
                 }
             )
+            if ball_source:
+                debug_log["ball_sources"].append(
+                    {"Кадр": frame_idx, "Время, с": round(t, 2), "Источник мяча": ball_source}
+                )
 
         # -------------------------------------------------------------
         # ГОЛЫ: векторный анализ пересечения траектории мяча с горизонтальной
@@ -1378,6 +1680,10 @@ def init_session_state() -> None:
         "person_conf": float(PERSON_CONF_DEFAULT),
         "ball_conf": float(BALL_CONF_DEFAULT),
         "imgsz": int(IMGSZ_DEFAULT),
+        "ball_max_gap_frames": int(BALL_MAX_GAP_FRAMES_DEFAULT),
+        "ball_max_predict_frames": int(BALL_MAX_PREDICT_FRAMES_DEFAULT),
+        "ball_color_fallback": BALL_COLOR_FALLBACK_DEFAULT,
+        "ball_color_roi_half": int(BALL_COLOR_ROI_HALF_DEFAULT),
         "camera_mode": CAMERA_MODE_STATIC,
         "ball_diagnostics": None,
         "preview_time": 0.0,
@@ -1774,6 +2080,44 @@ def render_step2_zones(device: str) -> None:
     if int(st.session_state["imgsz"]) > IMGSZ_DEFAULT:
         st.caption(f"⚠️ imgsz={int(st.session_state['imgsz'])} заметно медленнее дефолтных {IMGSZ_DEFAULT}px, особенно на CPU.")
 
+    st.subheader("🟠 Устойчивый трекинг мяча (Kalman + цвет)")
+    st.caption(
+        "Если YOLO часто теряет мяч, включите Kalman/интерполяцию и оранжевый цветовой fallback "
+        "в ROI вокруг последней позиции — это повышает % «видимого» мяча для пасов и голов."
+    )
+    st.session_state["ball_color_fallback"] = st.checkbox(
+        "Цветовой fallback (оранжевый мяч в ROI)",
+        value=bool(st.session_state.get("ball_color_fallback", BALL_COLOR_FALLBACK_DEFAULT)),
+    )
+    bgap1, bgap2, broi = st.columns(3)
+    with bgap1:
+        st.session_state["ball_max_gap_frames"] = st.slider(
+            "Макс. кадров интерполяции",
+            min_value=BALL_MAX_GAP_FRAMES_MIN,
+            max_value=BALL_MAX_GAP_FRAMES_MAX,
+            value=int(st.session_state.get("ball_max_gap_frames", BALL_MAX_GAP_FRAMES_DEFAULT)),
+            step=1,
+            help="Линейная экстраполяция между YOLO-детекциями (дефолт 20 кадров).",
+        )
+    with bgap2:
+        st.session_state["ball_max_predict_frames"] = st.slider(
+            "Макс. кадров виртуального мяча",
+            min_value=BALL_MAX_PREDICT_FRAMES_MIN,
+            max_value=BALL_MAX_PREDICT_FRAMES_MAX,
+            value=int(st.session_state.get("ball_max_predict_frames", BALL_MAX_PREDICT_FRAMES_DEFAULT)),
+            step=1,
+            help="Kalman/интерполяция/цвет — не дольше этого числа кадров без YOLO (дефолт 25).",
+        )
+    with broi:
+        st.session_state["ball_color_roi_half"] = st.slider(
+            "Полуразмер ROI цвета (px)",
+            min_value=BALL_COLOR_ROI_HALF_MIN,
+            max_value=BALL_COLOR_ROI_HALF_MAX,
+            value=int(st.session_state.get("ball_color_roi_half", BALL_COLOR_ROI_HALF_DEFAULT)),
+            step=10,
+            help="Окно поиска оранжевого blob вокруг последней позиции мяча.",
+        )
+
     st.subheader("🔧 Качество детекции")
     st.session_state["enhance_quality"] = st.checkbox(
         "Улучшить качество кадра перед детекцией (апскейл + резкость)",
@@ -1900,6 +2244,10 @@ def render_step3_players(device: str) -> None:
                     ball_conf_threshold=float(st.session_state.get("ball_conf", BALL_CONF_DEFAULT)),
                     imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
                     enhance_quality=st.session_state.get("enhance_quality", False),
+                    max_gap_frames=int(st.session_state.get("ball_max_gap_frames", BALL_MAX_GAP_FRAMES_DEFAULT)),
+                    max_predict_frames=int(st.session_state.get("ball_max_predict_frames", BALL_MAX_PREDICT_FRAMES_DEFAULT)),
+                    color_fallback=bool(st.session_state.get("ball_color_fallback", BALL_COLOR_FALLBACK_DEFAULT)),
+                    color_roi_half=int(st.session_state.get("ball_color_roi_half", BALL_COLOR_ROI_HALF_DEFAULT)),
                 )
             st.session_state["ball_diagnostics"] = diag
             if diag is None:
@@ -1907,31 +2255,41 @@ def render_step3_players(device: str) -> None:
 
     diag = st.session_state.get("ball_diagnostics")
     if diag:
-        rate_pct = diag["detection_rate"] * 100.0
+        yolo_pct = diag.get("yolo_detection_rate", diag.get("detection_rate", 0.0)) * 100.0
+        enh_pct = diag.get("enhanced_detection_rate", yolo_pct / 100.0) * 100.0
+        src = diag.get("source_counts") or {}
         st.caption(
-            f"Сэмплировано кадров: {diag['sampled_frames']} · мяч обнаружен в "
-            f"{diag['frames_with_ball']} из них ({rate_pct:.0f}%) · средняя уверенность по "
-            f"обнаруженным кадрам: {diag['avg_confidence']:.2f}"
+            f"Проанализировано кадров подряд: {diag['sampled_frames']} · "
+            f"YOLO: {diag.get('frames_with_ball_yolo', diag.get('frames_with_ball', 0))} "
+            f"({yolo_pct:.0f}%, conf≈{diag['avg_confidence']:.2f}) · "
+            f"после Kalman/цвет: {diag.get('frames_with_ball_enhanced', 0)} ({enh_pct:.0f}%) · "
+            f"средняя дыра YOLO: {diag.get('avg_gap_frames', 0):.1f} кадр., "
+            f"макс. {diag.get('max_gap_frames', 0)}"
         )
-        if rate_pct >= 50:
-            st.success(
-                f"✅ Мяч обнаруживается стабильно ({rate_pct:.0f}% кадров, средняя уверенность "
-                f"{diag['avg_confidence']:.2f}). Если события всё равно не фиксируются — дело, скорее "
-                "всего, в порогах владения/передач или кулдауне (шаг 2), а не в видимости мяча."
+        if src:
+            st.caption(
+                "Источники (после fallback): "
+                + ", ".join(f"{k}={v}" for k, v in sorted(src.items()) if v > 0)
             )
-        elif rate_pct >= 20:
+        if enh_pct >= 50:
+            st.success(
+                f"✅ С fallback мяч виден в {enh_pct:.0f}% кадров (YOLO alone: {yolo_pct:.0f}%). "
+                "События должны фиксироваться лучше — проверьте полный анализ на шаге 4."
+            )
+        elif enh_pct >= yolo_pct + 10:
             st.warning(
-                f"⚠️ Мяч обнаруживается умеренно часто ({rate_pct:.0f}% кадров, средняя уверенность "
-                f"{diag['avg_confidence']:.2f}) — вероятно проблема с качеством видео/освещением/"
-                "дистанцией съёмки. Попробуйте повысить imgsz и/или включить улучшение качества кадра "
-                "на шаге 2, либо ещё немного снизить порог уверенности для мяча."
+                f"⚠️ YOLO видит мяч в {yolo_pct:.0f}% кадров, fallback поднимает до {enh_pct:.0f}%. "
+                "Попробуйте увеличить ROI цвета или окно виртуального мяча на шаге 2."
+            )
+        elif yolo_pct >= 20:
+            st.warning(
+                f"⚠️ YOLO: {yolo_pct:.0f}%, с fallback: {enh_pct:.0f}%. "
+                "Увеличьте imgsz, включите цветовой fallback и окно Kalman на шаге 2."
             )
         else:
             st.error(
-                f"❌ Мяч обнаружен лишь в {rate_pct:.0f}% кадров (средняя уверенность "
-                f"{diag['avg_confidence']:.2f}) — вероятно проблема в качестве видео/освещении/"
-                "расстоянии до камеры, а не в порогах. Броски и передачи почти наверняка будут "
-                "фиксироваться редко или не будут вовсе, пока мяч физически не виден модели чаще."
+                f"❌ YOLO: {yolo_pct:.0f}%, с fallback: {enh_pct:.0f}% — даже эвристики слабо помогают. "
+                "Проверьте освещение/качество видео или увеличьте ROI и окно виртуального мяча."
             )
 
     colA, colB = st.columns(2)
@@ -2011,6 +2369,10 @@ def run_full_analysis(video_path: str, device: str) -> None:
             person_conf=float(st.session_state.get("person_conf", PERSON_CONF_DEFAULT)),
             ball_conf=float(st.session_state.get("ball_conf", BALL_CONF_DEFAULT)),
             imgsz=int(st.session_state.get("imgsz", IMGSZ_DEFAULT)),
+            max_gap_frames=int(st.session_state.get("ball_max_gap_frames", BALL_MAX_GAP_FRAMES_DEFAULT)),
+            max_predict_frames=int(st.session_state.get("ball_max_predict_frames", BALL_MAX_PREDICT_FRAMES_DEFAULT)),
+            color_fallback=bool(st.session_state.get("ball_color_fallback", BALL_COLOR_FALLBACK_DEFAULT)),
+            color_roi_half=int(st.session_state.get("ball_color_roi_half", BALL_COLOR_ROI_HALF_DEFAULT)),
             camera_transforms=camera_transforms,
             ring_reference_frame_idx=ring_reference_frame_idx,
         )
@@ -2138,14 +2500,23 @@ def render_step4_run(device: str) -> None:
             f"imgsz {int(st.session_state.get('imgsz', IMGSZ_DEFAULT))}px"
         )
         st.write(
+            "Трекинг мяча: "
+            f"интерполяция до {int(st.session_state.get('ball_max_gap_frames', BALL_MAX_GAP_FRAMES_DEFAULT))} кадр., "
+            f"виртуальный мяч до {int(st.session_state.get('ball_max_predict_frames', BALL_MAX_PREDICT_FRAMES_DEFAULT))} кадр., "
+            f"цветовой fallback {'вкл' if st.session_state.get('ball_color_fallback', BALL_COLOR_FALLBACK_DEFAULT) else 'выкл'}, "
+            f"ROI {int(st.session_state.get('ball_color_roi_half', BALL_COLOR_ROI_HALF_DEFAULT))}px"
+        )
+        st.write(
             "Режим камеры: "
             + CAMERA_MODE_LABELS.get(st.session_state.get("camera_mode", CAMERA_MODE_STATIC), "статичная")
         )
         diag = st.session_state.get("ball_diagnostics")
         if diag:
+            yolo_r = diag.get("yolo_detection_rate", diag.get("detection_rate", 0.0)) * 100
+            enh_r = diag.get("enhanced_detection_rate", 0.0) * 100
             st.write(
-                f"Диагностика видимости мяча: обнаружен в {diag['detection_rate'] * 100:.0f}% "
-                f"сэмплированных кадров (средняя уверенность {diag['avg_confidence']:.2f})"
+                f"Диагностика мяча: YOLO {yolo_r:.0f}% · с fallback {enh_r:.0f}% · "
+                f"средняя дыра {diag.get('avg_gap_frames', 0):.1f} кадр."
             )
         n_players = len(st.session_state.get("player_names") or {})
         st.write(f"Сопоставлено игроков (имя/номер): {n_players}")
