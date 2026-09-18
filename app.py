@@ -3,14 +3,14 @@ Basketball Tracking Analytics
 ==============================
 
 Полностью автономное (офлайн) приложение на Streamlit для аналитики баскетбольных
-тренировок по видео со статичной камеры.
+тренировок по видео (статичная или панорамная камера).
 
 Пошаговый пользовательский путь:
     1. Загрузка видео.
     2. Превью кадра + настройка ДВУХ зон колец и порогов владения/передач.
     3. Быстрое предварительное сканирование трекера для сбора списка ID
-       игроков и ручное сопоставление ID → Имя/Номер (номеров на форме нет,
-       поэтому распознать их автоматически невозможно).
+       игроков и ручное сопоставление ID → Имя/Номер (OCR номеров выключен
+       по умолчанию — включайте в проф. режиме, только если номера читаются).
     4. Полный прогон трекинга + аналитики, итоговый Box Score и хайлайты.
 
 Возможности:
@@ -18,9 +18,9 @@ Basketball Tracking Analytics
       ByteTrack (игроки без номеров на майках — удержание ID за счёт трекера,
       а не OCR номеров).
     * Векторная детекция голов: пересечение траектории мяча с горизонтальной
-      линией кольца (задаётся пользователем), с кулдауном 90 кадров.
+      линией кольца (задаётся пользователем), с кулдауном в секундах.
     * Детекция передач (пасов): игрок владел мячом → мяч летел без владельца
-      10–60 кадров → другой игрок получил владение.
+      в заданном окне (секунды) → другой игрок получил владение.
     * Устойчивый трекинг мяча при пропусках YOLO: Kalman + интерполяция +
       цветовой fallback (оранжевый blob в ROI).
     * Отладочный таймлайн владения мячом — виден каждый переход владения и
@@ -146,19 +146,22 @@ BALL_HISTORY_MAXLEN = 20
 TRACK_CONF_DEFAULT = 0.15
 TRACK_IOU_DEFAULT = 0.45
 
-# Окно передачи в КАДРАХ: мяч должен лететь без владельца от min до max кадров.
-PASS_MIN_FRAMES_DEFAULT = 10
-PASS_MIN_FRAMES_MIN = 3
-PASS_MIN_FRAMES_MAX = 30
+# Окно передачи в СЕКУНДАХ: мяч без владельца от min до max (конвертируется в кадры через fps).
+PASS_MIN_SECONDS_DEFAULT = 0.35
+PASS_MIN_SECONDS_MIN = 0.10
+PASS_MIN_SECONDS_MAX = 1.50
 
-PASS_MAX_FRAMES_DEFAULT = 60
-PASS_MAX_FRAMES_MIN = 20
-PASS_MAX_FRAMES_MAX = 120
+PASS_MAX_SECONDS_DEFAULT = 2.0
+PASS_MAX_SECONDS_MIN = 0.50
+PASS_MAX_SECONDS_MAX = 4.0
 
-# Кулдаун между голами у одного кольца (кадры; ~3 сек при 30 fps).
-GOAL_COOLDOWN_FRAMES_DEFAULT = 90
-GOAL_COOLDOWN_FRAMES_MIN = 30
-GOAL_COOLDOWN_FRAMES_MAX = 180
+# Минимальная дистанция полёта мяча (доля порога владения) — отсекает ведение.
+PASS_FLIGHT_MIN_POSSESSION_FRACTION = 0.35
+
+# Кулдаун между голами в одном эпизоде у кольца (секунды; ~3 с при 30 fps).
+GOAL_COOLDOWN_SECONDS_DEFAULT = 3.0
+GOAL_COOLDOWN_SECONDS_MIN = 1.0
+GOAL_COOLDOWN_SECONDS_MAX = 6.0
 
 # --- Дефолты и диапазоны настраиваемых через GUI порогов ---
 # ВАЖНО: на реальном видео исходный жёсткий порог владения (65 px) оказался
@@ -259,9 +262,13 @@ BALL_TRAJECTORY_THICKNESS = 6
 BALL_TRAJECTORY_OUTLINE_BGR = (0, 0, 0)
 BALL_DEFAULT_BBOX_HALF = 14
 BALL_CSRT_MAX_JUMP_PX = 120
+CSRT_REINIT_IOU_THRESHOLD = 0.35
+CSRT_REINIT_CONF_MARGIN = 0.12
+# Источники мяча, по которым можно считать гол/пас (не kalman/color/interp с нулевым conf).
+EVENT_ELIGIBLE_BALL_SOURCES = frozenset({"yolo", "csrt", "user", "user_interp", "tiled", "roi"})
 BALL_TILED_IMGSZ = 1280
 BALL_ROI_DETECT_IMGSZ = 960
-JERSEY_OCR_ENABLED_DEFAULT = True
+JERSEY_OCR_ENABLED_DEFAULT = False
 JERSEY_OCR_MIN_CONF = 0.45
 REID_SIMILARITY_THRESHOLD = 0.78
 # Жёсткий гейт внешности: ниже — не доверяем ID ByteTrack (лучше новый ID, чем swap).
@@ -1317,6 +1324,53 @@ def get_camera_transforms_cached(
 # ---------------------------------------------------------------------------
 # Разбор результатов детекции/трекинга Ultralytics и отрисовка аннотаций
 # ---------------------------------------------------------------------------
+def bbox_iou(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> float:
+    """IoU двух bbox (x1,y1,x2,y2)."""
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 1e-6 else 0.0
+
+
+def compute_csrt_max_jump_px(
+    fps: float,
+    avg_player_diagonal: Optional[float] = None,
+    imgsz: int = IMGSZ_DEFAULT,
+) -> float:
+    """Адаптивный порог скачка CSRT: ниже FPS / мельче игроки → больше px за кадр."""
+    fps = max(float(fps), 1.0)
+    fps_scale = 25.0 / fps
+    diag = float(avg_player_diagonal) if avg_player_diagonal and avg_player_diagonal > 0 else 120.0
+    size_scale = diag / 120.0
+    imgsz_scale = max(float(imgsz) / 640.0, 0.5)
+    jump = BALL_CSRT_MAX_JUMP_PX * fps_scale * size_scale * math.sqrt(imgsz_scale)
+    return float(np.clip(jump, 45.0, 320.0))
+
+
+def ball_state_counts_for_events(
+    ball_state: Optional["BallTrackState"],
+    ball_lost: bool = False,
+) -> bool:
+    """Гол/пас только по надёжным источникам (не kalman/color/interp с нулевым conf)."""
+    if ball_state is None or ball_lost:
+        return False
+    if ball_state.source not in EVENT_ELIGIBLE_BALL_SOURCES:
+        return False
+    return float(ball_state.conf) > 0.0
+
+
+def seconds_to_frames(seconds: float, fps: float, minimum: int = 1) -> int:
+    return max(int(round(float(seconds) * float(fps))), minimum)
+
+
 def parse_track_results(
     results,
     person_conf_threshold: float = 0.0,
@@ -1346,26 +1400,30 @@ def parse_track_results(
     ball_bbox: Optional[Tuple[float, float, float, float]] = None
 
     boxes = result.boxes
-    if boxes is not None and boxes.id is not None and len(boxes) > 0:
-        xyxy = boxes.xyxy.cpu().numpy()
-        cls = boxes.cls.cpu().numpy().astype(int)
-        ids = boxes.id.cpu().numpy().astype(int)
-        confs = boxes.conf.cpu().numpy()
+    if boxes is None or len(boxes) == 0:
+        return persons, ball, 0.0, ball_bbox
 
-        best_ball_conf = -1.0
-        for box, c, tid, conf in zip(xyxy, cls, ids, confs):
-            conf = float(conf)
-            if c == COCO_PERSON_CLASS_ID:
-                if conf < person_conf_threshold:
-                    continue
-                persons.append((int(tid), (float(box[0]), float(box[1]), float(box[2]), float(box[3]))))
-            elif c == COCO_BALL_CLASS_ID:
-                if conf < ball_conf_threshold:
-                    continue
-                if conf > best_ball_conf:
-                    best_ball_conf = conf
-                    ball = ((float(box[0]) + float(box[2])) / 2.0, (float(box[1]) + float(box[3])) / 2.0)
-                    ball_bbox = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+    xyxy = boxes.xyxy.cpu().numpy()
+    cls = boxes.cls.cpu().numpy().astype(int)
+    confs = boxes.conf.cpu().numpy()
+    ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
+
+    best_ball_conf = -1.0
+    for i, (box, c, conf) in enumerate(zip(xyxy, cls, confs)):
+        conf = float(conf)
+        if c == COCO_BALL_CLASS_ID:
+            if conf < ball_conf_threshold:
+                continue
+            if conf > best_ball_conf:
+                best_ball_conf = conf
+                ball = ((float(box[0]) + float(box[2])) / 2.0, (float(box[1]) + float(box[3])) / 2.0)
+                ball_bbox = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+        elif c == COCO_PERSON_CLASS_ID and ids is not None:
+            if conf < person_conf_threshold:
+                continue
+            persons.append(
+                (int(ids[i]), (float(box[0]), float(box[1]), float(box[2]), float(box[3])))
+            )
 
     return persons, ball, best_ball_conf if ball is not None else 0.0, ball_bbox
 
@@ -2181,13 +2239,98 @@ class BallKalmanFilter:
         self.kf.correct(np.array([[x], [y]], dtype=np.float32))
 
 
-def detect_orange_ball_color(
+@dataclass
+class BallColorCalibration:
+    """HSV-диапазоны мяча, откалиброванные по кликам-якорям шага 2."""
+
+    lower1: np.ndarray
+    upper1: np.ndarray
+    lower2: Optional[np.ndarray] = None
+    upper2: Optional[np.ndarray] = None
+
+
+def build_ball_color_calibration_from_anchors(
+    video_path: str,
+    anchors: Optional[List[Any]],
+    camera_transforms: Optional[List[np.ndarray]] = None,
+    patch_radius: int = 12,
+) -> Optional[BallColorCalibration]:
+    """Строит HSV-маску мяча по кликам пользователя; без якорей — None (fallback на оранжевый)."""
+    if cv2 is None:
+        return None
+    norm = normalize_ball_anchors(anchors)
+    if not norm:
+        return None
+    h_vals: List[float] = []
+    s_vals: List[float] = []
+    v_vals: List[float] = []
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    try:
+        for anchor in norm:
+            fidx = int(anchor["frame"])
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            x, y = project_ball_point_to_frame(
+                anchor["x"], anchor["y"], fidx, fidx, camera_transforms
+            )
+            cx, cy = int(round(x)), int(round(y))
+            fh, fw = frame.shape[:2]
+            x1, y1 = max(cx - patch_radius, 0), max(cy - patch_radius, 0)
+            x2, y2 = min(cx + patch_radius, fw), min(cy + patch_radius, fh)
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            patch = frame[y1:y2, x1:x2]
+            hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+            h_vals.extend(hsv[:, :, 0].astype(np.float32).flatten().tolist())
+            s_vals.extend(hsv[:, :, 1].astype(np.float32).flatten().tolist())
+            v_vals.extend(hsv[:, :, 2].astype(np.float32).flatten().tolist())
+    finally:
+        cap.release()
+    if len(h_vals) < 16:
+        return None
+    h_arr = np.array(h_vals, dtype=np.float32)
+    s_arr = np.array(s_vals, dtype=np.float32)
+    v_arr = np.array(v_vals, dtype=np.float32)
+    h_med = float(np.median(h_arr))
+    h_pad = 16.0
+    s_lo = float(np.clip(np.percentile(s_arr, 8) - 30, 25, 255))
+    s_hi = float(np.clip(np.percentile(s_arr, 92) + 30, 0, 255))
+    v_lo = float(np.clip(np.percentile(v_arr, 8) - 35, 30, 255))
+    v_hi = float(np.clip(np.percentile(v_arr, 92) + 35, 0, 255))
+    if h_med < 12:
+        lower1 = np.array([0, s_lo, v_lo], dtype=np.uint8)
+        upper1 = np.array([min(180, h_med + h_pad), s_hi, v_hi], dtype=np.uint8)
+        lower2 = np.array([max(0, 180 - (12 - h_med)), s_lo, v_lo], dtype=np.uint8)
+        upper2 = np.array([179, s_hi, v_hi], dtype=np.uint8)
+        return BallColorCalibration(lower1=lower1, upper1=upper1, lower2=lower2, upper2=upper2)
+    lower1 = np.array([max(0, h_med - h_pad), s_lo, v_lo], dtype=np.uint8)
+    upper1 = np.array([min(180, h_med + h_pad), s_hi, v_hi], dtype=np.uint8)
+    return BallColorCalibration(lower1=lower1, upper1=upper1)
+
+
+def _ball_color_hsv_mask(hsv: Any, calibration: Optional[BallColorCalibration]) -> Any:
+    if calibration is not None:
+        mask = cv2.inRange(hsv, calibration.lower1, calibration.upper1)
+        if calibration.lower2 is not None and calibration.upper2 is not None:
+            mask = mask | cv2.inRange(hsv, calibration.lower2, calibration.upper2)
+        return mask
+    return cv2.inRange(hsv, ORANGE_HSV_LOWER1, ORANGE_HSV_UPPER1) | cv2.inRange(
+        hsv, ORANGE_HSV_LOWER2, ORANGE_HSV_UPPER2
+    )
+
+
+def detect_ball_color_blob(
     frame_bgr: Any,
     hint_xy: Tuple[float, float],
     roi_half: int,
     persons: List[Tuple[int, Tuple[float, float, float, float]]],
+    color_calibration: Optional[BallColorCalibration] = None,
 ) -> Optional[Tuple[float, float, float]]:
-    """Ищет оранжевый круглый blob в ROI вокруг подсказки (не по всему кадру)."""
+    """Ищет круглый blob мяча в ROI (HSV из калибровки по кликам или дефолтный оранжевый)."""
     if cv2 is None or frame_bgr is None:
         return None
     h, w = frame_bgr.shape[:2]
@@ -2199,9 +2342,7 @@ def detect_orange_ball_color(
 
     roi = frame_bgr[y1:y2, x1:x2]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, ORANGE_HSV_LOWER1, ORANGE_HSV_UPPER1) | cv2.inRange(
-        hsv, ORANGE_HSV_LOWER2, ORANGE_HSV_UPPER2
-    )
+    mask = _ball_color_hsv_mask(hsv, color_calibration)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
@@ -2394,6 +2535,8 @@ class BallTracker:
         self.device = device
         self.ball_conf = ball_conf
         self.imgsz = imgsz
+        self.csrt_max_jump_px = float(BALL_CSRT_MAX_JUMP_PX)
+        self.color_calibration: Optional[BallColorCalibration] = None
         self.kalman = BallKalmanFilter()
         self.csrt_tracker: Any = None
         self.last_bbox: Optional[Tuple[float, float, float, float]] = None
@@ -2401,6 +2544,7 @@ class BallTracker:
         self.last_confident_pos: Optional[Tuple[float, float]] = None
         self.prev_confident_frame: Optional[int] = None
         self.prev_confident_pos: Optional[Tuple[float, float]] = None
+        self.last_committed_conf: float = 0.0
         self.frames_since_yolo = 10**6
         self.frames_since_any = 10**6
 
@@ -2439,7 +2583,7 @@ class BallTracker:
         center = _ball_center_from_bbox(bbox)
         if self.last_confident_pos is not None:
             jump = math.hypot(center[0] - self.last_confident_pos[0], center[1] - self.last_confident_pos[1])
-            if jump > BALL_CSRT_MAX_JUMP_PX:
+            if jump > self.csrt_max_jump_px:
                 self._reset_csrt()
                 return None
         self.last_bbox = bbox
@@ -2472,6 +2616,20 @@ class BallTracker:
         vy = (p1[1] - p0[1]) / dt
         return p1[0] + vx * gap, p1[1] + vy * gap
 
+    def _should_reinit_csrt(
+        self,
+        new_bbox: Tuple[float, float, float, float],
+        conf: float,
+        source: str,
+    ) -> bool:
+        if self.csrt_tracker is None or self.last_bbox is None:
+            return True
+        if bbox_iou(new_bbox, self.last_bbox) >= CSRT_REINIT_IOU_THRESHOLD:
+            return True
+        if source in ("yolo", "tiled", "roi") and conf > self.last_committed_conf + CSRT_REINIT_CONF_MARGIN:
+            return True
+        return False
+
     def _commit_detection(
         self,
         frame_idx: int,
@@ -2488,8 +2646,11 @@ class BallTracker:
         if self.kalman.initialized:
             self.kalman.predict()
         self.kalman.correct(x, y)
-        self._init_csrt(frame_bgr, bbox)
-        self.frames_since_yolo = 0
+        if self._should_reinit_csrt(bbox, conf, source):
+            self._init_csrt(frame_bgr, bbox)
+        self.last_committed_conf = float(conf)
+        if source in ("yolo", "user", "user_interp", "tiled", "roi"):
+            self.frames_since_yolo = 0
         self.frames_since_any = 0
         return BallTrackState(x, y, conf, source)
 
@@ -2550,13 +2711,16 @@ class BallTracker:
                 self.last_bbox = det_bbox
                 self._record_confident(frame_idx, x, y)
                 self.kalman.correct(x, y)
-                if det_bbox is not None:
+                if det_bbox is not None and self._should_reinit_csrt(det_bbox, det_conf, det_src):
                     self._init_csrt(frame_bgr, det_bbox)
+                self.last_committed_conf = float(det_conf)
                 self.frames_since_any = 0
                 return BallTrackState(x, y, det_conf, det_src)
 
         if self.color_fallback and hint is not None:
-            color_hit = detect_orange_ball_color(frame_bgr, hint, self.color_roi_half, persons)
+            color_hit = detect_ball_color_blob(
+                frame_bgr, hint, self.color_roi_half, persons, self.color_calibration
+            )
             if color_hit is not None:
                 x, y, score = color_hit
                 bbox = _bbox_from_center(x, y)
@@ -2564,7 +2728,8 @@ class BallTracker:
                 if self.kalman.initialized:
                     self.kalman.predict()
                 self.kalman.correct(x, y)
-                self._init_csrt(frame_bgr, bbox)
+                if self._should_reinit_csrt(bbox, score * 0.5, "color"):
+                    self._init_csrt(frame_bgr, bbox)
                 self.frames_since_any = 0
                 return BallTrackState(x, y, score * 0.5, "color")
 
@@ -3283,9 +3448,9 @@ def process_video(
     device: str,
     rings: List[RingZone],
     possession_threshold: float,
-    pass_min_frames: int,
-    pass_max_frames: int,
-    goal_cooldown_frames: int,
+    pass_min_seconds: float,
+    pass_max_seconds: float,
+    goal_cooldown_seconds: float,
     ball_memory_seconds: float,
     progress_bar,
     status_text,
@@ -3304,6 +3469,7 @@ def process_video(
     camera_transforms: Optional[List[np.ndarray]] = None,
     ball_anchors: Optional[List[Dict[str, Any]]] = None,
     manual_id_map: Optional[Dict[int, int]] = None,
+    avg_player_diagonal: Optional[float] = None,
 ) -> Tuple[Dict[int, PlayerStats], Path, Dict[str, List[Dict[str, Any]]]]:
     """Обрабатывает видео покадрово: детекция, трекинг, события, хайлайты.
 
@@ -3350,7 +3516,15 @@ def process_video(
         "sampled_timeline": [],
         "ball_sources": [],
     }
+    pass_min_frames = seconds_to_frames(pass_min_seconds, fps)
+    pass_max_frames = max(seconds_to_frames(pass_max_seconds, fps), pass_min_frames + 1)
+    goal_cooldown_frames = seconds_to_frames(goal_cooldown_seconds, fps)
+    pass_flight_min_px = possession_threshold * PASS_FLIGHT_MIN_POSSESSION_FRACTION
+
     predict_limit = max(max_predict_frames, int(ball_memory_seconds * fps))
+    ball_color_cal = build_ball_color_calibration_from_anchors(
+        video_path, ball_anchors, camera_transforms
+    )
     ball_tracker = BallTracker(
         max_gap_frames=max_gap_frames,
         max_predict_frames=predict_limit,
@@ -3361,6 +3535,8 @@ def process_video(
         ball_conf=ball_conf,
         imgsz=imgsz,
     )
+    ball_tracker.csrt_max_jump_px = compute_csrt_max_jump_px(fps, avg_player_diagonal, imgsz)
+    ball_tracker.color_calibration = ball_color_cal
     ball_anchor_guide = (
         BallAnchorGuide(ball_anchors, camera_transforms)
         if normalize_ball_anchors(ball_anchors)
@@ -3380,8 +3556,9 @@ def process_video(
     last_owner: Optional[int] = None
     pass_origin: Optional[int] = None
     free_ball_frames: int = 0
-    last_goal_frame_per_ring = [-10**9 for _ in rings]
-    prev_ball_xy: Optional[Tuple[float, float]] = None
+    pass_free_start_xy: Optional[Tuple[float, float]] = None
+    last_goal_episode_frame: int = -10**9
+    prev_event_ball_xy: Optional[Tuple[float, float]] = None
 
     reset_tracker(model)  # независимая от возможного шага 3 сессия трекинга
 
@@ -3399,6 +3576,7 @@ def process_video(
 
         t = frame_idx / fps
         ball: Optional[Tuple[float, float]] = None
+        ball_state: Optional[BallTrackState] = None
         ball_source: Optional[str] = None
         ball_lost = False
 
@@ -3451,6 +3629,10 @@ def process_video(
                 ball_source = ball_state.source
             elif ball_tracker.last_confident_pos is not None and ball_tracker.frames_since_any < ball_tracker.max_predict_frames:
                 ball_lost = True
+
+        event_ball: Optional[Tuple[float, float]] = None
+        if ball_state_counts_for_events(ball_state, ball_lost):
+            event_ball = ball
         else:
             persons = []
             annotated = frame.copy()
@@ -3501,22 +3683,30 @@ def process_video(
         # кадров → Игрок_2 получил владение → +1 пас Игроку_1.
         # -------------------------------------------------------------
         current_owner: Optional[int] = None
-        if effective_ball is not None and event_persons:
+        if event_ball is not None and event_persons:
             best_dist = None
             for pid, box in event_persons:
-                d = distance_point_to_bbox(effective_ball[0], effective_ball[1], box)
+                d = distance_point_to_bbox(event_ball[0], event_ball[1], box)
                 if best_dist is None or d < best_dist:
                     best_dist, current_owner = d, pid
             if best_dist is not None and best_dist > possession_threshold:
                 current_owner = None  # мяч ничейный/в полёте — слишком далеко от всех игроков
 
         if current_owner is not None:
+            pass_flight_ok = True
+            if pass_origin is not None and pass_free_start_xy is not None and event_ball is not None:
+                flight_dist = math.hypot(
+                    event_ball[0] - pass_free_start_xy[0],
+                    event_ball[1] - pass_free_start_xy[1],
+                )
+                pass_flight_ok = flight_dist >= pass_flight_min_px
             if (
                 pass_origin is not None
                 and pass_origin not in excluded_ids
                 and current_owner not in excluded_ids
                 and pass_origin != current_owner
                 and pass_min_frames <= free_ball_frames <= pass_max_frames
+                and pass_flight_ok
             ):
                 reason = "✅ передача засчитана"
                 stats.setdefault(pass_origin, blank_stats())["passes"] += 1
@@ -3542,9 +3732,17 @@ def process_video(
                 reason = "смена владельца (не пас)"
                 if pass_origin is not None and free_ball_frames > 0:
                     if free_ball_frames < pass_min_frames:
-                        reason = f"❌ отклонено (< {pass_min_frames} кадров без владельца)"
+                        reason = (
+                            f"❌ отклонено (< {pass_min_seconds:.2f} с без владельца)"
+                        )
                     elif free_ball_frames > pass_max_frames:
-                        reason = f"❌ отклонено (> {pass_max_frames} кадров без владельца)"
+                        reason = (
+                            f"❌ отклонено (> {pass_max_seconds:.2f} с без владельца)"
+                        )
+                    elif not pass_flight_ok:
+                        reason = (
+                            f"❌ отклонено (полёт < {pass_flight_min_px:.0f} px — вероятно ведение)"
+                        )
                 debug_log["ownership_changes"].append(
                     {
                         "Кадр": frame_idx,
@@ -3557,17 +3755,21 @@ def process_video(
                 )
             pass_origin = None
             free_ball_frames = 0
+            pass_free_start_xy = None
             last_owner = current_owner
-        elif effective_ball is not None:
+        elif event_ball is not None:
             if last_owner is not None and last_owner not in excluded_ids:
                 if pass_origin is None:
                     pass_origin = last_owner
+                    pass_free_start_xy = event_ball
                 free_ball_frames += 1
                 if free_ball_frames > pass_max_frames:
                     pass_origin = None
+                    pass_free_start_xy = None
         else:
             if free_ball_frames > pass_max_frames:
                 pass_origin = None
+                pass_free_start_xy = None
                 free_ball_frames = 0
 
         if frame_idx % sample_every == 0:
@@ -3583,38 +3785,37 @@ def process_video(
                 )
 
         # -------------------------------------------------------------
-        # ГОЛЫ: векторный анализ пересечения траектории мяча с горизонтальной
-        # линией кольца (сверху вниз). Кулдаун — goal_cooldown_frames кадров.
-        # Автором гола считается игрок, который последним владел мячом.
+        # ГОЛЫ: пересечение траектории мяча с линией кольца (только надёжный source).
+        # Общий кулдаун эпизода у кольца в секундах (не per-ring).
         # -------------------------------------------------------------
-        if effective_ball is not None and prev_ball_xy is not None:
-            bx_prev, by_prev = prev_ball_xy
-            bx_curr, by_curr = effective_ball[0], effective_ball[1]
-            for ring_idx, ring in enumerate(current_rings):
-                half_w = ring.get("half_width", ring.get("r", 40.0))
-                if not segment_crosses_hoop_line_top_to_bottom(
-                    bx_prev, by_prev, bx_curr, by_curr, ring["y"], ring["x"], half_w
-                ):
-                    continue
-                if (frame_idx - last_goal_frame_per_ring[ring_idx]) < goal_cooldown_frames:
-                    continue
-                last_goal_frame_per_ring[ring_idx] = frame_idx
-                credited_player = last_owner
-                if credited_player is None:
-                    credited_player = nearest_player_to_point(event_persons, (ring["x"], ring["y"]))
-                if credited_player is not None and credited_player not in excluded_ids:
-                    stats.setdefault(credited_player, blank_stats())["shots"] += 1
-                    stats[credited_player]["makes"] += 1
-                    pending_highlights.append(
-                        PendingHighlight(
-                            filename=f"goal_ring{ring_idx + 1}_ID{credited_player}_frame_{frame_idx}.mp4",
-                            past_frames=list(frame_buffer),
-                            frames_needed=future_frames_needed,
+        if event_ball is not None and prev_event_ball_xy is not None:
+            bx_prev, by_prev = prev_event_ball_xy
+            bx_curr, by_curr = event_ball[0], event_ball[1]
+            if (frame_idx - last_goal_episode_frame) >= goal_cooldown_frames:
+                for ring_idx, ring in enumerate(current_rings):
+                    half_w = ring.get("half_width", ring.get("r", 40.0))
+                    if not segment_crosses_hoop_line_top_to_bottom(
+                        bx_prev, by_prev, bx_curr, by_curr, ring["y"], ring["x"], half_w
+                    ):
+                        continue
+                    last_goal_episode_frame = frame_idx
+                    credited_player = last_owner
+                    if credited_player is None:
+                        credited_player = nearest_player_to_point(event_persons, (ring["x"], ring["y"]))
+                    if credited_player is not None and credited_player not in excluded_ids:
+                        stats.setdefault(credited_player, blank_stats())["shots"] += 1
+                        stats[credited_player]["makes"] += 1
+                        pending_highlights.append(
+                            PendingHighlight(
+                                filename=f"goal_ring{ring_idx + 1}_ID{credited_player}_frame_{frame_idx}.mp4",
+                                past_frames=list(frame_buffer),
+                                frames_needed=future_frames_needed,
+                            )
                         )
-                    )
+                    break
 
-        if effective_ball is not None:
-            prev_ball_xy = (effective_ball[0], effective_ball[1])
+        if event_ball is not None:
+            prev_event_ball_xy = (event_ball[0], event_ball[1])
 
         # -------------------------------------------------------------
         # Буфер прошлого (для хайлайтов) и добор "будущих" кадров для уже
@@ -3717,10 +3918,10 @@ def init_session_state() -> None:
         "ring2_anchors": [],
         "preview_frame_idx": 0,
         "possession_threshold": float(POSSESSION_THRESHOLD_DEFAULT),
-        "pass_min_frames": int(PASS_MIN_FRAMES_DEFAULT),
-        "pass_max_frames": int(PASS_MAX_FRAMES_DEFAULT),
+        "pass_min_seconds": float(PASS_MIN_SECONDS_DEFAULT),
+        "pass_max_seconds": float(PASS_MAX_SECONDS_DEFAULT),
         "ball_memory": float(BALL_MEMORY_SECONDS_DEFAULT),
-        "goal_cooldown_frames": int(GOAL_COOLDOWN_FRAMES_DEFAULT),
+        "goal_cooldown_seconds": float(GOAL_COOLDOWN_SECONDS_DEFAULT),
         "enhance_quality": False,
         "person_conf": float(PERSON_CONF_DEFAULT),
         "ball_conf": float(BALL_CONF_DEFAULT),
@@ -3962,19 +4163,19 @@ def render_step2_professional_settings(device: str, video_path: str, meta: Dict[
             help="Максимальное расстояние от центра мяча до рамки игрока, при котором игрок считается владеющим мячом.",
         )
     with c2:
-        st.session_state["pass_min_frames"] = st.slider(
-            "Мин. кадров без владельца для паса",
-            min_value=PASS_MIN_FRAMES_MIN,
-            max_value=PASS_MIN_FRAMES_MAX,
-            value=int(st.session_state["pass_min_frames"]),
-            step=1,
+        st.session_state["pass_min_seconds"] = st.slider(
+            "Мин. время без владельца для паса (сек)",
+            min_value=PASS_MIN_SECONDS_MIN,
+            max_value=PASS_MIN_SECONDS_MAX,
+            value=float(st.session_state.get("pass_min_seconds", PASS_MIN_SECONDS_DEFAULT)),
+            step=0.05,
         )
-        st.session_state["pass_max_frames"] = st.slider(
-            "Макс. кадров без владельца для паса",
-            min_value=PASS_MAX_FRAMES_MIN,
-            max_value=PASS_MAX_FRAMES_MAX,
-            value=int(st.session_state["pass_max_frames"]),
-            step=1,
+        st.session_state["pass_max_seconds"] = st.slider(
+            "Макс. время без владельца для паса (сек)",
+            min_value=PASS_MAX_SECONDS_MIN,
+            max_value=PASS_MAX_SECONDS_MAX,
+            value=float(st.session_state.get("pass_max_seconds", PASS_MAX_SECONDS_DEFAULT)),
+            step=0.1,
         )
     with c3:
         st.session_state["ball_memory"] = st.slider(
@@ -3985,12 +4186,12 @@ def render_step2_professional_settings(device: str, video_path: str, meta: Dict[
             step=0.05,
         )
 
-    st.session_state["goal_cooldown_frames"] = st.slider(
-        "Кулдаун гола у кольца (кадры)",
-        min_value=GOAL_COOLDOWN_FRAMES_MIN,
-        max_value=GOAL_COOLDOWN_FRAMES_MAX,
-        value=int(st.session_state["goal_cooldown_frames"]),
-        step=5,
+    st.session_state["goal_cooldown_seconds"] = st.slider(
+        "Кулдаун гола у кольца (сек, общий на эпизод)",
+        min_value=GOAL_COOLDOWN_SECONDS_MIN,
+        max_value=GOAL_COOLDOWN_SECONDS_MAX,
+        value=float(st.session_state.get("goal_cooldown_seconds", GOAL_COOLDOWN_SECONDS_DEFAULT)),
+        step=0.25,
     )
 
     st.markdown("**Детекция мяча и производительность (YOLO)**")
@@ -4015,7 +4216,7 @@ def render_step2_professional_settings(device: str, video_path: str, meta: Dict[
 
     st.markdown("**Устойчивый трекинг мяча (Kalman + цвет)**")
     st.session_state["ball_color_fallback"] = st.checkbox(
-        "Цветовой fallback (оранжевый мяч в ROI)",
+        "Цветовой fallback мяча в ROI (HSV из кликов шага 2 или оранжевый дефолт)",
         value=bool(st.session_state.get("ball_color_fallback", BALL_COLOR_FALLBACK_DEFAULT)),
     )
     bgap1, bgap2, broi = st.columns(3)
@@ -4059,10 +4260,15 @@ def render_step2_professional_settings(device: str, video_path: str, meta: Dict[
         step=0.01,
     )
     st.session_state["jersey_ocr_enabled"] = st.checkbox(
-        "На форме есть номера (EasyOCR)",
+        "EasyOCR номеров на форме (только если номера реально читаются на видео)",
         value=bool(st.session_state.get("jersey_ocr_enabled", JERSEY_OCR_ENABLED_DEFAULT)),
     )
-    if st.session_state["jersey_ocr_enabled"] and easyocr is None:
+    if not st.session_state["jersey_ocr_enabled"]:
+        st.caption(
+            "По умолчанию OCR выключен — на большинстве тренировочных видео номера не читаются "
+            "и OCR даёт ложные цифры. Включайте только при крупном плане и чётких номерах."
+        )
+    elif easyocr is None:
         st.caption(f"⚠️ EasyOCR недоступен: {EASYOCR_IMPORT_ERROR or 'не установлен'}")
 
     st.session_state["enhance_quality"] = st.checkbox(
@@ -4539,8 +4745,9 @@ def render_step3_players(device: str) -> None:
     meta = get_video_metadata(video_path)
     st.write(
         "Короткое предварительное сканирование первых секунд видео собирает список ID игроков "
-        "и по одному характерному кадру-кропу на каждого. Номера на форме не видны камере и "
-        "распознать их автоматически невозможно — впишите имя/номер вручную по кропам."
+        "и по одному характерному кадру-кропу на каждого. **Имена и номера** впишите вручную "
+        "по кропам. EasyOCR номеров **выключен по умолчанию** (шаг 2 → проф. режим) — "
+        "включайте только если на вашем видео номера действительно читаются."
     )
 
     max_scan = max(int(min(meta["duration"], 60)), 5)
@@ -4842,9 +5049,12 @@ def run_full_analysis(video_path: str, device: str) -> None:
             device=device,
             rings=rings,
             possession_threshold=float(st.session_state["possession_threshold"]),
-            pass_min_frames=int(st.session_state["pass_min_frames"]),
-            pass_max_frames=int(st.session_state["pass_max_frames"]),
-            goal_cooldown_frames=int(st.session_state["goal_cooldown_frames"]),
+            pass_min_seconds=float(st.session_state.get("pass_min_seconds", PASS_MIN_SECONDS_DEFAULT)),
+            pass_max_seconds=float(st.session_state.get("pass_max_seconds", PASS_MAX_SECONDS_DEFAULT)),
+            goal_cooldown_seconds=float(
+                st.session_state.get("goal_cooldown_seconds", GOAL_COOLDOWN_SECONDS_DEFAULT)
+            ),
+            avg_player_diagonal=st.session_state.get("avg_player_diagonal"),
             ball_memory_seconds=float(st.session_state["ball_memory"]),
             progress_bar=progress_bar,
             status_text=status_text,
@@ -4992,9 +5202,10 @@ def render_step4_run(device: str) -> None:
         )
         st.write(
             f"Порог владения: {int(st.session_state['possession_threshold'])} px · "
-            f"Окно паса: {int(st.session_state['pass_min_frames'])}–{int(st.session_state['pass_max_frames'])} кадров · "
+            f"Окно паса: {float(st.session_state.get('pass_min_seconds', PASS_MIN_SECONDS_DEFAULT)):.2f}–"
+            f"{float(st.session_state.get('pass_max_seconds', PASS_MAX_SECONDS_DEFAULT)):.2f} с · "
             f"Память мяча: {st.session_state['ball_memory']:.2f} с · "
-            f"Кулдаун гола: {int(st.session_state['goal_cooldown_frames'])} кадров"
+            f"Кулдаун гола: {float(st.session_state.get('goal_cooldown_seconds', GOAL_COOLDOWN_SECONDS_DEFAULT)):.2f} с"
         )
         st.write(
             "Улучшение качества кадра перед детекцией: "
@@ -5066,7 +5277,7 @@ def main() -> None:
     init_session_state()
 
     st.title("🏀 Basketball Tracking Analytics")
-    st.caption("Офлайн-аналитика баскетбольных тренировок по видео со статичной камеры (YOLO11x + ByteTrack)")
+    st.caption("Офлайн-аналитика баскетбольных тренировок по видео (YOLO11x + ByteTrack)")
 
     device, device_message, device_ok = resolve_device()
     if device_ok:
