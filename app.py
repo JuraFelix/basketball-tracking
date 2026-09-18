@@ -247,6 +247,7 @@ BALL_SOURCE_COLORS_BGR = {
 BALL_PREVIEW_COLOR_BGR = (0, 140, 255)
 BALL_PREVIEW_INTERP_COLOR_BGR = (0, 200, 255)
 CLICK_TARGET_OPTIONS = ("Кольцо 1", "Кольцо 2", "Мяч")
+BALL_ANCHORS_MIN_RECOMMENDED = 2
 # Яркая траектория мяча на аннотированном видео (BGR) + чёрная обводка.
 BALL_TRAJECTORY_COLOR_BGR = (0, 255, 255)
 BALL_TRAJECTORY_THICKNESS = 6
@@ -3396,9 +3397,19 @@ def _make_ring_widget_change_handler(ring_num: int):
     def _handler() -> None:
         st.session_state[f"ring{ring_num}_configured"] = True
         sync_ring_widgets_to_canonical(st.session_state, ring_num)
-        st.session_state[f"ring{ring_num}_frame"] = int(st.session_state.get("preview_frame_idx", 0))
+        if st.session_state.get("camera_mode") == CAMERA_MODE_PANNING:
+            st.session_state[f"ring{ring_num}_frame"] = int(st.session_state.get("preview_frame_idx", 0))
+        else:
+            st.session_state[f"ring{ring_num}_frame"] = 0
 
     return _handler
+
+
+def _ring_anchor_frame_idx() -> int:
+    """Номер кадра-якоря для кольца: в статике всегда 0, в динамике — текущий кадр превью."""
+    if st.session_state.get("camera_mode") == CAMERA_MODE_PANNING:
+        return int(st.session_state.get("preview_frame_idx", 0))
+    return 0
 
 
 def go_to_step(step: int) -> None:
@@ -3493,11 +3504,6 @@ def render_step2_professional_settings(device: str, video_path: str, meta: Dict[
             "Y1 (px)", min_value=0, max_value=int(meta["height"]), key="wi_ring1_y",
             on_change=_make_ring_widget_change_handler(1),
         )
-        st.number_input(
-            "Полуширина линии 1 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
-            key="wi_ring1_r", on_change=_make_ring_widget_change_handler(1),
-            help="Половина длины горизонтального отрезка линии кольца (от центра влево/вправо).",
-        )
     with col2:
         st.markdown("**Кольцо №2 (точные координаты)**")
         st.number_input(
@@ -3507,11 +3513,6 @@ def render_step2_professional_settings(device: str, video_path: str, meta: Dict[
         st.number_input(
             "Y2 (px)", min_value=0, max_value=int(meta["height"]), key="wi_ring2_y",
             on_change=_make_ring_widget_change_handler(2),
-        )
-        st.number_input(
-            "Полуширина линии 2 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
-            key="wi_ring2_r", on_change=_make_ring_widget_change_handler(2),
-            help="Половина длины горизонтального отрезка линии кольца (от центра влево/вправо).",
         )
     sync_ring_widgets_to_canonical(st.session_state, 1)
     sync_ring_widgets_to_canonical(st.session_state, 2)
@@ -3717,15 +3718,7 @@ def render_step2_zones(device: str) -> None:
             st.caption("Оценка движения камеры готова (используется кэш для этого видео).")
         camera_transforms_preview = st.session_state.get("camera_transforms")
 
-    st.subheader("🎯 Положение колец")
-    st.caption(
-        "Сдвиньте кадр → убедитесь, что кольцо видно → кликните по ободу. "
-        "Координаты и якорный кадр сохраняются в исходном разрешении."
-    )
-    st.info(
-        "**Инструкция:** выберите «Кольцо 1» / «Кольцо 2» и **кликните по ободу** на превью. "
-        "Для мяча выберите «Мяч» и кликните по нему на нескольких кадрах, где он хорошо виден."
-    )
+    st.subheader("🎯 Положение колец и мяча")
     if streamlit_image_coordinates is not None and cv2 is not None:
         current_target = st.session_state.get("click_target_ring", "Кольцо 1")
         if current_target not in CLICK_TARGET_OPTIONS:
@@ -3738,27 +3731,91 @@ def render_step2_zones(device: str) -> None:
             index=list(CLICK_TARGET_OPTIONS).index(current_target),
         )
     else:
+        current_target = st.session_state.get("click_target_ring", "Кольцо 1")
         st.caption(
             "Пакет streamlit-image-coordinates не установлен — доступна только точная настройка "
             "числовыми полями ниже (см. requirements.txt)."
         )
 
-    st.caption(
-        "Кликните мяч на **2–10 кадрах**, где он хорошо виден — так трекер реже теряет его между детекциями YOLO."
-    )
+    click_target = st.session_state.get("click_target_ring", current_target)
+    show_frame_slider = panning_mode or click_target == "Мяч"
 
-    if int(st.session_state.get("preview_frame_idx", 0)) > max_frame_idx:
-        st.session_state["preview_frame_idx"] = max_frame_idx
-    st.slider(
-        "Кадр для настройки (кольца и мяч привязываются к этому кадру)",
-        min_value=0,
-        max_value=max_frame_idx,
-        step=1,
-        key="preview_frame_idx",
-    )
-    preview_frame_idx = int(st.session_state["preview_frame_idx"])
-    st.session_state["preview_time"] = float(preview_frame_idx) / float(meta["fps"] or 25.0)
-    st.caption(f"Текущий кадр превью: **{preview_frame_idx}** (~{st.session_state['preview_time']:.2f} с)")
+    if click_target == "Мяч":
+        st.caption(
+            "Кликните мяч на **2–10 кадрах**, где он хорошо виден — так трекер реже теряет его "
+            "между детекциями YOLO. Особенно полезны кадры **броска** и **прилёта в кольцо**."
+        )
+    elif click_target == "Кольцо 1":
+        if panning_mode:
+            st.caption(
+                "Выберите кадр, где кольцо 1 хорошо видно, и **кликните по ободу** — "
+                "линия привяжется к этому кадру."
+            )
+        else:
+            st.caption(
+                "**Кликните по ободу** кольца 1 на превью — кадр выбирать не нужно, "
+                "линия на всех кадрах в одном месте."
+            )
+    else:
+        if panning_mode:
+            st.caption(
+                "Выберите кадр, где кольцо 2 хорошо видно, и **кликните по ободу** — "
+                "линия привяжется к этому кадру."
+            )
+        else:
+            st.caption(
+                "**Кликните по ободу** кольца 2 на превью — кадр выбирать не нужно, "
+                "линия на всех кадрах в одном месте."
+            )
+
+    half_w_col1, half_w_col2 = st.columns(2)
+    with half_w_col1:
+        st.number_input(
+            "Полуширина линии кольца 1 (px)",
+            min_value=5,
+            max_value=int(max(meta["width"], meta["height"])),
+            key="wi_ring1_r",
+            on_change=_make_ring_widget_change_handler(1),
+            help="Половина длины горизонтального отрезка линии (от центра влево/вправо).",
+        )
+    with half_w_col2:
+        st.number_input(
+            "Полуширина линии кольца 2 (px)",
+            min_value=5,
+            max_value=int(max(meta["width"], meta["height"])),
+            key="wi_ring2_r",
+            on_change=_make_ring_widget_change_handler(2),
+            help="Половина длины горизонтального отрезка линии (от центра влево/вправо).",
+        )
+    sync_ring_widgets_to_canonical(st.session_state, 1)
+    sync_ring_widgets_to_canonical(st.session_state, 2)
+
+    if show_frame_slider:
+        if int(st.session_state.get("preview_frame_idx", 0)) > max_frame_idx:
+            st.session_state["preview_frame_idx"] = max_frame_idx
+        slider_label = (
+            "Кадр для настройки (кольца и мяч привязываются к этому кадру)"
+            if panning_mode
+            else "Кадр для якорей мяча"
+        )
+        st.slider(
+            slider_label,
+            min_value=0,
+            max_value=max_frame_idx,
+            step=1,
+            key="preview_frame_idx",
+        )
+        preview_frame_idx = int(st.session_state["preview_frame_idx"])
+        st.session_state["preview_time"] = float(preview_frame_idx) / float(meta["fps"] or 25.0)
+        st.caption(f"Текущий кадр превью: **{preview_frame_idx}** (~{st.session_state['preview_time']:.2f} с)")
+    else:
+        st.session_state["preview_frame_idx"] = 0
+        preview_frame_idx = 0
+        st.session_state["preview_time"] = 0.0
+        st.caption(
+            "Статичное видео: кольца задаются в одной позиции на всех кадрах — "
+            "ползунок кадра не нужен (переключитесь на «Мяч» для выбора кадра)."
+        )
 
     frame = extract_frame_at_index(video_path, preview_frame_idx)
     if frame is not None and st.session_state.get("auto_threshold_computed_for") != video_path:
@@ -3831,7 +3888,7 @@ def render_step2_zones(device: str) -> None:
                         ring_num = 1 if target == "Кольцо 1" else 2
                         mark_ring_configured(
                             st.session_state, ring_num, orig_x, orig_y,
-                            frame_idx=int(st.session_state["preview_frame_idx"]),
+                            frame_idx=_ring_anchor_frame_idx(),
                         )
                     ring_click_triggered_rerun = True
         else:
@@ -3842,22 +3899,43 @@ def render_step2_zones(device: str) -> None:
     status_cols = st.columns(2)
     with status_cols[0]:
         if st.session_state.get("ring1_configured"):
+            ring1_extra = (
+                f" · **привязано к кадру {int(st.session_state.get('ring1_frame', 0))}**"
+                if panning_mode
+                else " · **на всех кадрах**"
+            )
             st.success(
                 f"✅ **Кольцо 1 задано:** X={int(st.session_state['ring1_x'])}, "
-                f"линия Y={int(st.session_state['ring1_y'])}, полуширина={int(st.session_state['ring1_r'])} px · "
-                f"**привязано к кадру {int(st.session_state.get('ring1_frame', 0))}**"
+                f"линия Y={int(st.session_state['ring1_y'])}, полуширина={int(st.session_state['ring1_r'])} px"
+                f"{ring1_extra}"
             )
         else:
-            st.caption("Кольцо 1: кликните по ободу на превью.")
+            if panning_mode:
+                st.caption("Кольцо 1: выберите кадр и кликните по ободу на превью.")
+            else:
+                st.caption("Кольцо 1: кликните по ободу на превью.")
     with status_cols[1]:
         if st.session_state.get("ring2_configured"):
+            ring2_extra = (
+                f" · **привязано к кадру {int(st.session_state.get('ring2_frame', 0))}**"
+                if panning_mode
+                else " · **на всех кадрах**"
+            )
             st.success(
                 f"✅ **Кольцо 2 задано:** X={int(st.session_state['ring2_x'])}, "
-                f"линия Y={int(st.session_state['ring2_y'])}, полуширина={int(st.session_state['ring2_r'])} px · "
-                f"**привязано к кадру {int(st.session_state.get('ring2_frame', 0))}**"
+                f"линия Y={int(st.session_state['ring2_y'])}, полуширина={int(st.session_state['ring2_r'])} px"
+                f"{ring2_extra}"
             )
         else:
-            st.caption("Кольцо 2: кликните по ободу на превью.")
+            if panning_mode:
+                st.caption("Кольцо 2: выберите кадр и кликните по ободу на превью.")
+            else:
+                st.caption("Кольцо 2: кликните по ободу на превью.")
+
+    ball_anchor_count = len(normalize_ball_anchors(st.session_state.get("ball_anchors")))
+    st.caption(
+        f"Мяч: кликните минимум **{BALL_ANCHORS_MIN_RECOMMENDED}** кадра (задано **{ball_anchor_count}**)."
+    )
 
     ball_anchors = normalize_ball_anchors(st.session_state.get("ball_anchors"))
     st.markdown("**Якоря мяча**")
