@@ -329,6 +329,24 @@ def ensure_directories() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def clear_highlights_directory() -> None:
+    """Удаляет старые mp4 из highlights/ (оставляет .gitkeep и прочие файлы)."""
+    ensure_directories()
+    for path in HIGHLIGHTS_DIR.glob("*.mp4"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def reset_analysis_results() -> None:
+    """Сбрасывает результаты последнего прогона анализа (шаг 4)."""
+    st.session_state["box_score_df"] = None
+    st.session_state["debug_log"] = None
+    st.session_state["last_output_video"] = None
+    st.session_state["highlight_files"] = []
+
+
 def ensure_tracker_config(path: Path = TRACKER_CONFIG_PATH) -> Path:
     """Генерирует/обновляет конфиг ByteTrack: низкий new_track_thresh для дальних игроков."""
     tracker_cfg = {
@@ -2850,6 +2868,7 @@ def init_session_state() -> None:
         "box_score_df": None,
         "debug_log": None,
         "last_output_video": None,
+        "highlight_files": [],
         "excluded_player_ids": [],
         "appearance_similarity": float(APPEARANCE_SIMILARITY_DEFAULT),
         "jersey_ocr_enabled": JERSEY_OCR_ENABLED_DEFAULT,
@@ -2862,6 +2881,8 @@ def init_session_state() -> None:
 
 def reset_for_new_video() -> None:
     """Сбрасывает всё, что зависит от конкретного видео (при загрузке нового)."""
+    clear_highlights_directory()
+    reset_analysis_results()
     for key in (
         "rings_initialized_for",
         "ring1_configured",
@@ -2871,9 +2892,6 @@ def reset_for_new_video() -> None:
         "player_crops",
         "player_names",
         "player_numbers",
-        "box_score_df",
-        "debug_log",
-        "last_output_video",
         "avg_player_diagonal",
         "auto_threshold_computed_for",
         "_last_ring_click_time",
@@ -3038,14 +3056,32 @@ def render_step2_zones(device: str) -> None:
         "Сдвиньте кадр → убедитесь, что кольцо видно → кликните по ободу. "
         "Координаты и якорный кадр сохраняются в исходном разрешении."
     )
-    preview_frame_idx = st.slider(
+    st.info(
+        "**Инструкция:** выберите «Кольцо 1» и **кликните по ободу** на превью. "
+        "Затем переключитесь на «Кольцо 2» и повторите на нужном кадре."
+    )
+    if streamlit_image_coordinates is not None and cv2 is not None:
+        st.session_state["click_target_ring"] = st.radio(
+            "Сейчас клик по превью задаёт:", ["Кольцо 1", "Кольцо 2"],
+            horizontal=True, key="click_target_ring_radio",
+            index=0 if st.session_state.get("click_target_ring", "Кольцо 1") == "Кольцо 1" else 1,
+        )
+    else:
+        st.caption(
+            "Пакет streamlit-image-coordinates не установлен — доступна только точная настройка "
+            "числовыми полями ниже (см. requirements.txt)."
+        )
+
+    if int(st.session_state.get("preview_frame_idx", 0)) > max_frame_idx:
+        st.session_state["preview_frame_idx"] = max_frame_idx
+    st.slider(
         "Кадр для настройки колец (клик привязывает линию к этому кадру)",
         min_value=0,
         max_value=max_frame_idx,
-        value=min(int(st.session_state.get("preview_frame_idx", 0)), max_frame_idx),
         step=1,
         key="preview_frame_idx",
     )
+    preview_frame_idx = int(st.session_state["preview_frame_idx"])
     st.session_state["preview_time"] = float(preview_frame_idx) / float(meta["fps"] or 25.0)
     st.caption(f"Текущий кадр превью: **{preview_frame_idx}** (~{st.session_state['preview_time']:.2f} с)")
 
@@ -3063,22 +3099,6 @@ def render_step2_zones(device: str) -> None:
                 st.session_state["avg_player_diagonal"] = avg_diag
                 st.session_state["possession_threshold"] = suggest_possession_threshold(avg_diag)
         st.session_state["auto_threshold_computed_for"] = video_path
-
-    st.info(
-        "**Инструкция:** выберите «Кольцо 1» и **кликните по ободу** на превью. "
-        "Затем переключитесь на «Кольцо 2» и повторите на нужном кадре."
-    )
-    if streamlit_image_coordinates is not None and cv2 is not None:
-        st.session_state["click_target_ring"] = st.radio(
-            "Сейчас клик по превью задаёт:", ["Кольцо 1", "Кольцо 2"],
-            horizontal=True, key="click_target_ring_radio",
-            index=0 if st.session_state.get("click_target_ring", "Кольцо 1") == "Кольцо 1" else 1,
-        )
-    else:
-        st.caption(
-            "Пакет streamlit-image-coordinates не установлен — доступна только точная настройка "
-            "числовыми полями ниже (см. requirements.txt)."
-        )
 
     # ВАЖНО: превью + обработка клика по картинке (streamlit_image_coordinates)
     # ДОЛЖНЫ идти строго ДО того, как ниже создаются number_input с ключами
@@ -3104,7 +3124,9 @@ def render_step2_zones(device: str) -> None:
 
         if streamlit_image_coordinates is not None:
             display_width = min(int(meta["width"]), PREVIEW_MAX_DISPLAY_WIDTH)
-            click_value = streamlit_image_coordinates(preview_rgb, key="ring_click_canvas", width=display_width)
+            click_value = streamlit_image_coordinates(
+                preview_rgb, key=f"ring_click_canvas_{preview_frame_idx}", width=display_width
+            )
             if click_value is not None and click_value.get("x") is not None:
                 click_time = click_value.get("unix_time")
                 if click_time != st.session_state.get("_last_ring_click_time"):
@@ -3589,6 +3611,8 @@ def render_step3_players(device: str) -> None:
 def run_full_analysis(video_path: str, device: str) -> None:
     ensure_directories()
     ensure_tracker_config()
+    clear_highlights_directory()
+    reset_analysis_results()
     ensure_ring_zones_for_video(video_path, st.session_state)
     sync_ring_widgets_to_canonical(st.session_state, 1)
     sync_ring_widgets_to_canonical(st.session_state, 2)
@@ -3691,6 +3715,9 @@ def run_full_analysis(video_path: str, device: str) -> None:
     )
     st.session_state["last_output_video"] = str(output_path)
     st.session_state["debug_log"] = debug_log
+    st.session_state["highlight_files"] = [
+        str(p) for p in sorted(HIGHLIGHTS_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+    ]
     st.success(f"Готово! Полное аннотированное видео сохранено: {output_path}")
 
 
@@ -3767,13 +3794,15 @@ def render_results_section() -> None:
             render_video_with_fallback(Path(last_output_video), "полное аннотированное видео", "dl_full_output")
 
     st.header("🎬 Хайлайты (броски и передачи)")
-    ensure_directories()
-    highlight_files = sorted(HIGHLIGHTS_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not highlight_files:
+    highlight_paths = st.session_state.get("highlight_files") or []
+    if not highlight_paths:
         st.info("Нарезанные хайлайты появятся здесь после обнаружения бросков/передач в обработанном видео.")
         return
 
-    for hf in highlight_files:
+    for highlight_path in reversed(highlight_paths):
+        hf = Path(highlight_path)
+        if not hf.exists():
+            continue
         st.subheader(hf.name)
         render_video_with_fallback(hf, hf.name, f"dl_{hf.stem}")
 
@@ -3852,6 +3881,7 @@ def render_step4_run(device: str) -> None:
     with colB:
         if st.button("🔄 Начать заново с новым видео"):
             old_path = st.session_state.get("video_path")
+            clear_highlights_directory()
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             if old_path:
