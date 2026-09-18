@@ -693,7 +693,9 @@ def smooth_cumulative_transforms(
 
 
 def estimate_camera_transforms(
-    video_path: str, progress_callback: Optional[Any] = None
+    video_path: str,
+    progress_callback: Optional[Any] = None,
+    frame_progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> List[np.ndarray]:
     """Оценивает покадровый сдвиг камеры по фоновым фичам (ORB + LK, RANSAC).
 
@@ -749,13 +751,24 @@ def estimate_camera_transforms(
         cumulative.append(incremental @ cumulative[-1])
         prev_gray = gray
 
-        if progress_callback is not None and len(cumulative) % 15 == 0:
+        current_frame = len(cumulative) - 1
+        if frame_progress_callback is not None:
             try:
-                progress_callback(min(len(cumulative) / total_frames, 1.0))
+                frame_progress_callback(current_frame, total_frames)
+            except Exception:
+                pass
+        elif progress_callback is not None and current_frame % 15 == 0:
+            try:
+                progress_callback(min(current_frame / total_frames, 1.0))
             except Exception:
                 pass
 
     cap.release()
+    if frame_progress_callback is not None:
+        try:
+            frame_progress_callback(total_frames, total_frames)
+        except Exception:
+            pass
     if progress_callback is not None:
         try:
             progress_callback(1.0)
@@ -845,10 +858,16 @@ def compute_dynamic_rings(
     return [transform_ring_to_frame(ring, camera_transforms, frame_idx) for ring in rings]
 
 
-def get_camera_transforms_cached(video_path: str, state: Dict[str, Any]) -> List[np.ndarray]:
+def get_camera_transforms_cached(
+    video_path: str,
+    state: Dict[str, Any],
+    frame_progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> List[np.ndarray]:
     """Кэширует estimate_camera_transforms в session_state для превью шага 2."""
     if state.get("camera_transforms_video") != video_path or state.get("camera_transforms") is None:
-        state["camera_transforms"] = estimate_camera_transforms(video_path)
+        state["camera_transforms"] = estimate_camera_transforms(
+            video_path, frame_progress_callback=frame_progress_callback
+        )
         state["camera_transforms_video"] = video_path
     return state["camera_transforms"]
 
@@ -3225,6 +3244,180 @@ def render_step1_upload() -> None:
 # ---------------------------------------------------------------------------
 # Шаг 2 — превью + зоны колец + пороги владения/передач
 # ---------------------------------------------------------------------------
+def render_step2_professional_settings(device: str, video_path: str, meta: Dict[str, float]) -> None:
+    """Дополнительные пороги и трекинг — только для опытных пользователей."""
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Кольцо №1 (точные координаты)**")
+        st.number_input(
+            "X1 (px)", min_value=0, max_value=int(meta["width"]), key="wi_ring1_x",
+            on_change=_make_ring_widget_change_handler(1),
+        )
+        st.number_input(
+            "Y1 (px)", min_value=0, max_value=int(meta["height"]), key="wi_ring1_y",
+            on_change=_make_ring_widget_change_handler(1),
+        )
+        st.number_input(
+            "Полуширина линии 1 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
+            key="wi_ring1_r", on_change=_make_ring_widget_change_handler(1),
+            help="Половина длины горизонтального отрезка линии кольца (от центра влево/вправо).",
+        )
+    with col2:
+        st.markdown("**Кольцо №2 (точные координаты)**")
+        st.number_input(
+            "X2 (px)", min_value=0, max_value=int(meta["width"]), key="wi_ring2_x",
+            on_change=_make_ring_widget_change_handler(2),
+        )
+        st.number_input(
+            "Y2 (px)", min_value=0, max_value=int(meta["height"]), key="wi_ring2_y",
+            on_change=_make_ring_widget_change_handler(2),
+        )
+        st.number_input(
+            "Полуширина линии 2 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
+            key="wi_ring2_r", on_change=_make_ring_widget_change_handler(2),
+            help="Половина длины горизонтального отрезка линии кольца (от центра влево/вправо).",
+        )
+    sync_ring_widgets_to_canonical(st.session_state, 1)
+    sync_ring_widgets_to_canonical(st.session_state, 2)
+
+    colcal1, colcal2 = st.columns([3, 1])
+    with colcal1:
+        if st.session_state.get("avg_player_diagonal"):
+            st.caption(
+                f"📏 Средний размер игрока на кадре превью: ~{st.session_state['avg_player_diagonal']:.0f}px → "
+                f"авто-порог владения ~{suggest_possession_threshold(st.session_state['avg_player_diagonal'])}px."
+            )
+        else:
+            st.caption(
+                "Авто-калибровка порога недоступна (модель не загружена или игроки не найдены) — "
+                f"дефолт {POSSESSION_THRESHOLD_DEFAULT}px."
+            )
+    with colcal2:
+        if st.button("🔄 Пересчитать порог по кадру", use_container_width=True):
+            st.session_state["auto_threshold_computed_for"] = None
+            st.rerun()
+
+    st.markdown("**Владение мячом, передачи и кулдаун**")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.session_state["possession_threshold"] = st.slider(
+            "Порог владения мячом (px)",
+            min_value=POSSESSION_THRESHOLD_MIN,
+            max_value=POSSESSION_THRESHOLD_MAX,
+            value=int(st.session_state["possession_threshold"]),
+            step=5,
+            help="Максимальное расстояние от центра мяча до рамки игрока, при котором игрок считается владеющим мячом.",
+        )
+    with c2:
+        st.session_state["pass_min_frames"] = st.slider(
+            "Мин. кадров без владельца для паса",
+            min_value=PASS_MIN_FRAMES_MIN,
+            max_value=PASS_MIN_FRAMES_MAX,
+            value=int(st.session_state["pass_min_frames"]),
+            step=1,
+        )
+        st.session_state["pass_max_frames"] = st.slider(
+            "Макс. кадров без владельца для паса",
+            min_value=PASS_MAX_FRAMES_MIN,
+            max_value=PASS_MAX_FRAMES_MAX,
+            value=int(st.session_state["pass_max_frames"]),
+            step=1,
+        )
+    with c3:
+        st.session_state["ball_memory"] = st.slider(
+            "Память мяча при потере детекции (сек)",
+            min_value=BALL_MEMORY_SECONDS_MIN,
+            max_value=BALL_MEMORY_SECONDS_MAX,
+            value=float(st.session_state["ball_memory"]),
+            step=0.05,
+        )
+
+    st.session_state["goal_cooldown_frames"] = st.slider(
+        "Кулдаун гола у кольца (кадры)",
+        min_value=GOAL_COOLDOWN_FRAMES_MIN,
+        max_value=GOAL_COOLDOWN_FRAMES_MAX,
+        value=int(st.session_state["goal_cooldown_frames"]),
+        step=5,
+    )
+
+    st.markdown("**Детекция мяча и производительность (YOLO)**")
+    cconf1, cconf2 = st.columns(2)
+    with cconf1:
+        st.session_state["ball_conf"] = st.slider(
+            "Порог уверенности для мяча (conf)",
+            min_value=BALL_CONF_MIN, max_value=BALL_CONF_MAX,
+            value=float(st.session_state["ball_conf"]), step=0.01,
+        )
+    with cconf2:
+        st.session_state["person_conf"] = st.slider(
+            "Порог уверенности для игроков (conf)",
+            min_value=PERSON_CONF_MIN, max_value=PERSON_CONF_MAX,
+            value=float(st.session_state["person_conf"]), step=0.05,
+        )
+    st.session_state["imgsz"] = st.select_slider(
+        "Разрешение инференса (imgsz, px)",
+        options=IMGSZ_OPTIONS,
+        value=int(st.session_state["imgsz"]) if int(st.session_state["imgsz"]) in IMGSZ_OPTIONS else IMGSZ_DEFAULT,
+    )
+
+    st.markdown("**Устойчивый трекинг мяча (Kalman + цвет)**")
+    st.session_state["ball_color_fallback"] = st.checkbox(
+        "Цветовой fallback (оранжевый мяч в ROI)",
+        value=bool(st.session_state.get("ball_color_fallback", BALL_COLOR_FALLBACK_DEFAULT)),
+    )
+    bgap1, bgap2, broi = st.columns(3)
+    with bgap1:
+        st.session_state["ball_max_gap_frames"] = st.slider(
+            "Макс. кадров интерполяции",
+            min_value=BALL_MAX_GAP_FRAMES_MIN,
+            max_value=BALL_MAX_GAP_FRAMES_MAX,
+            value=int(st.session_state.get("ball_max_gap_frames", BALL_MAX_GAP_FRAMES_DEFAULT)),
+            step=1,
+        )
+    with bgap2:
+        st.session_state["ball_max_predict_frames"] = st.slider(
+            "Макс. кадров виртуального мяча",
+            min_value=BALL_MAX_PREDICT_FRAMES_MIN,
+            max_value=BALL_MAX_PREDICT_FRAMES_MAX,
+            value=int(st.session_state.get("ball_max_predict_frames", BALL_MAX_PREDICT_FRAMES_DEFAULT)),
+            step=1,
+        )
+    with broi:
+        st.session_state["ball_color_roi_half"] = st.slider(
+            "Полуразмер ROI цвета (px)",
+            min_value=BALL_COLOR_ROI_HALF_MIN,
+            max_value=BALL_COLOR_ROI_HALF_MAX,
+            value=int(st.session_state.get("ball_color_roi_half", BALL_COLOR_ROI_HALF_DEFAULT)),
+            step=10,
+        )
+
+    st.session_state["min_person_bbox_area"] = st.slider(
+        "Мин. площадь bbox игрока (px², 0 = не фильтровать)",
+        min_value=MIN_PERSON_BBOX_AREA_MIN,
+        max_value=MIN_PERSON_BBOX_AREA_MAX,
+        value=int(st.session_state.get("min_person_bbox_area", MIN_PERSON_BBOX_AREA_DEFAULT)),
+        step=16,
+    )
+    st.session_state["appearance_similarity"] = st.slider(
+        "Порог похожести игроков (склейка ID / ReID)",
+        min_value=APPEARANCE_SIMILARITY_MIN,
+        max_value=APPEARANCE_SIMILARITY_MAX,
+        value=float(st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)),
+        step=0.01,
+    )
+    st.session_state["jersey_ocr_enabled"] = st.checkbox(
+        "На форме есть номера (EasyOCR)",
+        value=bool(st.session_state.get("jersey_ocr_enabled", JERSEY_OCR_ENABLED_DEFAULT)),
+    )
+    if st.session_state["jersey_ocr_enabled"] and easyocr is None:
+        st.caption(f"⚠️ EasyOCR недоступен: {EASYOCR_IMPORT_ERROR or 'не установлен'}")
+
+    st.session_state["enhance_quality"] = st.checkbox(
+        "Улучшить качество кадра перед детекцией (апскейл + резкость)",
+        value=st.session_state.get("enhance_quality", False),
+    )
+
+
 def render_step2_zones(device: str) -> None:
     st.header("Шаг 2 — Превью и настройка зон")
     video_path = st.session_state.get("video_path")
@@ -3269,9 +3462,23 @@ def render_step2_zones(device: str) -> None:
             "на котором вы кликнули. Сдвигайте ползунок ниже, чтобы проверить, как линия "
             "проецируется на другие кадры."
         )
+        total_frames_cam = max(int(meta["total_frames"]), 1)
         if st.session_state.get("camera_transforms_video") != video_path:
-            with st.spinner("Оценка движения камеры для превью колец..."):
-                get_camera_transforms_cached(video_path, st.session_state)
+            st.caption("Оценка движения камеры для превью колец…")
+            cam_progress = st.progress(0.0)
+            cam_status = st.empty()
+
+            def _camera_preview_progress(current: int, total: int) -> None:
+                cam_progress.progress(min(current / max(total, 1), 1.0))
+                cam_status.caption(f"Оценка движения камеры: кадр **{current}** / **{total}**")
+
+            get_camera_transforms_cached(
+                video_path, st.session_state, frame_progress_callback=_camera_preview_progress
+            )
+            cam_progress.progress(1.0)
+            cam_status.caption(f"Оценка движения камеры завершена ({total_frames_cam} кадров).")
+        else:
+            st.caption("Оценка движения камеры готова (используется кэш для этого видео).")
         camera_transforms_preview = st.session_state.get("camera_transforms")
 
     st.subheader("🎯 Положение колец")
@@ -3386,7 +3593,7 @@ def render_step2_zones(device: str) -> None:
                 f"**привязано к кадру {int(st.session_state.get('ring1_frame', 0))}**"
             )
         else:
-            st.caption("Кольцо 1: кликните по превью или введите координаты вручную.")
+            st.caption("Кольцо 1: кликните по ободу на превью.")
     with status_cols[1]:
         if st.session_state.get("ring2_configured"):
             st.success(
@@ -3395,233 +3602,7 @@ def render_step2_zones(device: str) -> None:
                 f"**привязано к кадру {int(st.session_state.get('ring2_frame', 0))}**"
             )
         else:
-            st.caption("Кольцо 2: кликните по превью или введите координаты вручную.")
-
-    # ПРИМЕЧАНИЕ: у number_input ниже key совпадает с именем переменной в
-    # session_state (например key="ring1_x" для st.session_state["ring1_x"]),
-    # и намеренно НЕ делается `st.session_state["ring1_x"] = st.number_input(
-    # ..., key="ring1_x")` — обе конструкции подряд означали бы запись в
-    # session_state[key] уже после инстанциирования виджета с этим key
-    # (в случае присваивания — сразу после его же создания), что Streamlit
-    # запрещает. Раз key совпадает с именем состояния, виджет и так пишет
-    # своё значение в session_state как побочный эффект — читать его дальше
-    # по коду можно напрямую из session_state, без явного присваивания. Если
-    # бы ключ виджета отличался от ключа состояния (как было раньше:
-    # "in_ring1_x" vs "ring1_x"), клик по картинке обновлял бы состояние, но
-    # поля ввода продолжали бы показывать старое значение до следующего
-    # ручного изменения.
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Кольцо №1**")
-        st.number_input(
-            "X1 (px)", min_value=0, max_value=int(meta["width"]), key="wi_ring1_x",
-            on_change=_make_ring_widget_change_handler(1),
-        )
-        st.number_input(
-            "Y1 (px)", min_value=0, max_value=int(meta["height"]), key="wi_ring1_y",
-            on_change=_make_ring_widget_change_handler(1),
-        )
-        st.number_input(
-            "Полуширина линии 1 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
-            key="wi_ring1_r", on_change=_make_ring_widget_change_handler(1),
-            help="Половина длины горизонтального отрезка линии кольца (от центра влево/вправо).",
-        )
-    with col2:
-        st.markdown("**Кольцо №2**")
-        st.number_input(
-            "X2 (px)", min_value=0, max_value=int(meta["width"]), key="wi_ring2_x",
-            on_change=_make_ring_widget_change_handler(2),
-        )
-        st.number_input(
-            "Y2 (px)", min_value=0, max_value=int(meta["height"]), key="wi_ring2_y",
-            on_change=_make_ring_widget_change_handler(2),
-        )
-        st.number_input(
-            "Полуширина линии 2 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
-            key="wi_ring2_r", on_change=_make_ring_widget_change_handler(2),
-            help="Половина длины горизонтального отрезка линии кольца (от центра влево/вправо).",
-        )
-    sync_ring_widgets_to_canonical(st.session_state, 1)
-    sync_ring_widgets_to_canonical(st.session_state, 2)
-
-    colcal1, colcal2 = st.columns([3, 1])
-    with colcal1:
-        if st.session_state.get("avg_player_diagonal"):
-            st.caption(
-                f"📏 Средний размер игрока на этом кадре: ~{st.session_state['avg_player_diagonal']:.0f}px по "
-                f"диагонали рамки → авто-порог владения ~{suggest_possession_threshold(st.session_state['avg_player_diagonal'])}px "
-                "(уже применён ниже, можно скорректировать слайдером)."
-            )
-        else:
-            st.caption(
-                "Авто-калибровка порога недоступна (модель не загружена или игроки не найдены на этом "
-                f"кадре) — используется дефолт {POSSESSION_THRESHOLD_DEFAULT}px."
-            )
-    with colcal2:
-        if st.button("🔄 Пересчитать по кадру", use_container_width=True):
-            st.session_state["auto_threshold_computed_for"] = None
-            st.rerun()
-
-    st.subheader("🤝 Владение мячом, передачи и кулдаун")
-    st.caption(
-        "Если на реальном видео передачи не засчитываются — увеличьте порог владения "
-        "и/или окно передачи ниже, и проверьте отладочный таймлайн на шаге 4."
-    )
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.session_state["possession_threshold"] = st.slider(
-            "Порог владения мячом (px)",
-            min_value=POSSESSION_THRESHOLD_MIN,
-            max_value=POSSESSION_THRESHOLD_MAX,
-            value=int(st.session_state["possession_threshold"]),
-            step=5,
-            help="Максимальное расстояние от центра мяча до рамки игрока, при котором игрок считается владеющим мячом.",
-        )
-    with c2:
-        st.session_state["pass_min_frames"] = st.slider(
-            "Мин. кадров без владельца для паса",
-            min_value=PASS_MIN_FRAMES_MIN,
-            max_value=PASS_MIN_FRAMES_MAX,
-            value=int(st.session_state["pass_min_frames"]),
-            step=1,
-            help="Мяч должен лететь без владельца не меньше этого числа кадров (дефолт 10).",
-        )
-        st.session_state["pass_max_frames"] = st.slider(
-            "Макс. кадров без владельца для паса",
-            min_value=PASS_MAX_FRAMES_MIN,
-            max_value=PASS_MAX_FRAMES_MAX,
-            value=int(st.session_state["pass_max_frames"]),
-            step=1,
-            help="Если мяч без владельца дольше — передача не засчитывается (дефолт 60).",
-        )
-    with c3:
-        st.session_state["ball_memory"] = st.slider(
-            "Память мяча при потере детекции (сек)",
-            min_value=BALL_MEMORY_SECONDS_MIN,
-            max_value=BALL_MEMORY_SECONDS_MAX,
-            value=float(st.session_state["ball_memory"]),
-            step=0.05,
-            help="Сколько секунд считать мяч в последней известной точке, если детектор его временно не находит.",
-        )
-
-    st.session_state["goal_cooldown_frames"] = st.slider(
-        "Кулдаун гола у кольца (кадры)",
-        min_value=GOAL_COOLDOWN_FRAMES_MIN,
-        max_value=GOAL_COOLDOWN_FRAMES_MAX,
-        value=int(st.session_state["goal_cooldown_frames"]),
-        step=5,
-        help="Минимальный промежуток в кадрах между двумя голами у одного кольца (дефолт 90 ≈ 3 сек при 30 fps).",
-    )
-
-    st.subheader("🏀 Детекция мяча и производительность")
-    st.caption(
-        "Мяч — маленький и часто смазанный объект, его уверенность детекции обычно заметно ниже, "
-        "чем у игроков. Поэтому порог для мяча по умолчанию ниже, чем для игроков. Если события "
-        "(броски/передачи) не фиксируются — сначала запустите диагностику видимости мяча на шаге 3."
-    )
-    cconf1, cconf2 = st.columns(2)
-    with cconf1:
-        st.session_state["ball_conf"] = st.slider(
-            "Порог уверенности для мяча (conf)",
-            min_value=BALL_CONF_MIN, max_value=BALL_CONF_MAX,
-            value=float(st.session_state["ball_conf"]), step=0.01,
-            help="Ниже — мяч обнаруживается чаще, но растёт риск ложных срабатываний на бликах/похожих объектах.",
-        )
-    with cconf2:
-        st.session_state["person_conf"] = st.slider(
-            "Порог уверенности для игроков (conf)",
-            min_value=PERSON_CONF_MIN, max_value=PERSON_CONF_MAX,
-            value=float(st.session_state["person_conf"]), step=0.05,
-            help="Выше — меньше ложных рамок на фоне/зрителях, но риск пропустить игрока в сложной позе/перекрытии.",
-        )
-    st.session_state["imgsz"] = st.select_slider(
-        "Разрешение инференса (imgsz, px)",
-        options=IMGSZ_OPTIONS,
-        value=int(st.session_state["imgsz"]) if int(st.session_state["imgsz"]) in IMGSZ_OPTIONS else IMGSZ_DEFAULT,
-        help="Выше — мяч (мелкий объект) занимает больше пикселей после ресайза модели и его легче "
-        "обнаружить, но обработка заметно замедляется. 640 — дефолт ultralytics, 960-1280 рекомендуется "
-        "для видео с плохо видимым мячом.",
-    )
-    if int(st.session_state["imgsz"]) > IMGSZ_DEFAULT:
-        st.caption(f"⚠️ imgsz={int(st.session_state['imgsz'])} заметно медленнее дефолтных {IMGSZ_DEFAULT}px, особенно на CPU.")
-
-    st.subheader("🟠 Устойчивый трекинг мяча (Kalman + цвет)")
-    st.caption(
-        "Если YOLO часто теряет мяч, включите Kalman/интерполяцию и оранжевый цветовой fallback "
-        "в ROI вокруг последней позиции — это повышает % «видимого» мяча для пасов и голов."
-    )
-    st.session_state["ball_color_fallback"] = st.checkbox(
-        "Цветовой fallback (оранжевый мяч в ROI)",
-        value=bool(st.session_state.get("ball_color_fallback", BALL_COLOR_FALLBACK_DEFAULT)),
-    )
-    bgap1, bgap2, broi = st.columns(3)
-    with bgap1:
-        st.session_state["ball_max_gap_frames"] = st.slider(
-            "Макс. кадров интерполяции",
-            min_value=BALL_MAX_GAP_FRAMES_MIN,
-            max_value=BALL_MAX_GAP_FRAMES_MAX,
-            value=int(st.session_state.get("ball_max_gap_frames", BALL_MAX_GAP_FRAMES_DEFAULT)),
-            step=1,
-            help="Линейная экстраполяция между YOLO-детекциями (дефолт 20 кадров).",
-        )
-    with bgap2:
-        st.session_state["ball_max_predict_frames"] = st.slider(
-            "Макс. кадров виртуального мяча",
-            min_value=BALL_MAX_PREDICT_FRAMES_MIN,
-            max_value=BALL_MAX_PREDICT_FRAMES_MAX,
-            value=int(st.session_state.get("ball_max_predict_frames", BALL_MAX_PREDICT_FRAMES_DEFAULT)),
-            step=1,
-            help="Kalman/интерполяция/цвет — не дольше этого числа кадров без YOLO (дефолт 25).",
-        )
-    with broi:
-        st.session_state["ball_color_roi_half"] = st.slider(
-            "Полуразмер ROI цвета (px)",
-            min_value=BALL_COLOR_ROI_HALF_MIN,
-            max_value=BALL_COLOR_ROI_HALF_MAX,
-            value=int(st.session_state.get("ball_color_roi_half", BALL_COLOR_ROI_HALF_DEFAULT)),
-            step=10,
-            help="Окно поиска оранжевого blob вокруг последней позиции мяча.",
-        )
-
-    st.session_state["min_person_bbox_area"] = st.slider(
-        "Мин. площадь bbox игрока (px², 0 = не фильтровать)",
-        min_value=MIN_PERSON_BBOX_AREA_MIN,
-        max_value=MIN_PERSON_BBOX_AREA_MAX,
-        value=int(st.session_state.get("min_person_bbox_area", MIN_PERSON_BBOX_AREA_DEFAULT)),
-        step=16,
-        help="Отбрасывает слишком мелкие рамки после трекинга. 0 — оставлять дальних/мелких игроков.",
-    )
-    st.session_state["appearance_similarity"] = st.slider(
-        "Порог похожести игроков (склейка ID)",
-        min_value=APPEARANCE_SIMILARITY_MIN,
-        max_value=APPEARANCE_SIMILARITY_MAX,
-        value=float(st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)),
-        step=0.01,
-        help="Гейт ReID/цвета при пересечении и повторном появлении. Снижайте, если ID слишком часто "
-        "дробятся; повышайте, если при пересечении ID всё ещё путаются.",
-    )
-    st.session_state["jersey_ocr_enabled"] = st.checkbox(
-        "На форме есть номера (EasyOCR)",
-        value=bool(st.session_state.get("jersey_ocr_enabled", JERSEY_OCR_ENABLED_DEFAULT)),
-        help="Если номера видны на майках, склейка ID сначала идёт по номеру, затем по ReID/цвету. "
-        "Первый запуск скачает модели EasyOCR (~100 МБ).",
-    )
-    if st.session_state["jersey_ocr_enabled"] and easyocr is None:
-        st.caption(f"⚠️ EasyOCR недоступен: {EASYOCR_IMPORT_ERROR or 'не установлен'}")
-
-    st.subheader("🔧 Качество детекции")
-    st.session_state["enhance_quality"] = st.checkbox(
-        "Улучшить качество кадра перед детекцией (апскейл + резкость)",
-        value=st.session_state.get("enhance_quality", False),
-        help="Может помочь трекеру/ReID различать игроков на видео низкого разрешения. "
-        "Не панацея: если исходное видео изначально сильно сжато/размыто, апскейл не "
-        "восстановит потерянные детали. Замедляет обработку.",
-    )
-    if st.session_state["enhance_quality"]:
-        st.caption(
-            "⚠️ Это не панацея при изначально плохом качестве видео — лишь может немного помочь "
-            "трекеру на видео низкого разрешения, ценой более медленной обработки."
-        )
+            st.caption("Кольцо 2: кликните по ободу на превью.")
 
     rings_ready = any_ring_configured(st.session_state)
     if not rings_ready:
@@ -3636,6 +3617,16 @@ def render_step2_zones(device: str) -> None:
             sync_ring_widgets_to_canonical(st.session_state, 1)
             sync_ring_widgets_to_canonical(st.session_state, 2)
             go_to_step(3)
+
+    with st.expander(
+        "⚙️ Профессиональный режим — пороги YOLO, трекинг, точные координаты",
+        expanded=False,
+    ):
+        st.caption(
+            "Открывайте только если на шагах 3–4 плохо считаются броски/передачи, теряется мяч "
+            "или путаются ID игроков. Для настройки колец достаточно клика по превью выше."
+        )
+        render_step2_professional_settings(device, video_path, meta)
 
     # Отложенный rerun после клика по превью (см. комментарий у
     # ring_click_triggered_rerun в начале функции) — на этом этапе ВСЕ виджеты
@@ -3890,14 +3881,25 @@ def run_full_analysis(video_path: str, device: str) -> None:
         else:
             st.info("🎥 Экспериментальный режим «камера в движении»: оцениваю сдвиг камеры по всему видео...")
             cam_progress = st.progress(0.0)
+            cam_status = st.empty()
+            video_meta_cam = get_video_metadata(video_path)
+            total_frames_cam = max(int(video_meta_cam["total_frames"]), 1)
+
+            def _camera_run_progress(current: int, total: int) -> None:
+                cam_progress.progress(min(current / max(total, 1), 1.0))
+                cam_status.caption(f"Оценка движения камеры: кадр **{current}** / **{total}**")
+
             try:
-                camera_transforms = estimate_camera_transforms(video_path, progress_callback=cam_progress.progress)
+                camera_transforms = estimate_camera_transforms(
+                    video_path, frame_progress_callback=_camera_run_progress
+                )
                 st.session_state["camera_transforms"] = camera_transforms
                 st.session_state["camera_transforms_video"] = video_path
             except Exception as exc:
                 st.warning(f"⚠️ Не удалось оценить движение камеры ({exc}) — зоны колец останутся фиксированными.")
                 camera_transforms = None
             cam_progress.progress(1.0)
+            cam_status.caption(f"Оценка движения камеры завершена ({total_frames_cam} кадров).")
 
     progress_bar = st.progress(0.0)
     status_text = st.empty()
