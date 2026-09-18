@@ -90,6 +90,14 @@ except Exception as exc:  # pragma: no cover - защита от отсутст�
     cv2 = None  # type: ignore[assignment]
     CV2_IMPORT_ERROR = str(exc)
 
+try:
+    import easyocr
+
+    EASYOCR_IMPORT_ERROR: Optional[str] = None
+except Exception as exc:  # pragma: no cover
+    easyocr = None  # type: ignore[assignment]
+    EASYOCR_IMPORT_ERROR = str(exc)
+
 # streamlit-image-coordinates — необязательная лёгкая зависимость для клика
 # мышкой по превью (шаг 2). Если пакета нет — GUI просто скрывает кликабельный
 # режим и оставляет числовые поля/слайдеры как единственный способ ввода.
@@ -228,10 +236,26 @@ BALL_SOURCE_COLORS_BGR = {
     "color": (0, 140, 255),
     "interp": (0, 255, 255),
     "kalman": (180, 255, 255),
+    "csrt": (0, 255, 128),
+    "tiled": (255, 200, 0),
+    "roi": (255, 160, 0),
+    "lost": (160, 160, 160),
 }
-# Яркая траектория мяча на аннотированном видео (BGR).
-BALL_TRAJECTORY_COLOR_BGR = (255, 0, 255)
-BALL_TRAJECTORY_THICKNESS = 5
+# Яркая траектория мяча на аннотированном видео (BGR) + чёрная обводка.
+BALL_TRAJECTORY_COLOR_BGR = (0, 255, 255)
+BALL_TRAJECTORY_THICKNESS = 6
+BALL_TRAJECTORY_OUTLINE_BGR = (0, 0, 0)
+BALL_DEFAULT_BBOX_HALF = 14
+BALL_CSRT_MAX_JUMP_PX = 120
+BALL_TILED_IMGSZ = 1280
+BALL_ROI_DETECT_IMGSZ = 960
+JERSEY_OCR_ENABLED_DEFAULT = True
+JERSEY_OCR_MIN_CONF = 0.45
+REID_SIMILARITY_THRESHOLD = 0.78
+# Линии колец на аннотированном видео: яркий cyan/lime + чёрная обводка (BGR).
+HOOP_LINE_COLORS_BGR = [(255, 255, 0), (0, 255, 128)]
+HOOP_LINE_THICKNESS = 7
+HOOP_LINE_OUTLINE_THICKNESS = 12
 
 # Appearance-matching поверх ByteTrack (гистограмма HSV майки, без ReID).
 APPEARANCE_SIMILARITY_DEFAULT = 0.72
@@ -576,7 +600,12 @@ def parse_track_results(
     results,
     person_conf_threshold: float = 0.0,
     ball_conf_threshold: float = 0.0,
-) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], Optional[Tuple[float, float]], float]:
+) -> Tuple[
+    List[Tuple[int, Tuple[float, float, float, float]]],
+    Optional[Tuple[float, float]],
+    float,
+    Optional[Tuple[float, float, float, float]],
+]:
     """Извлекает из результата YOLO список игроков (ID, рамка) и центр мяча.
 
     Координаты возвращаются в системе координат кадра, который был передан
@@ -593,6 +622,7 @@ def parse_track_results(
     result = results[0]
     persons: List[Tuple[int, Tuple[float, float, float, float]]] = []
     ball: Optional[Tuple[float, float]] = None
+    ball_bbox: Optional[Tuple[float, float, float, float]] = None
 
     boxes = result.boxes
     if boxes is not None and boxes.id is not None and len(boxes) > 0:
@@ -614,8 +644,9 @@ def parse_track_results(
                 if conf > best_ball_conf:
                     best_ball_conf = conf
                     ball = ((float(box[0]) + float(box[2])) / 2.0, (float(box[1]) + float(box[3])) / 2.0)
+                    ball_bbox = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
 
-    return persons, ball, best_ball_conf if ball is not None else 0.0
+    return persons, ball, best_ball_conf if ball is not None else 0.0, ball_bbox
 
 
 def id_to_color(pid: int) -> Tuple[int, int, int]:
@@ -627,27 +658,157 @@ def id_to_color(pid: int) -> Tuple[int, int, int]:
     return int(bgr_pixel[0]), int(bgr_pixel[1]), int(bgr_pixel[2])
 
 
-def draw_hoop_lines_on_frame(frame: Any, rings: List[RingZone]) -> Any:
-    """Рисует горизонтальные линии колец на кадре (для аннотированного видео)."""
-    h, w = frame.shape[:2]
-    colors = [(0, 140, 255), (255, 80, 0)]
+def ensure_ring_zones_for_video(video_path: str, state: Dict[str, Any]) -> None:
+    """Инициализирует ring1/ring2 в координатах исходного кадра, если шаг 2 ещё не открывали."""
+    if state.get("rings_initialized_for") == video_path or cv2 is None:
+        return
+    meta = get_video_metadata(video_path)
+    ring1, ring2 = default_ring_zones(int(meta["width"]), int(meta["height"]))
+    state["ring1_x"] = int(ring1["x"])
+    state["ring1_y"] = int(ring1["y"])
+    state["ring1_r"] = int(ring1.get("half_width", ring1.get("r", 40)))
+    state["ring2_x"] = int(ring2["x"])
+    state["ring2_y"] = int(ring2["y"])
+    state["ring2_r"] = int(ring2.get("half_width", ring2.get("r", 40)))
+    state["rings_initialized_for"] = video_path
+
+
+def rings_from_session_state(state: Dict[str, Any]) -> List[RingZone]:
+    """Собирает зоны колец из session_state в системе координат исходного кадра."""
+    return [
+        {
+            "x": float(state["ring1_x"]),
+            "y": float(state["ring1_y"]),
+            "half_width": float(state["ring1_r"]),
+        },
+        {
+            "x": float(state["ring2_x"]),
+            "y": float(state["ring2_y"]),
+            "half_width": float(state["ring2_r"]),
+        },
+    ]
+
+
+def prepare_rings_for_drawing(
+    rings: List[RingZone], frame_w: int, frame_h: int
+) -> Tuple[List[RingZone], List[str]]:
+    """Нормализует координаты колец и формирует предупреждения о вырожденных линиях."""
+    warnings: List[str] = []
+    prepared: List[RingZone] = []
+    if not rings:
+        warnings.append("Зоны колец не заданы — линии не рисуются.")
+        return prepared, warnings
+
+    both_at_origin = len(rings) >= 2 and all(
+        float(r.get("x", 0.0)) == 0.0 and float(r.get("y", 0.0)) == 0.0 for r in rings[:2]
+    )
+
     for idx, ring in enumerate(rings):
-        color = colors[idx % len(colors)]
-        center_x = int(ring["x"])
-        line_y = int(ring["y"])
-        half_w = max(int(ring.get("half_width", ring.get("r", 40))), 1)
+        x = float(ring.get("x", 0.0))
+        y = float(ring.get("y", 0.0))
+        half_w = float(ring.get("half_width", ring.get("r", 0.0)))
+        label = f"Кольцо {idx + 1}"
+
+        degenerate = both_at_origin or half_w <= 0.0 or (x == 0.0 and y == 0.0)
+        if degenerate and y > 0.0:
+            half_w = max(half_w, frame_w * 0.2)
+            x = frame_w / 2.0
+            warnings.append(
+                f"{label}: вырожденная линия (X={int(ring.get('x', 0))}, полуширина={int(half_w)}) — "
+                f"fallback: горизонталь на всю ширину кадра по Y={int(y)}."
+            )
+        elif degenerate or y <= 0.0:
+            warnings.append(
+                f"{label}: не задано или Y=0 (X={int(x)}, Y={int(y)}, полуширина={int(half_w)}) — линия пропущена."
+            )
+            continue
+
+        half_w = max(half_w, 5.0)
+        x = float(np.clip(x, 0, max(frame_w - 1, 0)))
+        y = float(np.clip(y, 0, max(frame_h - 1, 0)))
+        prepared.append({"x": x, "y": y, "half_width": half_w})
+    return prepared, warnings
+
+
+def draw_hoop_lines_on_frame(
+    frame: Any,
+    rings: List[RingZone],
+    warnings_out: Optional[List[str]] = None,
+) -> Any:
+    """Рисует горизонтальные линии колец поверх всех остальных аннотаций.
+
+    Координаты должны быть в системе исходного кадра (не уменьшенного превью).
+    """
+    if cv2 is None or frame is None:
+        return frame
+    h, w = frame.shape[:2]
+    prepared, warnings = prepare_rings_for_drawing(rings, w, h)
+    if warnings_out is not None:
+        warnings_out.extend(warnings)
+
+    for idx, ring in enumerate(prepared):
+        color = HOOP_LINE_COLORS_BGR[idx % len(HOOP_LINE_COLORS_BGR)]
+        center_x = int(round(ring["x"]))
+        line_y = int(round(ring["y"]))
+        half_w = int(round(ring["half_width"]))
         x1 = max(center_x - half_w, 0)
         x2 = min(center_x + half_w, w - 1)
-        cv2.line(frame, (x1, line_y), (x2, line_y), color, 4, cv2.LINE_AA)
-        cv2.drawMarker(
-            frame, (center_x, line_y), color, markerType=cv2.MARKER_CROSS, markerSize=16, thickness=2
+        if x2 <= x1:
+            x1, x2 = 0, w - 1
+        _draw_line_outlined(
+            frame, (x1, line_y), (x2, line_y), color, HOOP_LINE_THICKNESS,
+            outline_thickness=HOOP_LINE_OUTLINE_THICKNESS,
         )
-        label_pos = (max(center_x - 45, 0), max(line_y - 22, 22))
+        cv2.drawMarker(
+            frame,
+            (center_x, line_y),
+            (0, 0, 0),
+            markerType=cv2.MARKER_CROSS,
+            markerSize=22,
+            thickness=HOOP_LINE_OUTLINE_THICKNESS // 2,
+        )
+        cv2.drawMarker(
+            frame,
+            (center_x, line_y),
+            color,
+            markerType=cv2.MARKER_CROSS,
+            markerSize=18,
+            thickness=3,
+        )
+        label = f"Кольцо {idx + 1}"
+        label_pos = (max(center_x - 55, 4), max(line_y - 28, 24))
         cv2.putText(
-            frame, f"Кольцо {idx + 1}", label_pos,
-            cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA,
+            frame, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 5, cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2, cv2.LINE_AA,
         )
     return frame
+
+
+def test_draw_hoop_lines_on_frame() -> bool:
+    """Синтетическая проверка: после отрисовки пиксели линии ненулевые."""
+    if cv2 is None:
+        return True
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    rings = [{"x": 320.0, "y": 120.0, "half_width": 80.0}]
+    draw_hoop_lines_on_frame(frame, rings)
+    line_y = 120
+    segment = frame[line_y, 240:401]
+    return bool(np.any(segment))
+
+
+def _draw_line_outlined(
+    img: Any,
+    p1: Tuple[int, int],
+    p2: Tuple[int, int],
+    color: Tuple[int, int, int],
+    thickness: int,
+    outline_thickness: Optional[int] = None,
+) -> None:
+    outline = outline_thickness if outline_thickness is not None else thickness + 4
+    cv2.line(img, p1, p2, BALL_TRAJECTORY_OUTLINE_BGR, outline, cv2.LINE_AA)
+    cv2.line(img, p1, p2, color, thickness, cv2.LINE_AA)
 
 
 def draw_annotations(
@@ -657,6 +818,8 @@ def draw_annotations(
     ball_trajectory: Optional[List[Tuple[float, float]]] = None,
     ball_source: Optional[str] = None,
     excluded_ids: Optional[set] = None,
+    ball_lost: bool = False,
+    last_ball: Optional[Tuple[float, float]] = None,
 ):
     """Рисует рамки игроков (с ID), траекторию мяча и маркер мяча на копии кадра.
 
@@ -674,9 +837,9 @@ def draw_annotations(
         traj_pts.append((int(ball[0]), int(ball[1])))
     if len(traj_pts) >= 2:
         for i in range(1, len(traj_pts)):
-            cv2.line(
+            _draw_line_outlined(
                 annotated, traj_pts[i - 1], traj_pts[i],
-                BALL_TRAJECTORY_COLOR_BGR, BALL_TRAJECTORY_THICKNESS, cv2.LINE_AA,
+                BALL_TRAJECTORY_COLOR_BGR, BALL_TRAJECTORY_THICKNESS,
             )
     for pid, (x1, y1, x2, y2) in persons:
         excluded = pid in excluded_ids
@@ -692,16 +855,27 @@ def draw_annotations(
             annotated, label, (p1[0] + 3, max(p1[1] - 5, th)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA,
         )
-    if ball is not None:
-        center = (int(ball[0]), int(ball[1]))
-        src = ball_source or "yolo"
+    draw_ball = ball
+    src = ball_source or ("lost" if ball_lost else "yolo")
+    if draw_ball is None and ball_lost and last_ball is not None:
+        draw_ball = last_ball
+    if draw_ball is not None:
+        center = (int(draw_ball[0]), int(draw_ball[1]))
         color = BALL_SOURCE_COLORS_BGR.get(src, (0, 215, 255))
-        cv2.circle(annotated, center, 9, color, -1)
-        cv2.circle(annotated, center, 9, (0, 0, 0), 2)
-        label = f"ball/{src}"
+        if ball_lost and ball is None:
+            overlay = annotated.copy()
+            cv2.circle(overlay, center, 12, color, -1)
+            annotated = cv2.addWeighted(overlay, 0.45, annotated, 0.55, 0)
+            cv2.circle(annotated, center, 12, color, 2)
+            label = "ball/lost"
+        else:
+            cv2.circle(annotated, center, 11, (0, 0, 0), -1)
+            cv2.circle(annotated, center, 9, color, -1)
+            cv2.circle(annotated, center, 9, (0, 0, 0), 2)
+            label = f"ball/{src}"
         cv2.putText(
-            annotated, label, (center[0] + 12, center[1] - 8),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA,
+            annotated, label, (center[0] + 14, center[1] - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
         )
     return annotated
 
@@ -837,19 +1011,22 @@ def draw_zones_preview(
     """
     preview = frame.copy()
     h, w = preview.shape[:2]
-    colors = [(0, 140, 255), (255, 80, 0)]
-    for idx, ring in enumerate(rings):
-        color = colors[idx % len(colors)]
-        center_x = int(ring["x"])
-        line_y = int(ring["y"])
-        half_w = max(int(ring.get("half_width", ring.get("r", 40))), 1)
+    prepared, _ = prepare_rings_for_drawing(rings, w, h)
+    for idx, ring in enumerate(prepared):
+        color = HOOP_LINE_COLORS_BGR[idx % len(HOOP_LINE_COLORS_BGR)]
+        center_x = int(round(ring["x"]))
+        line_y = int(round(ring["y"]))
+        half_w = int(round(ring["half_width"]))
         x1 = max(center_x - half_w, 0)
         x2 = min(center_x + half_w, w - 1)
-        cv2.line(preview, (x1, line_y), (x2, line_y), color, 3, cv2.LINE_AA)
-        cv2.drawMarker(
-            preview, (center_x, line_y), color, markerType=cv2.MARKER_CROSS, markerSize=14, thickness=2
+        if x2 <= x1:
+            x1, x2 = 0, w - 1
+        _draw_line_outlined(
+            preview, (x1, line_y), (x2, line_y), color, HOOP_LINE_THICKNESS,
+            outline_thickness=HOOP_LINE_OUTLINE_THICKNESS,
         )
         label_pos = (max(center_x - 45, 0), max(line_y - 18, 20))
+        cv2.putText(preview, f"Кольцо {idx + 1}", label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(preview, f"Кольцо {idx + 1}", label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
 
     if possession_threshold and possession_threshold > 0:
@@ -917,14 +1094,14 @@ def suggest_possession_threshold(avg_player_diagonal: Optional[float]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Устойчивый трекинг мяча: Kalman + интерполяция + цветовой fallback
+# Устойчивый трекинг мяча: Kalman + CSRT + tiled/ROI YOLO + цветовой fallback
 # ---------------------------------------------------------------------------
 @dataclass
 class BallTrackState:
     x: float
     y: float
     conf: float
-    source: str  # yolo | color | interp | kalman
+    source: str  # yolo | csrt | tiled | roi | color | interp | kalman
 
 
 class BallKalmanFilter:
@@ -1015,8 +1192,142 @@ def detect_orange_ball_color(
     return best
 
 
+def _create_cv_ball_tracker() -> Any:
+    """CSRT с fallback на KCF (opencv-contrib)."""
+    if cv2 is None:
+        return None
+    factories = []
+    if hasattr(cv2, "TrackerCSRT_create"):
+        factories.append(cv2.TrackerCSRT_create)
+    legacy = getattr(cv2, "legacy", None)
+    if legacy is not None and hasattr(legacy, "TrackerCSRT_create"):
+        factories.append(legacy.TrackerCSRT_create)
+    if hasattr(cv2, "TrackerKCF_create"):
+        factories.append(cv2.TrackerKCF_create)
+    if legacy is not None and hasattr(legacy, "TrackerKCF_create"):
+        factories.append(legacy.TrackerKCF_create)
+    for factory in factories:
+        try:
+            tracker = factory()
+            if tracker is not None:
+                return tracker
+        except Exception:
+            continue
+    return None
+
+
+def _bbox_from_center(x: float, y: float, half: float = BALL_DEFAULT_BBOX_HALF) -> Tuple[float, float, float, float]:
+    return (x - half, y - half, x + half, y + half)
+
+
+def _clip_bbox(
+    bbox: Tuple[float, float, float, float], frame_w: int, frame_h: int
+) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    xi1 = max(int(x1), 0)
+    yi1 = max(int(y1), 0)
+    xi2 = min(int(x2), frame_w)
+    yi2 = min(int(y2), frame_h)
+    if xi2 <= xi1 + 2:
+        xi2 = min(xi1 + 4, frame_w)
+    if yi2 <= yi1 + 2:
+        yi2 = min(yi1 + 4, frame_h)
+    return xi1, yi1, xi2, yi2
+
+
+def _ball_center_from_bbox(bbox: Tuple[float, float, float, float]) -> Tuple[float, float]:
+    return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
+
+
+def detect_ball_yolo_on_crop(
+    crop: Any,
+    offset_xy: Tuple[int, int],
+    model,
+    device: str,
+    ball_conf_threshold: float,
+    imgsz: int,
+) -> Tuple[Optional[Tuple[float, float]], float, Optional[Tuple[float, float, float, float]]]:
+    """YOLO predict на кропе; координаты возвращаются в системе полного кадра."""
+    if model is None or crop is None or crop.size == 0:
+        return None, 0.0, None
+    try:
+        results = model.predict(
+            crop,
+            classes=[COCO_BALL_CLASS_ID],
+            conf=ball_conf_threshold,
+            imgsz=imgsz,
+            device=device,
+            verbose=False,
+        )
+    except Exception:
+        return None, 0.0, None
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        return None, 0.0, None
+    xyxy = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()
+    best_i = int(np.argmax(confs))
+    box = xyxy[best_i]
+    ox, oy = offset_xy
+    bbox = (float(box[0]) + ox, float(box[1]) + oy, float(box[2]) + ox, float(box[3]) + oy)
+    center = _ball_center_from_bbox(bbox)
+    return center, float(confs[best_i]), bbox
+
+
+def detect_ball_yolo_tiled_and_roi(
+    frame_bgr: Any,
+    model,
+    device: str,
+    ball_conf_threshold: float,
+    hint_xy: Optional[Tuple[float, float]],
+    roi_half: int,
+) -> Tuple[Optional[Tuple[float, float]], float, Optional[Tuple[float, float, float, float]], str]:
+    """ROI YOLO вокруг подсказки, затем 2×2 тайлы по всему кадру."""
+    if model is None or frame_bgr is None:
+        return None, 0.0, None, "roi"
+    h, w = frame_bgr.shape[:2]
+    best: Optional[Tuple[float, float]] = None
+    best_conf = -1.0
+    best_bbox: Optional[Tuple[float, float, float, float]] = None
+    best_source = "roi"
+
+    if hint_xy is not None:
+        cx, cy = int(hint_xy[0]), int(hint_xy[1])
+        x1, y1 = max(cx - roi_half, 0), max(cy - roi_half, 0)
+        x2, y2 = min(cx + roi_half, w), min(cy + roi_half, h)
+        if x2 - x1 >= 16 and y2 - y1 >= 16:
+            center, conf, bbox = detect_ball_yolo_on_crop(
+                frame_bgr[y1:y2, x1:x2], (x1, y1), model, device, ball_conf_threshold, BALL_ROI_DETECT_IMGSZ
+            )
+            if center is not None and conf > best_conf:
+                best, best_conf, best_bbox, best_source = center, conf, bbox, "roi"
+
+    mid_x, mid_y = w // 2, h // 2
+    tiles = [
+        (0, 0, mid_x, mid_y),
+        (mid_x, 0, w, mid_y),
+        (0, mid_y, mid_x, h),
+        (mid_x, mid_y, w, h),
+    ]
+    for tx1, ty1, tx2, ty2 in tiles:
+        if tx2 - tx1 < 16 or ty2 - ty1 < 16:
+            continue
+        center, conf, bbox = detect_ball_yolo_on_crop(
+            frame_bgr[ty1:ty2, tx1:tx2],
+            (tx1, ty1),
+            model,
+            device,
+            ball_conf_threshold,
+            BALL_TILED_IMGSZ,
+        )
+        if center is not None and conf > best_conf:
+            best, best_conf, best_bbox, best_source = center, conf, bbox, "tiled"
+
+    return best, best_conf if best is not None else 0.0, best_bbox, best_source
+
+
 class BallTracker:
-    """Сглаживает пропуски YOLO: Kalman-предсказание, линейная экстраполяция, цвет."""
+    """Сглаживает пропуски YOLO: CSRT, ROI/tiled YOLO, Kalman, цвет."""
 
     def __init__(
         self,
@@ -1024,18 +1335,69 @@ class BallTracker:
         max_predict_frames: int = BALL_MAX_PREDICT_FRAMES_DEFAULT,
         color_fallback: bool = BALL_COLOR_FALLBACK_DEFAULT,
         color_roi_half: int = BALL_COLOR_ROI_HALF_DEFAULT,
+        model=None,
+        device: str = "cpu",
+        ball_conf: float = BALL_CONF_DEFAULT,
+        imgsz: int = IMGSZ_DEFAULT,
     ) -> None:
         self.max_gap_frames = max_gap_frames
         self.max_predict_frames = max_predict_frames
         self.color_fallback = color_fallback
         self.color_roi_half = color_roi_half
+        self.model = model
+        self.device = device
+        self.ball_conf = ball_conf
+        self.imgsz = imgsz
         self.kalman = BallKalmanFilter()
+        self.csrt_tracker: Any = None
+        self.last_bbox: Optional[Tuple[float, float, float, float]] = None
         self.last_confident_frame: Optional[int] = None
         self.last_confident_pos: Optional[Tuple[float, float]] = None
         self.prev_confident_frame: Optional[int] = None
         self.prev_confident_pos: Optional[Tuple[float, float]] = None
         self.frames_since_yolo = 10**6
         self.frames_since_any = 10**6
+
+    def _reset_csrt(self) -> None:
+        self.csrt_tracker = None
+
+    def _init_csrt(self, frame_bgr: Any, bbox: Tuple[float, float, float, float]) -> bool:
+        if cv2 is None:
+            return False
+        tracker = _create_cv_ball_tracker()
+        if tracker is None:
+            return False
+        h, w = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = _clip_bbox(bbox, w, h)
+        try:
+            tracker.init(frame_bgr, (x1, y1, x2 - x1, y2 - y1))
+        except Exception:
+            return False
+        self.csrt_tracker = tracker
+        self.last_bbox = (float(x1), float(y1), float(x2), float(y2))
+        return True
+
+    def _update_csrt(self, frame_bgr: Any) -> Optional[Tuple[float, float, Tuple[float, float, float, float]]]:
+        if self.csrt_tracker is None:
+            return None
+        try:
+            ok, rect = self.csrt_tracker.update(frame_bgr)
+        except Exception:
+            self._reset_csrt()
+            return None
+        if not ok:
+            self._reset_csrt()
+            return None
+        x, y, rw, rh = rect
+        bbox = (float(x), float(y), float(x + rw), float(y + rh))
+        center = _ball_center_from_bbox(bbox)
+        if self.last_confident_pos is not None:
+            jump = math.hypot(center[0] - self.last_confident_pos[0], center[1] - self.last_confident_pos[1])
+            if jump > BALL_CSRT_MAX_JUMP_PX:
+                self._reset_csrt()
+                return None
+        self.last_bbox = bbox
+        return center[0], center[1], bbox
 
     def _record_confident(self, frame_idx: int, x: float, y: float) -> None:
         if self.last_confident_frame is not None:
@@ -1071,13 +1433,17 @@ class BallTracker:
         yolo_ball: Optional[Tuple[float, float]],
         yolo_conf: float,
         persons: List[Tuple[int, Tuple[float, float, float, float]]],
+        yolo_bbox: Optional[Tuple[float, float, float, float]] = None,
     ) -> Optional[BallTrackState]:
         if yolo_ball is not None:
             x, y = yolo_ball
+            bbox = yolo_bbox or _bbox_from_center(x, y)
+            self.last_bbox = bbox
             self._record_confident(frame_idx, x, y)
             if self.kalman.initialized:
                 self.kalman.predict()
             self.kalman.correct(x, y)
+            self._init_csrt(frame_bgr, bbox)
             self.frames_since_yolo = 0
             self.frames_since_any = 0
             return BallTrackState(x, y, yolo_conf, "yolo")
@@ -1089,13 +1455,44 @@ class BallTracker:
         predicted = self.kalman.predict() if self.kalman.initialized else None
         hint = predicted or self.last_confident_pos
 
+        csrt_hit = self._update_csrt(frame_bgr)
+        if csrt_hit is not None:
+            x, y, bbox = csrt_hit
+            self.last_bbox = bbox
+            self._record_confident(frame_idx, x, y)
+            self.kalman.correct(x, y)
+            self.frames_since_any = 0
+            return BallTrackState(x, y, 0.55, "csrt")
+
+        if self.model is not None and hint is not None and self.frames_since_yolo >= 2:
+            det_center, det_conf, det_bbox, det_src = detect_ball_yolo_tiled_and_roi(
+                frame_bgr,
+                self.model,
+                self.device,
+                self.ball_conf,
+                hint,
+                self.color_roi_half,
+            )
+            if det_center is not None:
+                x, y = det_center
+                self.last_bbox = det_bbox
+                self._record_confident(frame_idx, x, y)
+                self.kalman.correct(x, y)
+                if det_bbox is not None:
+                    self._init_csrt(frame_bgr, det_bbox)
+                self.frames_since_any = 0
+                return BallTrackState(x, y, det_conf, det_src)
+
         if self.color_fallback and hint is not None:
             color_hit = detect_orange_ball_color(frame_bgr, hint, self.color_roi_half, persons)
             if color_hit is not None:
                 x, y, score = color_hit
+                bbox = _bbox_from_center(x, y)
+                self.last_bbox = bbox
                 if self.kalman.initialized:
                     self.kalman.predict()
                 self.kalman.correct(x, y)
+                self._init_csrt(frame_bgr, bbox)
                 self.frames_since_any = 0
                 return BallTrackState(x, y, score * 0.5, "color")
 
@@ -1148,18 +1545,126 @@ def histogram_similarity(h1: np.ndarray, h2: np.ndarray) -> float:
     return float(cv2.compareHist(h1.reshape(-1, 1), h2.reshape(-1, 1), cv2.HISTCMP_CORREL))
 
 
+_REID_MODEL: Any = None
+_OCR_READER: Any = None
+
+
+def _get_reid_model() -> Any:
+    global _REID_MODEL
+    if _REID_MODEL is not None or torch is None:
+        return _REID_MODEL
+    try:
+        from torchvision import models
+        import torch.nn as nn
+
+        model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
+        model.classifier = nn.Identity()
+        model.eval()
+        _REID_MODEL = model
+    except Exception:
+        _REID_MODEL = None
+    return _REID_MODEL
+
+
+def _get_ocr_reader() -> Any:
+    global _OCR_READER
+    if _OCR_READER is not None:
+        return _OCR_READER
+    if easyocr is None:
+        return None
+    try:
+        _OCR_READER = easyocr.Reader(["en"], gpu=torch is not None and torch.cuda.is_available(), verbose=False)
+    except Exception:
+        _OCR_READER = None
+    return _OCR_READER
+
+
+def extract_reid_embedding(frame_bgr: Any, box: Tuple[float, float, float, float]) -> Optional[np.ndarray]:
+    model = _get_reid_model()
+    if model is None or torch is None or cv2 is None or frame_bgr is None:
+        return None
+    x1, y1, x2, y2 = [int(v) for v in box]
+    h, w = frame_bgr.shape[:2]
+    x1, y1 = max(x1, 0), max(y1, 0)
+    x2, y2 = min(x2, w), min(y2, h)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    try:
+        from torchvision import transforms
+
+        transform = transforms.Compose(
+            [
+                transforms.ToPILImage(),
+                transforms.Resize((128, 64)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        tensor = transform(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).unsqueeze(0)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        with torch.no_grad():
+            emb = model(tensor.to(device)).cpu().numpy().flatten().astype(np.float32)
+        norm = np.linalg.norm(emb)
+        if norm > 1e-6:
+            emb /= norm
+        return emb
+    except Exception:
+        return None
+
+
+def embedding_similarity(e1: np.ndarray, e2: np.ndarray) -> float:
+    return float(np.dot(e1, e2))
+
+
+def read_jersey_number_from_box(
+    frame_bgr: Any, box: Tuple[float, float, float, float]
+) -> Optional[str]:
+    reader = _get_ocr_reader()
+    if reader is None or cv2 is None or frame_bgr is None:
+        return None
+    x1, y1, x2, y2 = box
+    torso_y2 = y1 + max(y2 - y1, 1.0) * 0.65
+    xi1, yi1 = max(int(x1), 0), max(int(y1), 0)
+    xi2, yi2 = min(int(x2), frame_bgr.shape[1]), min(int(torso_y2), frame_bgr.shape[0])
+    if xi2 - xi1 < 12 or yi2 - yi1 < 12:
+        return None
+    crop = frame_bgr[yi1:yi2, xi1:xi2]
+    try:
+        results = reader.readtext(crop, allowlist="0123456789", detail=1, paragraph=False)
+    except Exception:
+        return None
+    best_num: Optional[str] = None
+    best_conf = -1.0
+    for _bbox, text, conf in results:
+        digits = "".join(ch for ch in str(text) if ch.isdigit())
+        if not digits or len(digits) > 2:
+            continue
+        conf = float(conf)
+        if conf >= JERSEY_OCR_MIN_CONF and conf > best_conf:
+            best_conf = conf
+            best_num = digits
+    return best_num
+
+
 class AppearanceMerger:
-    """Post-process поверх ByteTrack: склейка новых ID с недавно пропавшими по похожести майки."""
+    """Post-process поверх ByteTrack: OCR номера → ReID + HSV-гистограмма майки."""
 
     def __init__(
         self,
         similarity_threshold: float = APPEARANCE_SIMILARITY_DEFAULT,
         lost_buffer_frames: int = APPEARANCE_LOST_BUFFER_FRAMES,
+        jersey_ocr_enabled: bool = JERSEY_OCR_ENABLED_DEFAULT,
     ) -> None:
         self.similarity_threshold = similarity_threshold
         self.lost_buffer_frames = lost_buffer_frames
+        self.jersey_ocr_enabled = jersey_ocr_enabled
         self.raw_to_canonical: Dict[int, int] = {}
         self.histograms: Dict[int, np.ndarray] = {}
+        self.embeddings: Dict[int, np.ndarray] = {}
+        self.jersey_numbers: Dict[int, str] = {}
         self.last_seen: Dict[int, int] = {}
         self.active_canonical: set = set()
         self.merge_log: List[Dict[str, Any]] = []
@@ -1172,16 +1677,66 @@ class AppearanceMerger:
             alpha = APPEARANCE_HIST_EMA_ALPHA
             self.histograms[canonical_id] = (1.0 - alpha) * prev + alpha * hist
 
-    def _match_lost(self, hist: np.ndarray, frame_idx: int) -> Optional[int]:
+    def _update_embedding(self, canonical_id: int, emb: np.ndarray) -> None:
+        prev = self.embeddings.get(canonical_id)
+        if prev is None:
+            self.embeddings[canonical_id] = emb.copy()
+        else:
+            alpha = APPEARANCE_HIST_EMA_ALPHA
+            merged = (1.0 - alpha) * prev + alpha * emb
+            norm = np.linalg.norm(merged)
+            if norm > 1e-6:
+                merged /= norm
+            self.embeddings[canonical_id] = merged.astype(np.float32)
+
+    def _combined_similarity(
+        self,
+        canonical_id: int,
+        hist: Optional[np.ndarray],
+        emb: Optional[np.ndarray],
+    ) -> float:
+        scores: List[float] = []
+        if hist is not None and canonical_id in self.histograms:
+            scores.append(histogram_similarity(hist, self.histograms[canonical_id]))
+        if emb is not None and canonical_id in self.embeddings:
+            scores.append(embedding_similarity(emb, self.embeddings[canonical_id]))
+        if not scores:
+            return -1.0
+        return float(np.mean(scores))
+
+    def _match_lost_by_number(self, jersey_num: Optional[str], frame_idx: int) -> Optional[int]:
+        if not jersey_num:
+            return None
+        for canonical_id, stored in self.jersey_numbers.items():
+            if canonical_id in self.active_canonical:
+                continue
+            if stored != jersey_num:
+                continue
+            if frame_idx - self.last_seen.get(canonical_id, -10**9) > self.lost_buffer_frames:
+                continue
+            return canonical_id
+        return None
+
+    def _match_lost(
+        self,
+        hist: Optional[np.ndarray],
+        emb: Optional[np.ndarray],
+        frame_idx: int,
+        jersey_num: Optional[str],
+    ) -> Optional[int]:
+        by_number = self._match_lost_by_number(jersey_num, frame_idx)
+        if by_number is not None:
+            return by_number
         best_id: Optional[int] = None
         best_sim = -1.0
-        for canonical_id, app_hist in self.histograms.items():
+        for canonical_id in self.histograms.keys() | self.embeddings.keys():
             if canonical_id in self.active_canonical:
                 continue
             if frame_idx - self.last_seen.get(canonical_id, -10**9) > self.lost_buffer_frames:
                 continue
-            sim = histogram_similarity(hist, app_hist)
-            if sim >= self.similarity_threshold and sim > best_sim:
+            sim = self._combined_similarity(canonical_id, hist, emb)
+            threshold = max(self.similarity_threshold, REID_SIMILARITY_THRESHOLD - 0.08)
+            if sim >= threshold and sim > best_sim:
                 best_sim = sim
                 best_id = canonical_id
         return best_id
@@ -1196,23 +1751,31 @@ class AppearanceMerger:
         remapped: List[Tuple[int, Tuple[float, float, float, float]]] = []
         for raw_id, box in persons:
             hist = extract_jersey_histogram(frame_bgr, box)
+            emb = extract_reid_embedding(frame_bgr, box)
+            jersey_num = read_jersey_number_from_box(frame_bgr, box) if self.jersey_ocr_enabled else None
             if raw_id in self.raw_to_canonical:
                 canonical_id = self.raw_to_canonical[raw_id]
             else:
-                canonical_id = self._match_lost(hist, frame_idx) if hist is not None else None
+                canonical_id = self._match_lost(hist, emb, frame_idx, jersey_num)
                 if canonical_id is None:
                     canonical_id = int(raw_id)
                 elif canonical_id != raw_id:
+                    reason = "номер" if jersey_num and self.jersey_numbers.get(canonical_id) == jersey_num else "внешность"
                     self.merge_log.append(
                         {
                             "Кадр": frame_idx,
                             "Новый ID трекера": int(raw_id),
                             "Склеен с ID": int(canonical_id),
+                            "Причина": reason,
                         }
                     )
                 self.raw_to_canonical[raw_id] = canonical_id
             if hist is not None:
                 self._update_histogram(canonical_id, hist)
+            if emb is not None:
+                self._update_embedding(canonical_id, emb)
+            if jersey_num:
+                self.jersey_numbers[canonical_id] = jersey_num
             self.last_seen[canonical_id] = frame_idx
             self.active_canonical.add(canonical_id)
             remapped.append((canonical_id, box))
@@ -1312,12 +1875,18 @@ def diagnose_ball_visibility(
         max_predict_frames=max_predict_frames,
         color_fallback=color_fallback,
         color_roi_half=color_roi_half,
+        model=model,
+        device=device,
+        ball_conf=ball_conf_threshold,
+        imgsz=imgsz,
     )
 
     yolo_hits = 0
     enhanced_hits = 0
     yolo_conf_sum = 0.0
-    source_counts: Dict[str, int] = {"yolo": 0, "color": 0, "interp": 0, "kalman": 0}
+    source_counts: Dict[str, int] = {
+        "yolo": 0, "csrt": 0, "tiled": 0, "roi": 0, "color": 0, "interp": 0, "kalman": 0,
+    }
     gaps: List[int] = []
     gap_start_frame: Optional[int] = None
     n_samples = len(sample_indices)
@@ -1400,6 +1969,7 @@ def quick_player_scan(
     ball_conf: float = BALL_CONF_DEFAULT,
     imgsz: int = IMGSZ_DEFAULT,
     appearance_similarity: float = APPEARANCE_SIMILARITY_DEFAULT,
+    jersey_ocr_enabled: bool = JERSEY_OCR_ENABLED_DEFAULT,
     progress_callback: Optional[Callable[[float], Any]] = None,
     status_callback: Optional[Callable[[str], Any]] = None,
 ) -> Tuple[Dict[int, Any], List[Dict[str, Any]]]:
@@ -1418,7 +1988,10 @@ def quick_player_scan(
         return {}, []
 
     reset_tracker(model)
-    appearance = AppearanceMerger(similarity_threshold=appearance_similarity)
+    appearance = AppearanceMerger(
+        similarity_threshold=appearance_similarity,
+        jersey_ocr_enabled=jersey_ocr_enabled,
+    )
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1470,7 +2043,7 @@ def quick_player_scan(
             imgsz=imgsz,
             verbose=False,
         )
-        persons, _, _ = parse_track_results(
+        persons, _, _, _ = parse_track_results(
             results, person_conf_threshold=person_conf, ball_conf_threshold=ball_conf
         )
         if enhance_quality:
@@ -1520,6 +2093,7 @@ def process_video(
     color_fallback: bool = BALL_COLOR_FALLBACK_DEFAULT,
     color_roi_half: int = BALL_COLOR_ROI_HALF_DEFAULT,
     appearance_similarity: float = APPEARANCE_SIMILARITY_DEFAULT,
+    jersey_ocr_enabled: bool = JERSEY_OCR_ENABLED_DEFAULT,
     excluded_player_ids: Optional[set] = None,
     camera_transforms: Optional[List[np.ndarray]] = None,
     ring_reference_frame_idx: int = 0,
@@ -1576,9 +2150,17 @@ def process_video(
         max_predict_frames=predict_limit,
         color_fallback=color_fallback,
         color_roi_half=color_roi_half,
+        model=model,
+        device=device,
+        ball_conf=ball_conf,
+        imgsz=imgsz,
     )
-    appearance_merger = AppearanceMerger(similarity_threshold=appearance_similarity)
+    appearance_merger = AppearanceMerger(
+        similarity_threshold=appearance_similarity,
+        jersey_ocr_enabled=jersey_ocr_enabled,
+    )
     excluded_ids: set = set(excluded_player_ids or [])
+    ring_draw_warnings: List[str] = []
 
     # Состояние владения мячом (для пасов и для "кто владел мячом перед голом").
     last_owner: Optional[int] = None
@@ -1604,6 +2186,7 @@ def process_video(
         t = frame_idx / fps
         ball: Optional[Tuple[float, float]] = None
         ball_source: Optional[str] = None
+        ball_lost = False
 
         if model is not None:
             # Опционально апскейлим+резчим кадр перед детекцией (помогает
@@ -1628,7 +2211,7 @@ def process_video(
                 imgsz=imgsz,
                 verbose=False,
             )
-            persons, yolo_ball, yolo_ball_conf = parse_track_results(
+            persons, yolo_ball, yolo_ball_conf, yolo_ball_bbox = parse_track_results(
                 results, person_conf_threshold=person_conf, ball_conf_threshold=ball_conf
             )
             if enhance_quality:
@@ -1636,11 +2219,17 @@ def process_video(
                 persons = [(pid, tuple(v * inv_scale for v in box)) for pid, box in persons]
                 if yolo_ball is not None:
                     yolo_ball = (yolo_ball[0] * inv_scale, yolo_ball[1] * inv_scale)
+                if yolo_ball_bbox is not None:
+                    yolo_ball_bbox = tuple(v * inv_scale for v in yolo_ball_bbox)
             persons = appearance_merger.remap(frame_idx, frame, persons)
-            ball_state = ball_tracker.update(frame_idx, frame, yolo_ball, yolo_ball_conf, persons)
+            ball_state = ball_tracker.update(
+                frame_idx, frame, yolo_ball, yolo_ball_conf, persons, yolo_bbox=yolo_ball_bbox
+            )
             if ball_state is not None:
                 ball = (ball_state.x, ball_state.y)
                 ball_source = ball_state.source
+            elif ball_tracker.last_confident_pos is not None and ball_tracker.frames_since_any < ball_tracker.max_predict_frames:
+                ball_lost = True
         else:
             persons = []
             annotated = frame.copy()
@@ -1668,12 +2257,18 @@ def process_video(
         event_persons = [(pid, box) for pid, box in persons if pid not in excluded_ids]
         if model is not None:
             annotated = draw_annotations(
-                frame, persons, effective_ball, list(ball_trajectory),
-                ball_source=ball_source, excluded_ids=excluded_ids,
+                frame,
+                persons,
+                effective_ball,
+                list(ball_trajectory),
+                ball_source=ball_source,
+                excluded_ids=excluded_ids,
+                ball_lost=ball_lost if model is not None else False,
+                last_ball=ball_tracker.last_confident_pos if model is not None else None,
             )
-            annotated = draw_hoop_lines_on_frame(annotated, current_rings)
+            annotated = draw_hoop_lines_on_frame(annotated, current_rings, warnings_out=ring_draw_warnings)
         elif effective_ball is not None:
-            annotated = draw_hoop_lines_on_frame(annotated, current_rings)
+            annotated = draw_hoop_lines_on_frame(annotated, current_rings, warnings_out=ring_draw_warnings)
 
         # -------------------------------------------------------------
         # ВЛАДЕНИЕ МЯЧОМ И ДЕТЕКЦИЯ ПЕРЕДАЧ (ПАСОВ)
@@ -1833,6 +2428,8 @@ def process_video(
     output_path = reencode_for_browser(output_path)
     if appearance_merger.merge_log:
         debug_log["id_merges"] = appearance_merger.merge_log
+    if ring_draw_warnings:
+        debug_log["ring_draw_warnings"] = list(dict.fromkeys(ring_draw_warnings))
     return stats, output_path, debug_log
 
 
@@ -1915,6 +2512,7 @@ def init_session_state() -> None:
         "last_output_video": None,
         "excluded_player_ids": [],
         "appearance_similarity": float(APPEARANCE_SIMILARITY_DEFAULT),
+        "jersey_ocr_enabled": JERSEY_OCR_ENABLED_DEFAULT,
         "id_merge_log": [],
     }
     for key, value in defaults.items():
@@ -2352,9 +2950,17 @@ def render_step2_zones(device: str) -> None:
         max_value=APPEARANCE_SIMILARITY_MAX,
         value=float(st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)),
         step=0.01,
-        help="Чем выше — тем агрессивнее ByteTrack-ID склеиваются по цвету майки, если игрок "
+        help="Чем выше — тем агрессивнее ByteTrack-ID склеиваются по ReID/цвету майки, если игрок "
         "временно пропал из кадра. Снижайте, если разных игроков ошибочно объединяет.",
     )
+    st.session_state["jersey_ocr_enabled"] = st.checkbox(
+        "На форме есть номера (EasyOCR)",
+        value=bool(st.session_state.get("jersey_ocr_enabled", JERSEY_OCR_ENABLED_DEFAULT)),
+        help="Если номера видны на майках, склейка ID сначала идёт по номеру, затем по ReID/цвету. "
+        "Первый запуск скачает модели EasyOCR (~100 МБ).",
+    )
+    if st.session_state["jersey_ocr_enabled"] and easyocr is None:
+        st.caption(f"⚠️ EasyOCR недоступен: {EASYOCR_IMPORT_ERROR or 'не установлен'}")
 
     st.subheader("🔧 Качество детекции")
     st.session_state["enhance_quality"] = st.checkbox(
@@ -2438,6 +3044,7 @@ def render_step3_players(device: str) -> None:
                 appearance_similarity=float(
                     st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)
                 ),
+                jersey_ocr_enabled=bool(st.session_state.get("jersey_ocr_enabled", JERSEY_OCR_ENABLED_DEFAULT)),
                 progress_callback=scan_progress.progress,
                 status_callback=scan_status.caption,
             )
@@ -2579,6 +3186,7 @@ def render_step3_players(device: str) -> None:
 def run_full_analysis(video_path: str, device: str) -> None:
     ensure_directories()
     ensure_tracker_config()
+    ensure_ring_zones_for_video(video_path, st.session_state)
 
     model, model_error = load_model(device)
     if model is None:
@@ -2591,18 +3199,13 @@ def run_full_analysis(video_path: str, device: str) -> None:
             "полноценно."
         )
 
-    rings = [
-        {
-            "x": st.session_state["ring1_x"],
-            "y": st.session_state["ring1_y"],
-            "half_width": st.session_state["ring1_r"],
-        },
-        {
-            "x": st.session_state["ring2_x"],
-            "y": st.session_state["ring2_y"],
-            "half_width": st.session_state["ring2_r"],
-        },
-    ]
+    video_meta = get_video_metadata(video_path)
+    rings = rings_from_session_state(st.session_state)
+    _, ring_preview_warnings = prepare_rings_for_drawing(
+        rings, int(video_meta["width"]), int(video_meta["height"])
+    )
+    for warn in ring_preview_warnings:
+        st.warning(f"⚠️ {warn}")
 
     camera_transforms: Optional[List[np.ndarray]] = None
     ring_reference_frame_idx = 0
@@ -2645,6 +3248,7 @@ def run_full_analysis(video_path: str, device: str) -> None:
             appearance_similarity=float(
                 st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)
             ),
+            jersey_ocr_enabled=bool(st.session_state.get("jersey_ocr_enabled", JERSEY_OCR_ENABLED_DEFAULT)),
             excluded_player_ids=set(st.session_state.get("excluded_player_ids") or []),
             camera_transforms=camera_transforms,
             ring_reference_frame_idx=ring_reference_frame_idx,
@@ -2721,6 +3325,10 @@ def render_results_section() -> None:
                 st.caption(f"Смен владения: {len(changes)} · засчитано передач: {accepted} · отклонено: {rejected}")
             else:
                 st.info("Смен владения мячом не зафиксировано — мяч либо не был обнаружен, либо всё время был у одного игрока.")
+
+            ring_warns = debug_log.get("ring_draw_warnings") or []
+            if ring_warns:
+                st.warning("Линии колец: " + " · ".join(ring_warns))
 
             sampled = debug_log.get("sampled_timeline") or []
             if sampled:
@@ -2865,4 +3473,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if not test_draw_hoop_lines_on_frame():
+        raise RuntimeError("test_draw_hoop_lines_on_frame: пиксели линии кольца остались нулевыми")
     main()
