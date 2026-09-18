@@ -866,15 +866,169 @@ def transform_ring_to_frame(
     }
 
 
+def normalize_ring_anchors(anchors: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for item in anchors or []:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            {
+                "x": float(item["x"]),
+                "y": float(item["y"]),
+                "half_width": float(item.get("half_width", item.get("r", 40.0))),
+                "frame": int(item["frame"]),
+            }
+        )
+    out.sort(key=lambda a: int(a["frame"]))
+    return out
+
+
+def ring_anchors_from_state(state: Dict[str, Any], ring_num: int) -> List[Dict[str, Any]]:
+    """Список якорей кольца из session_state; при отсутствии — legacy single-anchor."""
+    stored = normalize_ring_anchors(state.get(f"ring{ring_num}_anchors"))
+    if stored:
+        return stored
+    if state.get(f"ring{ring_num}_configured"):
+        return [
+            {
+                "x": float(state.get(f"ring{ring_num}_x", 0)),
+                "y": float(state.get(f"ring{ring_num}_y", 0)),
+                "half_width": float(state.get(f"ring{ring_num}_r", 40)),
+                "frame": int(state.get(f"ring{ring_num}_frame", 0)),
+            }
+        ]
+    return []
+
+
+def ensure_ring_anchors_migrated(state: Dict[str, Any], ring_num: int) -> None:
+    """Переносит legacy single-anchor в ring{N}_anchors при первом входе в динамику."""
+    key = f"ring{ring_num}_anchors"
+    if state.get(key):
+        return
+    legacy = ring_anchors_from_state(state, ring_num)
+    if legacy:
+        state[key] = legacy
+
+
+def add_ring_anchor(
+    state: Dict[str, Any],
+    ring_num: int,
+    x: int,
+    y: int,
+    frame_idx: int,
+    half_width: Optional[float] = None,
+) -> None:
+    hw = float(half_width if half_width is not None else state.get(f"ring{ring_num}_r", 40))
+    key = f"ring{ring_num}_anchors"
+    anchors = [
+        a for a in normalize_ring_anchors(state.get(key))
+        if int(a["frame"]) != int(frame_idx)
+    ]
+    anchors.append({"x": float(x), "y": float(y), "half_width": hw, "frame": int(frame_idx)})
+    anchors.sort(key=lambda a: int(a["frame"]))
+    state[key] = anchors
+    state[f"ring{ring_num}_configured"] = True
+    state[f"ring{ring_num}_x"] = int(x)
+    state[f"ring{ring_num}_y"] = int(y)
+    state[f"ring{ring_num}_r"] = hw
+    state[f"ring{ring_num}_frame"] = int(frame_idx)
+    state[f"wi_ring{ring_num}_x"] = int(x)
+    state[f"wi_ring{ring_num}_y"] = int(y)
+    state[f"wi_ring{ring_num}_r"] = int(hw)
+
+
+def remove_ring_anchor_at(state: Dict[str, Any], ring_num: int, index: int) -> None:
+    key = f"ring{ring_num}_anchors"
+    anchors = normalize_ring_anchors(state.get(key)) or ring_anchors_from_state(state, ring_num)
+    if 0 <= index < len(anchors):
+        anchors.pop(index)
+    state[key] = anchors
+    if anchors:
+        latest = anchors[-1]
+        state[f"ring{ring_num}_configured"] = True
+        state[f"ring{ring_num}_x"] = int(latest["x"])
+        state[f"ring{ring_num}_y"] = int(latest["y"])
+        state[f"ring{ring_num}_r"] = float(latest["half_width"])
+        state[f"ring{ring_num}_frame"] = int(latest["frame"])
+    else:
+        state[f"ring{ring_num}_configured"] = False
+
+
+def _ring_anchor_as_zone(anchor: Dict[str, Any]) -> RingZone:
+    return {
+        "x": float(anchor["x"]),
+        "y": float(anchor["y"]),
+        "half_width": float(anchor["half_width"]),
+        "anchor_frame": int(anchor["frame"]),
+        "configured": True,
+    }
+
+
+def resolve_ring_from_anchors(
+    anchors: List[Dict[str, Any]],
+    frame_idx: int,
+    camera_transforms: Optional[List[np.ndarray]],
+) -> Optional[RingZone]:
+    """Позиция линии кольца на frame_idx: warp якорей в текущий кадр + интерполяция."""
+    sorted_anchors = normalize_ring_anchors(anchors)
+    if not sorted_anchors:
+        return None
+    if not camera_transforms:
+        zone = _ring_anchor_as_zone(sorted_anchors[0])
+        zone["anchor_frame"] = int(frame_idx)
+        return zone
+
+    def project(anchor: Dict[str, Any], target: int) -> RingZone:
+        return transform_ring_to_frame(_ring_anchor_as_zone(anchor), camera_transforms, target)
+
+    if len(sorted_anchors) == 1:
+        return project(sorted_anchors[0], frame_idx)
+
+    first_f = int(sorted_anchors[0]["frame"])
+    last_f = int(sorted_anchors[-1]["frame"])
+    if frame_idx <= first_f:
+        return project(sorted_anchors[0], frame_idx)
+    if frame_idx >= last_f:
+        return project(sorted_anchors[-1], frame_idx)
+
+    for i in range(len(sorted_anchors) - 1):
+        a0 = sorted_anchors[i]
+        a1 = sorted_anchors[i + 1]
+        f0, f1 = int(a0["frame"]), int(a1["frame"])
+        if f0 <= frame_idx <= f1:
+            if f1 == f0:
+                return project(a0, frame_idx)
+            t_frac = (frame_idx - f0) / float(f1 - f0)
+            p0 = project(a0, frame_idx)
+            p1 = project(a1, frame_idx)
+            return {
+                "x": p0["x"] + t_frac * (p1["x"] - p0["x"]),
+                "y": p0["y"] + t_frac * (p1["y"] - p0["y"]),
+                "half_width": p0["half_width"] + t_frac * (p1["half_width"] - p0["half_width"]),
+                "configured": True,
+                "anchor_frame": int(frame_idx),
+            }
+    return project(sorted_anchors[0], frame_idx)
+
+
 def compute_dynamic_rings(
     rings: List[RingZone],
     camera_transforms: List[np.ndarray],
     frame_idx: int,
 ) -> List[RingZone]:
-    """Пересчитывает каждое кольцо из его якорного кадра в frame_idx (динамическое видео)."""
+    """Пересчитывает кольца в frame_idx: multi-anchor интерполяция или single-anchor warp."""
     if not camera_transforms:
         return rings
-    return [transform_ring_to_frame(ring, camera_transforms, frame_idx) for ring in rings]
+    out: List[RingZone] = []
+    for ring in rings:
+        anchors = ring.get("anchors") or []
+        if anchors and ring.get("configured"):
+            resolved = resolve_ring_from_anchors(anchors, frame_idx, camera_transforms)
+            if resolved is not None:
+                out.append(resolved)
+                continue
+        out.append(transform_ring_to_frame(ring, camera_transforms, frame_idx))
+    return out
 
 
 def project_ball_point_to_frame(
@@ -1388,14 +1542,21 @@ def rings_for_preview_display(
     camera_transforms: Optional[List[np.ndarray]] = None,
     panning_mode: bool = False,
 ) -> List[RingZone]:
-    """Кольца для превью: в динамике проецируем якорь на текущий кадр слайдера."""
+    """Кольца для превью: в динамике — интерполяция/warp списка якорей на текущий кадр."""
     rings = rings_from_session_state(state)
     display: List[RingZone] = []
     for ring in rings:
         if ring.get("configured") and panning_mode and camera_transforms:
-            projected = transform_ring_to_frame(ring, camera_transforms, preview_frame_idx)
-            projected["configured"] = True
-            display.append(projected)
+            anchors = ring.get("anchors") or []
+            if anchors:
+                projected = resolve_ring_from_anchors(anchors, preview_frame_idx, camera_transforms)
+            else:
+                projected = transform_ring_to_frame(ring, camera_transforms, preview_frame_idx)
+            if projected is not None:
+                projected["configured"] = True
+                display.append(projected)
+            else:
+                display.append(dict(ring))
         elif ring.get("configured"):
             display.append(dict(ring))
         else:
@@ -1407,31 +1568,45 @@ def rings_for_preview_display(
 
 
 def rings_from_session_state(state: Dict[str, Any]) -> List[RingZone]:
-    """Собирает зоны колец из session_state (координаты в системе якорного кадра)."""
-    return [
-        {
-            "x": float(state["ring1_x"]),
-            "y": float(state["ring1_y"]),
-            "half_width": float(state["ring1_r"]),
-            "configured": bool(state.get("ring1_configured")),
-            "anchor_frame": int(state.get("ring1_frame", 0)),
-        },
-        {
-            "x": float(state["ring2_x"]),
-            "y": float(state["ring2_y"]),
-            "half_width": float(state["ring2_r"]),
-            "configured": bool(state.get("ring2_configured")),
-            "anchor_frame": int(state.get("ring2_frame", 0)),
-        },
-    ]
+    """Собирает зоны колец из session_state (с списком якорей для динамического видео)."""
+    rings: List[RingZone] = []
+    for ring_num in (1, 2):
+        anchors = ring_anchors_from_state(state, ring_num)
+        configured = bool(state.get(f"ring{ring_num}_configured"))
+        if anchors:
+            primary = anchors[0]
+            rings.append(
+                {
+                    "x": float(primary["x"]),
+                    "y": float(primary["y"]),
+                    "half_width": float(primary["half_width"]),
+                    "configured": configured,
+                    "anchor_frame": int(primary["frame"]),
+                    "anchors": anchors,
+                }
+            )
+        else:
+            rings.append(
+                {
+                    "x": float(state[f"ring{ring_num}_x"]),
+                    "y": float(state[f"ring{ring_num}_y"]),
+                    "half_width": float(state[f"ring{ring_num}_r"]),
+                    "configured": configured,
+                    "anchor_frame": int(state.get(f"ring{ring_num}_frame", 0)),
+                    "anchors": [],
+                }
+            )
+    return rings
 
 
 def describe_ring_state_for_debug(state: Dict[str, Any]) -> str:
     r1, r2 = ring_configuration_status(state)
+    n1 = len(ring_anchors_from_state(state, 1))
+    n2 = len(ring_anchors_from_state(state, 2))
     return (
-        f"ring1_configured={r1}, anchor_frame={state.get('ring1_frame')}, "
+        f"ring1_configured={r1}, anchors={n1}, anchor_frame={state.get('ring1_frame')}, "
         f"ring1_x/y/r=({state.get('ring1_x')}, {state.get('ring1_y')}, {state.get('ring1_r')}); "
-        f"ring2_configured={r2}, anchor_frame={state.get('ring2_frame')}, "
+        f"ring2_configured={r2}, anchors={n2}, anchor_frame={state.get('ring2_frame')}, "
         f"ring2_x/y/r=({state.get('ring2_x')}, {state.get('ring2_y')}, {state.get('ring2_r')})"
     )
 
@@ -3538,6 +3713,8 @@ def init_session_state() -> None:
         "ring2_r": 40.0,
         "ring2_configured": False,
         "ring2_frame": 0,
+        "ring1_anchors": [],
+        "ring2_anchors": [],
         "preview_frame_idx": 0,
         "possession_threshold": float(POSSESSION_THRESHOLD_DEFAULT),
         "pass_min_frames": int(PASS_MIN_FRAMES_DEFAULT),
@@ -3603,6 +3780,8 @@ def reset_for_new_video() -> None:
         "excluded_player_ids",
         "id_merge_log",
         "ball_anchors",
+        "ring1_anchors",
+        "ring2_anchors",
         "manual_id_map",
         "manual_id_merge_log",
         "ball_interp_skipped",
@@ -3610,7 +3789,10 @@ def reset_for_new_video() -> None:
     ):
         if key in ("player_crops", "player_names", "player_numbers"):
             st.session_state[key] = {}
-        elif key in ("excluded_player_ids", "id_merge_log", "ball_anchors", "ball_interp_skipped"):
+        elif key in (
+            "excluded_player_ids", "id_merge_log", "ball_anchors", "ball_interp_skipped",
+            "ring1_anchors", "ring2_anchors",
+        ):
             st.session_state[key] = []
         elif key in ("manual_id_map",):
             st.session_state[key] = {}
@@ -3928,6 +4110,8 @@ def render_step2_zones(device: str) -> None:
     panning_mode = st.session_state.get("camera_mode") == CAMERA_MODE_PANNING
     camera_transforms_preview: Optional[List[np.ndarray]] = None
     if panning_mode:
+        ensure_ring_anchors_migrated(st.session_state, 1)
+        ensure_ring_anchors_migrated(st.session_state, 2)
         st.info(
             "🎥 **Динамическое видео:** каждое кольцо привязывается к **номеру кадра**, "
             "на котором вы кликнули. Сдвигайте ползунок ниже, чтобы проверить, как линия "
@@ -3982,8 +4166,9 @@ def render_step2_zones(device: str) -> None:
     elif click_target == "Кольцо 1":
         if panning_mode:
             st.caption(
-                "Выберите кадр, где кольцо 1 хорошо видно, и **кликните по ободу** — "
-                "линия привяжется к этому кадру."
+                "На **нескольких кадрах** выберите кадр и **кликните по ободу** кольца 1 — "
+                "каждый клик добавляет якорь (повтор на том же кадре заменяет). Между якорями "
+                "линия интерполируется с учётом движения камеры."
             )
         else:
             st.caption(
@@ -3993,8 +4178,9 @@ def render_step2_zones(device: str) -> None:
     else:
         if panning_mode:
             st.caption(
-                "Выберите кадр, где кольцо 2 хорошо видно, и **кликните по ободу** — "
-                "линия привяжется к этому кадру."
+                "На **нескольких кадрах** выберите кадр и **кликните по ободу** кольца 2 — "
+                "каждый клик добавляет якорь (повтор на том же кадре заменяет). Между якорями "
+                "линия интерполируется с учётом движения камеры."
             )
         else:
             st.caption(
@@ -4128,24 +4314,36 @@ def render_step2_zones(device: str) -> None:
                         st.session_state["ball_interp_fix_frame"] = None
                     else:
                         ring_num = 1 if target == "Кольцо 1" else 2
-                        mark_ring_configured(
-                            st.session_state, ring_num, orig_x, orig_y,
-                            frame_idx=_ring_anchor_frame_idx(),
-                        )
+                        if panning_mode:
+                            sync_ring_widgets_to_canonical(st.session_state, ring_num)
+                            add_ring_anchor(
+                                st.session_state,
+                                ring_num,
+                                orig_x,
+                                orig_y,
+                                frame_idx=int(st.session_state["preview_frame_idx"]),
+                                half_width=float(st.session_state.get(f"ring{ring_num}_r", 40)),
+                            )
+                        else:
+                            mark_ring_configured(
+                                st.session_state, ring_num, orig_x, orig_y,
+                                frame_idx=_ring_anchor_frame_idx(),
+                            )
                     ring_click_triggered_rerun = True
         else:
             st.image(preview_rgb, caption="Превью с зонами колец", use_container_width=True)
     else:
         st.error("Не удалось прочитать кадр из видео для превью.")
 
+    ring1_anchor_count = len(ring_anchors_from_state(st.session_state, 1))
+    ring2_anchor_count = len(ring_anchors_from_state(st.session_state, 2))
     status_cols = st.columns(2)
     with status_cols[0]:
         if st.session_state.get("ring1_configured"):
-            ring1_extra = (
-                f" · **привязано к кадру {int(st.session_state.get('ring1_frame', 0))}**"
-                if panning_mode
-                else " · **на всех кадрах**"
-            )
+            if panning_mode:
+                ring1_extra = f" · **задано {ring1_anchor_count} кадр.**"
+            else:
+                ring1_extra = " · **на всех кадрах**"
             st.success(
                 f"✅ **Кольцо 1 задано:** X={int(st.session_state['ring1_x'])}, "
                 f"линия Y={int(st.session_state['ring1_y'])}, полуширина={int(st.session_state['ring1_r'])} px"
@@ -4158,11 +4356,10 @@ def render_step2_zones(device: str) -> None:
                 st.caption("Кольцо 1: кликните по ободу на превью.")
     with status_cols[1]:
         if st.session_state.get("ring2_configured"):
-            ring2_extra = (
-                f" · **привязано к кадру {int(st.session_state.get('ring2_frame', 0))}**"
-                if panning_mode
-                else " · **на всех кадрах**"
-            )
+            if panning_mode:
+                ring2_extra = f" · **задано {ring2_anchor_count} кадр.**"
+            else:
+                ring2_extra = " · **на всех кадрах**"
             st.success(
                 f"✅ **Кольцо 2 задано:** X={int(st.session_state['ring2_x'])}, "
                 f"линия Y={int(st.session_state['ring2_y'])}, полуширина={int(st.session_state['ring2_r'])} px"
@@ -4173,6 +4370,25 @@ def render_step2_zones(device: str) -> None:
                 st.caption("Кольцо 2: выберите кадр и кликните по ободу на превью.")
             else:
                 st.caption("Кольцо 2: кликните по ободу на превью.")
+
+    if panning_mode:
+        for ring_num, ring_label in ((1, "Кольцо 1"), (2, "Кольцо 2")):
+            anchors = ring_anchors_from_state(st.session_state, ring_num)
+            st.caption(f"**{ring_label}:** задано **{len(anchors)}** кадр.")
+            if anchors:
+                st.markdown(f"**Якоря {ring_label.lower()}**")
+                for idx, anchor in enumerate(anchors):
+                    row_cols = st.columns([5, 1])
+                    with row_cols[0]:
+                        st.text(
+                            f"Кадр {int(anchor['frame'])}: "
+                            f"X={int(anchor['x'])}, Y={int(anchor['y'])}, "
+                            f"полуширина={int(anchor['half_width'])} px"
+                        )
+                    with row_cols[1]:
+                        if st.button("✕", key=f"del_ring{ring_num}_anchor_{int(anchor['frame'])}_{idx}"):
+                            remove_ring_anchor_at(st.session_state, ring_num, idx)
+                            st.rerun()
 
     ball_anchor_count = len(normalize_ball_anchors(st.session_state.get("ball_anchors")))
     st.caption(
@@ -4766,11 +4982,13 @@ def render_step4_run(device: str) -> None:
         return
 
     with st.expander("⚙️ Текущие настройки анализа", expanded=False):
+        r1_n = len(ring_anchors_from_state(st.session_state, 1))
+        r2_n = len(ring_anchors_from_state(st.session_state, 2))
         st.write(
             f"Кольцо 1: X={int(st.session_state['ring1_x'])}, Y={int(st.session_state['ring1_y'])}, "
-            f"полуширина={int(st.session_state['ring1_r'])}, якорь кадр {int(st.session_state.get('ring1_frame', 0))} · "
+            f"полуширина={int(st.session_state['ring1_r'])}, якорей {r1_n} · "
             f"Кольцо 2: X={int(st.session_state['ring2_x'])}, Y={int(st.session_state['ring2_y'])}, "
-            f"полуширина={int(st.session_state['ring2_r'])}, якорь кадр {int(st.session_state.get('ring2_frame', 0))}"
+            f"полуширина={int(st.session_state['ring2_r'])}, якорей {r2_n}"
         )
         st.write(
             f"Порог владения: {int(st.session_state['possession_threshold'])} px · "

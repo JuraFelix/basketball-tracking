@@ -9,6 +9,7 @@ import numpy as np
 
 from app import (
     add_ball_anchor,
+    add_ring_anchor,
     any_ring_configured,
     apply_default_ring_positions,
     compute_dynamic_rings,
@@ -19,6 +20,7 @@ from app import (
     interpolate_ball_position,
     mark_ring_configured,
     prepare_rings_for_drawing,
+    resolve_ring_from_anchors,
     rings_from_session_state,
     sync_ring_widgets_to_canonical,
     test_draw_hoop_lines_on_frame,
@@ -194,6 +196,72 @@ class RingSessionFlowTests(unittest.TestCase):
         add_ball_anchor(state, 80, 90, 12)
         self.assertEqual(len(state["ball_anchors"]), 1)
         self.assertAlmostEqual(state["ball_anchors"][0]["x"], 80.0)
+
+    def test_ring_anchor_add_replaces_same_frame(self) -> None:
+        state: dict = {"ring1_r": 40, "ring1_configured": False, "ring1_anchors": []}
+        add_ring_anchor(state, 1, 100, 200, 5, half_width=50)
+        add_ring_anchor(state, 1, 110, 210, 5, half_width=55)
+        self.assertEqual(len(state["ring1_anchors"]), 1)
+        self.assertAlmostEqual(state["ring1_anchors"][0]["x"], 110.0)
+        self.assertTrue(state["ring1_configured"])
+
+    def test_ring_multi_anchor_interpolation(self) -> None:
+        transforms = _translation_transforms(40, 10.0)
+        # Один и тот же обод: на кадре 10 клик x=100, на кадре 30 — x=300 (камера +10 px/кадр).
+        anchors = [
+            {"x": 100.0, "y": 200.0, "half_width": 50.0, "frame": 10},
+            {"x": 300.0, "y": 200.0, "half_width": 50.0, "frame": 30},
+        ]
+        at_mid = resolve_ring_from_anchors(anchors, 20, transforms)
+        self.assertIsNotNone(at_mid)
+        self.assertAlmostEqual(at_mid["x"], 200.0)
+        self.assertAlmostEqual(at_mid["y"], 200.0)
+
+    def test_compute_dynamic_rings_multi_anchor(self) -> None:
+        transforms = _translation_transforms(40, 8.0)
+        rings = [
+            {
+                "x": 80.0,
+                "y": 120.0,
+                "half_width": 40.0,
+                "anchor_frame": 10,
+                "configured": True,
+                "anchors": [
+                    {"x": 80.0, "y": 120.0, "half_width": 40.0, "frame": 10},
+                    {"x": 240.0, "y": 120.0, "half_width": 40.0, "frame": 30},
+                ],
+            },
+            {
+                "x": 400.0,
+                "y": 130.0,
+                "half_width": 45.0,
+                "anchor_frame": 20,
+                "configured": True,
+                "anchors": [{"x": 400.0, "y": 130.0, "half_width": 45.0, "frame": 20}],
+            },
+        ]
+        out = compute_dynamic_rings(rings, transforms, 20)
+        self.assertAlmostEqual(out[0]["x"], 80.0 + (20 - 10) * 8.0)
+        self.assertAlmostEqual(out[1]["x"], 400.0)
+
+    def test_rings_from_session_state_includes_anchors(self) -> None:
+        state = {
+            "ring1_x": 100,
+            "ring1_y": 200,
+            "ring1_r": 50,
+            "ring1_configured": True,
+            "ring1_frame": 5,
+            "ring1_anchors": [{"x": 100, "y": 200, "half_width": 50, "frame": 5}],
+            "ring2_x": 0,
+            "ring2_y": 0,
+            "ring2_r": 40,
+            "ring2_configured": False,
+            "ring2_frame": 0,
+            "ring2_anchors": [],
+        }
+        rings = rings_from_session_state(state)
+        self.assertEqual(len(rings[0]["anchors"]), 1)
+        self.assertEqual(rings[0]["anchors"][0]["frame"], 5)
 
 
 class DrawingTests(unittest.TestCase):
