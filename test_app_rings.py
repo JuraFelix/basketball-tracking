@@ -100,14 +100,32 @@ class RingSessionFlowTests(unittest.TestCase):
             "ring2_y": 0,
             "ring2_r": 40,
             "ring2_configured": False,
+            "wi_ring1_x": 0,
+            "wi_ring1_y": 0,
+            "wi_ring1_r": 40,
         }
         mark_ring_configured(state, 1, 512, 288)
         self.assertTrue(state["ring1_configured"])
-        self.assertEqual(state["wi_ring1_x"], 512)
-        self.assertEqual(state["wi_ring1_y"], 288)
+        self.assertEqual(state["ring1_x"], 512)
+        self.assertEqual(state["ring1_y"], 288)
         state["wi_ring1_r"] = 70
         sync_ring_widgets_to_canonical(state, 1)
         self.assertEqual(state["ring1_r"], 70)
+
+    def test_add_ring_anchor_does_not_touch_widget_keys(self) -> None:
+        state = {
+            "ring1_r": 40,
+            "wi_ring1_x": 10,
+            "wi_ring1_y": 20,
+            "wi_ring1_r": 55,
+            "ring1_anchors": [],
+        }
+        add_ring_anchor(state, 1, 300, 150, frame_idx=5, half_width=60.0)
+        self.assertEqual(state["wi_ring1_x"], 10)
+        self.assertEqual(state["wi_ring1_y"], 20)
+        self.assertEqual(state["wi_ring1_r"], 55)
+        self.assertEqual(len(state["ring1_anchors"]), 1)
+        self.assertEqual(state["ring1_anchors"][0]["x"], 300.0)
 
     def test_defaults_do_not_mark_configured(self) -> None:
         state = {}

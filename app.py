@@ -256,6 +256,9 @@ BALL_PREVIEW_INTERP_COLOR_BGR = (0, 200, 255)
 CLICK_TARGET_OPTIONS = ("Кольцо 1", "Кольцо 2", "Мяч")
 BALL_ANCHORS_MIN_RECOMMENDED = 2
 BALL_INTERP_CHECKS_PER_GAP = 3
+RING_ANCHOR_SNAP_FRAMES = 2
+CAMERA_TRACK_MIN_INLIERS = 8
+CAMERA_TRACK_MAX_SCALE_DELTA = 0.12
 # Яркая траектория мяча на аннотированном видео (BGR) + чёрная обводка.
 BALL_TRAJECTORY_COLOR_BGR = (0, 255, 255)
 BALL_TRAJECTORY_THICKNESS = 6
@@ -587,27 +590,35 @@ def _filter_flow_outliers(
     return prev_pts, next_pts
 
 
-def _estimate_incremental_transform(prev_pts: np.ndarray, next_pts: np.ndarray) -> np.ndarray:
+def _homography_scale(H: np.ndarray) -> float:
+    return float(math.hypot(float(H[0, 0]), float(H[1, 0])))
+
+
+def _estimate_incremental_transform(
+    prev_pts: np.ndarray, next_pts: np.ndarray
+) -> Tuple[np.ndarray, int]:
     """Оценивает T_{i-1→i}: prev_pts (кадр i-1) → next_pts (кадр i). Homography, затем affine."""
     incremental = np.eye(3, dtype=np.float64)
     if len(prev_pts) < 6:
-        return incremental
+        return incremental, 0
     prev_f = prev_pts.reshape(-1, 1, 2).astype(np.float32)
     next_f = next_pts.reshape(-1, 1, 2).astype(np.float32)
     prev_f, next_f = _filter_flow_outliers(prev_f, next_f)
     if len(prev_f) < 6:
-        return incremental
-    H, _inliers = cv2.findHomography(prev_f, next_f, cv2.RANSAC, 3.0, maxIters=2000, confidence=0.995)
+        return incremental, 0
+    H, inlier_mask = cv2.findHomography(prev_f, next_f, cv2.RANSAC, 3.0, maxIters=2000, confidence=0.995)
     if H is not None and not _is_degenerate_homography(H):
         H = H.astype(np.float64)
         H /= H[2, 2]
-        return H
-    m, _inliers = cv2.estimateAffinePartial2D(
+        inliers = int(np.count_nonzero(inlier_mask)) if inlier_mask is not None else len(prev_f)
+        return H, inliers
+    m, inlier_mask = cv2.estimateAffinePartial2D(
         prev_f, next_f, method=cv2.RANSAC, ransacReprojThreshold=3.0
     )
     if m is not None:
-        return _affine2x3_to_3x3(m)
-    return incremental
+        inliers = int(np.count_nonzero(inlier_mask)) if inlier_mask is not None else len(prev_f)
+        return _affine2x3_to_3x3(m), inliers
+    return incremental, 0
 
 
 def _detect_local_motion_blobs(
@@ -693,29 +704,43 @@ def _collect_matched_points(
     return np.array(prev_list, dtype=np.float32), np.array(next_list, dtype=np.float32)
 
 
+def _matrix_to_affine_params(T: np.ndarray) -> Tuple[float, float, float, float]:
+    tx, ty = float(T[0, 2]), float(T[1, 2])
+    a, b = float(T[0, 0]), float(T[1, 0])
+    scale = math.hypot(a, b)
+    theta = math.atan2(b, a) if scale > 1e-9 else 0.0
+    return tx, ty, scale, theta
+
+
+def _affine_params_to_matrix(tx: float, ty: float, scale: float, theta: float) -> np.ndarray:
+    c, s = math.cos(theta), math.sin(theta)
+    T = np.eye(3, dtype=np.float64)
+    T[0, 0] = scale * c
+    T[0, 1] = -scale * s
+    T[1, 0] = scale * s
+    T[1, 1] = scale * c
+    T[0, 2] = tx
+    T[1, 2] = ty
+    return T
+
+
 def smooth_cumulative_transforms(
     transforms: List[np.ndarray], window: int = 9
 ) -> List[np.ndarray]:
-    """Сглаживает накопленный сдвиг (tx, ty), сохраняя локальную геометрию матрицы."""
+    """Сглаживает tx/ty/scale/rotation накопленной гомографии (не только сдвиг)."""
     if len(transforms) < 3 or window < 3:
         return transforms
     n = len(transforms)
-    txs = np.array([T[0, 2] for T in transforms], dtype=np.float64)
-    tys = np.array([T[1, 2] for T in transforms], dtype=np.float64)
+    params = np.array([_matrix_to_affine_params(T) for T in transforms], dtype=np.float64)
     half = window // 2
-    smoothed_tx = txs.copy()
-    smoothed_ty = tys.copy()
+    smoothed = params.copy()
     for i in range(n):
         lo, hi = max(0, i - half), min(n, i + half + 1)
-        smoothed_tx[i] = float(np.mean(txs[lo:hi]))
-        smoothed_ty[i] = float(np.mean(tys[lo:hi]))
-    out: List[np.ndarray] = []
-    for i, T in enumerate(transforms):
-        S = T.copy()
-        S[0, 2] = smoothed_tx[i]
-        S[1, 2] = smoothed_ty[i]
-        out.append(S)
-    return out
+        smoothed[i] = np.mean(params[lo:hi], axis=0)
+    return [
+        _affine_params_to_matrix(float(p[0]), float(p[1]), float(p[2]), float(p[3]))
+        for p in smoothed
+    ]
 
 
 def estimate_camera_transforms(
@@ -768,13 +793,22 @@ def estimate_camera_transforms(
         bg_mask = _create_background_feature_mask(prev_gray, motion_mask)
 
         incremental = np.eye(3, dtype=np.float64)
+        inlier_count = 0
         prev_pts, next_pts = _collect_matched_points(
             prev_gray, gray, bg_mask, orb, bf, feature_params, lk_params
         )
         if prev_pts is not None and next_pts is not None:
-            incremental = _estimate_incremental_transform(prev_pts, next_pts)
+            incremental, inlier_count = _estimate_incremental_transform(prev_pts, next_pts)
 
-        cumulative.append(incremental @ cumulative[-1])
+        prev_cum = cumulative[-1]
+        next_cum = incremental @ prev_cum
+        prev_scale = _homography_scale(prev_cum)
+        next_scale = _homography_scale(next_cum)
+        scale_delta = abs(next_scale - prev_scale) / max(prev_scale, 1e-6)
+        if inlier_count < CAMERA_TRACK_MIN_INLIERS or scale_delta > CAMERA_TRACK_MAX_SCALE_DELTA:
+            cumulative.append(prev_cum.copy())
+        else:
+            cumulative.append(next_cum)
         prev_gray = gray
 
         current_frame = len(cumulative) - 1
@@ -939,9 +973,6 @@ def add_ring_anchor(
     state[f"ring{ring_num}_y"] = int(y)
     state[f"ring{ring_num}_r"] = hw
     state[f"ring{ring_num}_frame"] = int(frame_idx)
-    state[f"wi_ring{ring_num}_x"] = int(x)
-    state[f"wi_ring{ring_num}_y"] = int(y)
-    state[f"wi_ring{ring_num}_r"] = int(hw)
 
 
 def remove_ring_anchor_at(state: Dict[str, Any], ring_num: int, index: int) -> None:
@@ -1005,6 +1036,10 @@ def resolve_ring_from_anchors(
         if f0 <= frame_idx <= f1:
             if f1 == f0:
                 return project(a0, frame_idx)
+            if frame_idx - f0 <= RING_ANCHOR_SNAP_FRAMES:
+                return project(a0, frame_idx)
+            if f1 - frame_idx <= RING_ANCHOR_SNAP_FRAMES:
+                return project(a1, frame_idx)
             t_frac = (frame_idx - f0) / float(f1 - f0)
             p0 = project(a0, frame_idx)
             p1 = project(a1, frame_idx)
@@ -1239,6 +1274,57 @@ def build_id_former_labels(manual_id_map: Optional[Dict[int, int]]) -> Dict[int,
     for canonical in labels:
         labels[canonical] = sorted(set(labels[canonical]))
     return labels
+
+
+def build_player_id_groups(
+    crop_ids: List[int],
+    manual_id_map: Optional[Dict[int, int]] = None,
+) -> Dict[int, List[int]]:
+    """Канонический ID → все ID группы (канонический первым)."""
+    resolve = make_id_resolver(manual_id_map)
+    groups: Dict[int, List[int]] = {}
+    for pid in crop_ids:
+        canonical = resolve(int(pid))
+        members = groups.setdefault(canonical, [])
+        if int(pid) not in members:
+            members.append(int(pid))
+    for canonical, members in groups.items():
+        ordered = sorted(members)
+        if canonical in ordered:
+            groups[canonical] = [canonical] + [m for m in ordered if m != canonical]
+        else:
+            groups[canonical] = [canonical] + ordered
+    return groups
+
+
+def merge_player_ids_selection(state: Dict[str, Any], selected_ids: List[int]) -> None:
+    """Склеивает выбранные карточки: канонический = минимальный ID."""
+    unique = sorted({int(pid) for pid in selected_ids})
+    if len(unique) < 2:
+        return
+    canonical = unique[0]
+    apply_manual_id_merge(state, canonical, [pid for pid in unique if pid != canonical])
+
+
+def unmerge_player_group(state: Dict[str, Any], canonical_id: int) -> None:
+    """Разъединяет группу: убирает все записи manual_id_map, ведущие к canonical_id."""
+    manual_map = {int(k): int(v) for k, v in (state.get("manual_id_map") or {}).items()}
+    to_remove = [raw_id for raw_id, target in manual_map.items() if int(target) == int(canonical_id)]
+    for raw_id in to_remove:
+        manual_map.pop(raw_id, None)
+    state["manual_id_map"] = manual_map
+
+
+def consume_pending_step2_ui_state(state: Dict[str, Any]) -> None:
+    """Применяет отложенные изменения навигации шага 2 до создания виджетов."""
+    pending_frame = state.pop("_pending_preview_frame_idx", None)
+    if pending_frame is not None:
+        state["preview_frame_idx"] = int(pending_frame)
+    pending_target = state.pop("_pending_click_target_ring", None)
+    if pending_target is not None:
+        state["click_target_ring"] = pending_target
+        # radio с key=click_target_ring_radio хранит своё состояние отдельно от click_target_ring
+        state["click_target_ring_radio"] = pending_target
 
 
 def apply_manual_id_merge(state: Dict[str, Any], canonical_id: int, source_ids: List[int]) -> None:
@@ -1547,8 +1633,6 @@ def mark_ring_configured(
     state[f"ring{ring_num}_configured"] = True
     state[f"ring{ring_num}_x"] = int(x)
     state[f"ring{ring_num}_y"] = int(y)
-    state[f"wi_ring{ring_num}_x"] = int(x)
-    state[f"wi_ring{ring_num}_y"] = int(y)
     if frame_idx is not None:
         state[f"ring{ring_num}_frame"] = int(frame_idx)
 
@@ -4286,6 +4370,8 @@ def render_step2_zones(device: str) -> None:
             go_to_step(1)
         return
 
+    consume_pending_step2_ui_state(st.session_state)
+
     # Клик по превью обновляет session_state["ring*_x"/"_y"] ДО того, как ниже
     # инстанциируются number_input с теми же ключами (иначе — StreamlitAPIException
     # "cannot be modified after the widget... is instantiated", см. комментарий
@@ -4671,17 +4757,17 @@ def render_step2_zones(device: str) -> None:
                         st.rerun()
                 with btn_fix:
                     if st.button("✏️ Поправить кликом", key=f"ball_interp_fix_{check_frame}"):
-                        st.session_state["click_target_ring"] = "Мяч"
-                        st.session_state["preview_frame_idx"] = check_frame
-                        st.session_state["ball_interp_fix_frame"] = check_frame
-                        st.rerun()
+                        st.session_state["_pending_click_target_ring"] = "Мяч"
+                        st.session_state["_pending_preview_frame_idx"] = int(check_frame)
+                        st.session_state["ball_interp_fix_frame"] = int(check_frame)
+                        ring_click_triggered_rerun = True
                 with btn_skip:
                     if st.button("Пропустить", key=f"ball_interp_skip_{check_frame}"):
                         skipped = list(st.session_state.get("ball_interp_skipped") or [])
                         if check_frame not in skipped:
                             skipped.append(check_frame)
                         st.session_state["ball_interp_skipped"] = skipped
-                        st.rerun()
+                        ring_click_triggered_rerun = True
             else:
                 st.caption("Для этого кадра интерполяция недоступна — нажмите «Пропустить».")
                 if st.button("Пропустить", key=f"ball_interp_skip_empty_{check_frame}"):
@@ -4689,7 +4775,7 @@ def render_step2_zones(device: str) -> None:
                     if check_frame not in skipped:
                         skipped.append(check_frame)
                     st.session_state["ball_interp_skipped"] = skipped
-                    st.rerun()
+                    ring_click_triggered_rerun = True
 
         fix_frame = st.session_state.get("ball_interp_fix_frame")
         if fix_frame is not None:
@@ -4798,27 +4884,99 @@ def render_step3_players(device: str) -> None:
                 st.success(f"Найдено {len(crops)} уникальных ID игроков.")
 
     crops: Dict[int, Any] = st.session_state.get("player_crops") or {}
+    manual_map: Dict[int, int] = dict(st.session_state.get("manual_id_map") or {})
     if crops:
-        # Компактная сетка: все кропы приводятся к одинаковой высоте (пропорции
-        # сохраняются), поэтому карточки игроков ровные независимо от того,
-        # насколько разного размера/ориентации были исходные рамки детекций.
-        cols_per_row = 6
-        ids_sorted = sorted(crops.keys())
-        for row_start in range(0, len(ids_sorted), cols_per_row):
-            row_ids = ids_sorted[row_start : row_start + cols_per_row]
-            cols = st.columns(cols_per_row)
-            for col, pid in zip(cols, row_ids):
-                with col:
-                    with st.container(border=True):
-                        resized_crop = resize_crop_to_height(crops[pid], CROP_DISPLAY_HEIGHT)
-                        st.image(cv2.cvtColor(resized_crop, cv2.COLOR_BGR2RGB), caption=f"ID {pid}")
+        st.subheader("🔗 Склейка ID — один человек")
+        st.caption(
+            "Отметьте **2+ карточки** чекбоксом «В группу» и нажмите **Объединить выбранных** — "
+            "каноническим станет наименьший ID. Группы показаны ниже; у группы можно нажать **Разъединить**."
+        )
+
+        groups = build_player_id_groups(sorted(crops.keys()), manual_map)
+        for canonical in sorted(groups.keys()):
+            members = groups[canonical]
+            if len(members) > 1:
+                with st.container(border=True):
+                    header_cols = st.columns([4, 1])
+                    with header_cols[0]:
+                        st.markdown(f"**Группа — канонический ID {canonical}** · это один человек")
+                    with header_cols[1]:
+                        if st.button("Разъединить", key=f"unmerge_group_{canonical}"):
+                            unmerge_player_group(st.session_state, canonical)
+                            st.rerun()
+                    main_col, mini_cols = st.columns([2, 3])
+                    with main_col:
+                        resized_main = resize_crop_to_height(crops[canonical], CROP_DISPLAY_HEIGHT)
+                        st.image(
+                            cv2.cvtColor(resized_main, cv2.COLOR_BGR2RGB),
+                            caption=f"ID {canonical} (канон)",
+                        )
                         st.checkbox(
                             "Исключить из статистики",
-                            key=f"exclude_player_{pid}",
-                            value=pid in (st.session_state.get("excluded_player_ids") or []),
+                            key=f"exclude_player_{canonical}",
+                            value=canonical in (st.session_state.get("excluded_player_ids") or []),
                         )
-                        st.text_input("Имя", key=f"player_name_{pid}", placeholder=f"Игрок {pid}", label_visibility="collapsed")
-                        st.text_input("Номер", key=f"player_number_{pid}", placeholder="Номер", label_visibility="collapsed")
+                        st.text_input(
+                            "Имя", key=f"player_name_{canonical}",
+                            placeholder=f"Игрок {canonical}", label_visibility="collapsed",
+                        )
+                        st.text_input(
+                            "Номер", key=f"player_number_{canonical}",
+                            placeholder="Номер", label_visibility="collapsed",
+                        )
+                    with mini_cols:
+                        st.caption("Склеенные ID:")
+                        satellite = [m for m in members if m != canonical]
+                        sat_cols = st.columns(min(len(satellite), 4) or 1)
+                        for col, sid in zip(sat_cols, satellite):
+                            with col:
+                                mini = resize_crop_to_height(crops[sid], max(CROP_DISPLAY_HEIGHT // 2, 72))
+                                st.image(cv2.cvtColor(mini, cv2.COLOR_BGR2RGB), caption=f"б. ID {sid}")
+            else:
+                pid = members[0]
+                with st.container(border=True):
+                    row_cols = st.columns([1, 4])
+                    with row_cols[0]:
+                        st.checkbox("В группу", key=f"merge_pick_{pid}")
+                    with row_cols[1]:
+                        card_cols = st.columns([2, 3])
+                        with card_cols[0]:
+                            resized_crop = resize_crop_to_height(crops[pid], CROP_DISPLAY_HEIGHT)
+                            st.image(cv2.cvtColor(resized_crop, cv2.COLOR_BGR2RGB), caption=f"ID {pid}")
+                        with card_cols[1]:
+                            st.checkbox(
+                                "Исключить из статистики",
+                                key=f"exclude_player_{pid}",
+                                value=pid in (st.session_state.get("excluded_player_ids") or []),
+                            )
+                            st.text_input(
+                                "Имя", key=f"player_name_{pid}",
+                                placeholder=f"Игрок {pid}", label_visibility="collapsed",
+                            )
+                            st.text_input(
+                                "Номер", key=f"player_number_{pid}",
+                                placeholder="Номер", label_visibility="collapsed",
+                            )
+
+        merge_pick_ids = [
+            int(pid) for pid in sorted(crops.keys())
+            if st.session_state.get(f"merge_pick_{pid}", False)
+        ]
+        merge_btn_cols = st.columns([2, 3])
+        with merge_btn_cols[0]:
+            if st.button(
+                "Объединить выбранных",
+                type="secondary",
+                disabled=len(merge_pick_ids) < 2,
+                key="merge_selected_players_btn",
+            ):
+                merge_player_ids_selection(st.session_state, merge_pick_ids)
+                for picked in merge_pick_ids:
+                    st.session_state[f"merge_pick_{picked}"] = False
+                st.rerun()
+        with merge_btn_cols[1]:
+            if merge_pick_ids:
+                st.caption(f"Выбрано для склейки: **{', '.join(str(p) for p in sorted(merge_pick_ids))}**")
     else:
         st.info(
             "Пока нет данных — запустите сканирование выше, либо пропустите этот шаг: "
@@ -4831,45 +4989,14 @@ def render_step3_players(device: str) -> None:
             st.dataframe(pd.DataFrame(merge_log), use_container_width=True, hide_index=True)
             st.caption("Новые ID трекера, переназначенные на ранее виденный ID (appearance-matching).")
 
-    st.subheader("🔗 Ручная склейка ID")
-    st.caption(
-        "Если трекер выдал **несколько ID на одного человека**, выберите канонический ID "
-        "и объедините остальные. На шаге 4 статистика, события и подписи на видео будут "
-        "использовать канонический ID; исключения из статистики сохраняются."
-    )
-    manual_map: Dict[int, int] = dict(st.session_state.get("manual_id_map") or {})
     manual_merge_log = st.session_state.get("manual_id_merge_log") or []
-    if crops:
-        all_ids = sorted(crops.keys())
-        canonical_options = all_ids
-        canonical_default = canonical_options[0]
-        canonical_id = st.selectbox(
-            "Канонический ID (останется в статистике и на видео)",
-            canonical_options,
-            index=canonical_options.index(canonical_default),
-            key="manual_merge_canonical_select",
-        )
-        source_options = [pid for pid in all_ids if pid != canonical_id]
-        source_ids = st.multiselect(
-            "ID для объединения в канонический",
-            source_options,
-            key="manual_merge_sources_select",
-        )
-        if st.button("Объединить выбранные ID", type="secondary", disabled=not source_ids):
-            apply_manual_id_merge(st.session_state, int(canonical_id), source_ids)
-            st.success(
-                f"ID {', '.join(str(s) for s in sorted(source_ids))} объединены в канонический **{canonical_id}**."
-            )
-            st.rerun()
-    else:
-        st.caption("Сначала запустите сканирование — список ID появится выше.")
-
     if manual_map:
-        rows = [
-            {"Бывший ID": raw_id, "→ Канонический": target}
-            for raw_id, target in sorted(manual_map.items(), key=lambda item: (item[1], item[0]))
-        ]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        with st.expander(f"Таблица ручных склеек ({len(manual_map)})", expanded=False):
+            rows = [
+                {"Бывший ID": raw_id, "→ Канонический": target}
+                for raw_id, target in sorted(manual_map.items(), key=lambda item: (item[1], item[0]))
+            ]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     if manual_merge_log:
         with st.expander(f"История ручных склеек ({len(manual_merge_log)})", expanded=False):
             st.dataframe(pd.DataFrame(manual_merge_log), use_container_width=True, hide_index=True)
