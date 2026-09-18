@@ -241,7 +241,12 @@ BALL_SOURCE_COLORS_BGR = {
     "tiled": (255, 200, 0),
     "roi": (255, 160, 0),
     "lost": (160, 160, 160),
+    "user": (0, 120, 255),
+    "user_interp": (0, 180, 255),
 }
+BALL_PREVIEW_COLOR_BGR = (0, 140, 255)
+BALL_PREVIEW_INTERP_COLOR_BGR = (0, 200, 255)
+CLICK_TARGET_OPTIONS = ("Кольцо 1", "Кольцо 2", "Мяч")
 # Яркая траектория мяча на аннотированном видео (BGR) + чёрная обводка.
 BALL_TRAJECTORY_COLOR_BGR = (0, 255, 255)
 BALL_TRAJECTORY_THICKNESS = 6
@@ -858,6 +863,102 @@ def compute_dynamic_rings(
     return [transform_ring_to_frame(ring, camera_transforms, frame_idx) for ring in rings]
 
 
+def project_ball_point_to_frame(
+    x: float,
+    y: float,
+    anchor_frame: int,
+    target_frame_idx: int,
+    camera_transforms: Optional[List[np.ndarray]],
+) -> Tuple[float, float]:
+    """Переносит точку мяча из координат якорного кадра в target_frame_idx."""
+    if not camera_transforms:
+        return float(x), float(y)
+    ring = {
+        "x": float(x),
+        "y": float(y),
+        "half_width": 40.0,
+        "anchor_frame": int(anchor_frame),
+        "configured": True,
+    }
+    projected = transform_ring_to_frame(ring, camera_transforms, target_frame_idx)
+    return float(projected["x"]), float(projected["y"])
+
+
+def normalize_ball_anchors(anchors: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for item in anchors or []:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            {
+                "x": float(item["x"]),
+                "y": float(item["y"]),
+                "frame": int(item["frame"]),
+            }
+        )
+    out.sort(key=lambda a: int(a["frame"]))
+    return out
+
+
+def add_ball_anchor(state: Dict[str, Any], x: int, y: int, frame_idx: int) -> None:
+    anchors = [
+        a for a in normalize_ball_anchors(state.get("ball_anchors"))
+        if int(a["frame"]) != int(frame_idx)
+    ]
+    anchors.append({"x": float(x), "y": float(y), "frame": int(frame_idx)})
+    anchors.sort(key=lambda a: int(a["frame"]))
+    state["ball_anchors"] = anchors
+
+
+def remove_ball_anchor_at(state: Dict[str, Any], index: int) -> None:
+    anchors = normalize_ball_anchors(state.get("ball_anchors"))
+    if 0 <= index < len(anchors):
+        anchors.pop(index)
+    state["ball_anchors"] = anchors
+
+
+def interpolate_ball_position(
+    anchors: List[Dict[str, Any]],
+    frame_idx: int,
+    camera_transforms: Optional[List[np.ndarray]] = None,
+) -> Optional[Tuple[float, float, str]]:
+    """Позиция мяча на frame_idx: точный якорь или линейная интерполяция между соседними."""
+    sorted_anchors = normalize_ball_anchors(anchors)
+    if not sorted_anchors:
+        return None
+
+    for anchor in sorted_anchors:
+        if int(anchor["frame"]) == int(frame_idx):
+            x, y = project_ball_point_to_frame(
+                anchor["x"], anchor["y"], int(anchor["frame"]), frame_idx, camera_transforms
+            )
+            return x, y, "user"
+
+    if len(sorted_anchors) == 1:
+        return None
+
+    first_frame = int(sorted_anchors[0]["frame"])
+    last_frame = int(sorted_anchors[-1]["frame"])
+    if frame_idx < first_frame or frame_idx > last_frame:
+        return None
+
+    for i in range(len(sorted_anchors) - 1):
+        a0 = sorted_anchors[i]
+        a1 = sorted_anchors[i + 1]
+        f0, f1 = int(a0["frame"]), int(a1["frame"])
+        if f0 <= frame_idx <= f1:
+            if f1 == f0:
+                x, y = project_ball_point_to_frame(a0["x"], a0["y"], f0, frame_idx, camera_transforms)
+                return x, y, "user"
+            t_frac = (frame_idx - f0) / float(f1 - f0)
+            p0 = project_ball_point_to_frame(a0["x"], a0["y"], f0, frame_idx, camera_transforms)
+            p1 = project_ball_point_to_frame(a1["x"], a1["y"], f1, frame_idx, camera_transforms)
+            x = p0[0] + t_frac * (p1[0] - p0[0])
+            y = p0[1] + t_frac * (p1[1] - p0[1])
+            return x, y, "user_interp"
+    return None
+
+
 def get_camera_transforms_cached(
     video_path: str,
     state: Dict[str, Any],
@@ -1430,12 +1531,64 @@ def default_ring_zones(width: int, height: int) -> Tuple[RingZone, RingZone]:
     return ring1, ring2
 
 
+def draw_ball_anchors_on_preview(
+    preview: Any,
+    ball_anchors: List[Dict[str, Any]],
+    preview_frame_idx: int,
+    camera_transforms: Optional[List[np.ndarray]] = None,
+    panning_mode: bool = False,
+) -> None:
+    """Оранжевые маркеры якорей мяча и интерполированная позиция на текущем кадре превью."""
+    if cv2 is None or not ball_anchors:
+        return
+    transforms = camera_transforms if panning_mode else None
+    for anchor in normalize_ball_anchors(ball_anchors):
+        if int(anchor["frame"]) != int(preview_frame_idx):
+            continue
+        cx = int(round(anchor["x"]))
+        cy = int(round(anchor["y"]))
+        cv2.circle(preview, (cx, cy), 12, (0, 0, 0), 2, lineType=cv2.LINE_AA)
+        cv2.circle(preview, (cx, cy), 10, BALL_PREVIEW_COLOR_BGR, -1, lineType=cv2.LINE_AA)
+        draw_text_on_bgr(
+            preview, "мяч", (cx + 14, max(cy - 16, 18)),
+            font_size=16, color_bgr=BALL_PREVIEW_COLOR_BGR,
+            outline_bgr=(0, 0, 0), outline_width=2,
+        )
+
+    interp = interpolate_ball_position(ball_anchors, preview_frame_idx, transforms)
+    if interp is None:
+        return
+    ix, iy, kind = interp
+    center = (int(round(ix)), int(round(iy)))
+    if kind == "user":
+        return
+    color = BALL_PREVIEW_INTERP_COLOR_BGR
+    cv2.circle(preview, center, 11, (0, 0, 0), 2, lineType=cv2.LINE_AA)
+    cv2.circle(preview, center, 9, color, 2, lineType=cv2.LINE_AA)
+    cross = 7
+    cv2.line(
+        preview, (center[0] - cross, center[1]), (center[0] + cross, center[1]),
+        color, 1, lineType=cv2.LINE_AA,
+    )
+    cv2.line(
+        preview, (center[0], center[1] - cross), (center[0], center[1] + cross),
+        color, 1, lineType=cv2.LINE_AA,
+    )
+    draw_text_on_bgr(
+        preview, "мяч↔", (center[0] + 12, max(center[1] - 18, 16)),
+        font_size=15, color_bgr=color, outline_bgr=(0, 0, 0), outline_width=2,
+    )
+
+
 def draw_zones_preview(
     frame,
     rings: List[RingZone],
     possession_threshold: Optional[float] = None,
     preview_frame_idx: Optional[int] = None,
     show_anchor_debug: bool = False,
+    ball_anchors: Optional[List[Dict[str, Any]]] = None,
+    camera_transforms: Optional[List[np.ndarray]] = None,
+    panning_mode: bool = False,
 ) -> Any:
     """Рисует горизонтальные линии колец на копии кадра для наглядной проверки в GUI.
 
@@ -1487,6 +1640,11 @@ def draw_zones_preview(
                 font_size=16, color_bgr=(255, 255, 255),
                 outline_bgr=(0, 0, 0), outline_width=2,
             )
+
+    if ball_anchors and preview_frame_idx is not None:
+        draw_ball_anchors_on_preview(
+            preview, ball_anchors, preview_frame_idx, camera_transforms, panning_mode
+        )
 
     if possession_threshold and possession_threshold > 0:
         h, w = preview.shape[:2]
@@ -1561,7 +1719,43 @@ class BallTrackState:
     x: float
     y: float
     conf: float
-    source: str  # yolo | csrt | tiled | roi | color | interp | kalman
+    source: str  # yolo | csrt | tiled | roi | color | interp | kalman | user | user_interp
+
+
+class BallAnchorGuide:
+    """Пользовательские клики по мячу: приоритет на якорных кадрах и интерполяция между ними."""
+
+    def __init__(
+        self,
+        anchors: Optional[List[Dict[str, Any]]] = None,
+        camera_transforms: Optional[List[np.ndarray]] = None,
+    ) -> None:
+        self.anchors = normalize_ball_anchors(anchors)
+        self.camera_transforms = camera_transforms
+
+    def get_override(self, frame_idx: int) -> Optional[BallTrackState]:
+        hit = interpolate_ball_position(self.anchors, frame_idx, self.camera_transforms)
+        if hit is None:
+            return None
+        x, y, source = hit
+        conf = 1.0 if source == "user" else 0.92
+        return BallTrackState(x, y, conf, source)
+
+    def get_csrt_seed_bbox(self, frame_idx: int) -> Optional[Tuple[float, float, float, float]]:
+        if not self.anchors:
+            return None
+        best: Optional[Dict[str, Any]] = None
+        for anchor in self.anchors:
+            if int(anchor["frame"]) <= frame_idx:
+                best = anchor
+            else:
+                break
+        if best is None:
+            return None
+        x, y = project_ball_point_to_frame(
+            best["x"], best["y"], int(best["frame"]), frame_idx, self.camera_transforms
+        )
+        return _bbox_from_center(x, y)
 
 
 class BallKalmanFilter:
@@ -1886,6 +2080,27 @@ class BallTracker:
         vy = (p1[1] - p0[1]) / dt
         return p1[0] + vx * gap, p1[1] + vy * gap
 
+    def _commit_detection(
+        self,
+        frame_idx: int,
+        frame_bgr: Any,
+        x: float,
+        y: float,
+        conf: float,
+        source: str,
+        bbox: Optional[Tuple[float, float, float, float]] = None,
+    ) -> BallTrackState:
+        bbox = bbox or _bbox_from_center(x, y)
+        self.last_bbox = bbox
+        self._record_confident(frame_idx, x, y)
+        if self.kalman.initialized:
+            self.kalman.predict()
+        self.kalman.correct(x, y)
+        self._init_csrt(frame_bgr, bbox)
+        self.frames_since_yolo = 0
+        self.frames_since_any = 0
+        return BallTrackState(x, y, conf, source)
+
     def update(
         self,
         frame_idx: int,
@@ -1894,19 +2109,24 @@ class BallTracker:
         yolo_conf: float,
         persons: List[Tuple[int, Tuple[float, float, float, float]]],
         yolo_bbox: Optional[Tuple[float, float, float, float]] = None,
+        ball_anchor_guide: Optional[BallAnchorGuide] = None,
     ) -> Optional[BallTrackState]:
+        if ball_anchor_guide is not None:
+            override = ball_anchor_guide.get_override(frame_idx)
+            if override is not None:
+                return self._commit_detection(
+                    frame_idx, frame_bgr, override.x, override.y, override.conf, override.source
+                )
+            if yolo_ball is None and self.csrt_tracker is None:
+                seed_bbox = ball_anchor_guide.get_csrt_seed_bbox(frame_idx)
+                if seed_bbox is not None:
+                    self._init_csrt(frame_bgr, seed_bbox)
+
         if yolo_ball is not None:
-            x, y = yolo_ball
-            bbox = yolo_bbox or _bbox_from_center(x, y)
-            self.last_bbox = bbox
-            self._record_confident(frame_idx, x, y)
-            if self.kalman.initialized:
-                self.kalman.predict()
-            self.kalman.correct(x, y)
-            self._init_csrt(frame_bgr, bbox)
-            self.frames_since_yolo = 0
-            self.frames_since_any = 0
-            return BallTrackState(x, y, yolo_conf, "yolo")
+            bbox = yolo_bbox or _bbox_from_center(yolo_ball[0], yolo_ball[1])
+            return self._commit_detection(
+                frame_idx, frame_bgr, yolo_ball[0], yolo_ball[1], yolo_conf, "yolo", bbox=bbox
+            )
 
         self.frames_since_yolo += 1
         if self.frames_since_any >= self.max_predict_frames:
@@ -2690,6 +2910,7 @@ def process_video(
     min_person_bbox_area: float = MIN_PERSON_BBOX_AREA_DEFAULT,
     excluded_player_ids: Optional[set] = None,
     camera_transforms: Optional[List[np.ndarray]] = None,
+    ball_anchors: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Dict[int, PlayerStats], Path, Dict[str, List[Dict[str, Any]]]]:
     """Обрабатывает видео покадрово: детекция, трекинг, события, хайлайты.
 
@@ -2746,6 +2967,11 @@ def process_video(
         device=device,
         ball_conf=ball_conf,
         imgsz=imgsz,
+    )
+    ball_anchor_guide = (
+        BallAnchorGuide(ball_anchors, camera_transforms)
+        if normalize_ball_anchors(ball_anchors)
+        else None
     )
     appearance_merger = AppearanceMerger(
         similarity_threshold=appearance_similarity,
@@ -2816,7 +3042,13 @@ def process_video(
                     yolo_ball_bbox = tuple(v * inv_scale for v in yolo_ball_bbox)
             persons = appearance_merger.remap(frame_idx, frame, persons)
             ball_state = ball_tracker.update(
-                frame_idx, frame, yolo_ball, yolo_ball_conf, persons, yolo_bbox=yolo_ball_bbox
+                frame_idx,
+                frame,
+                yolo_ball,
+                yolo_ball_conf,
+                persons,
+                yolo_bbox=yolo_ball_bbox,
+                ball_anchor_guide=ball_anchor_guide,
             )
             if ball_state is not None:
                 ball = (ball_state.x, ball_state.y)
@@ -3103,6 +3335,7 @@ def init_session_state() -> None:
         "avg_player_diagonal": None,
         "auto_threshold_computed_for": None,
         "click_target_ring": "Кольцо 1",
+        "ball_anchors": [],
         "_last_ring_click_time": None,
         "player_crops": {},
         "player_names": {},
@@ -3140,12 +3373,15 @@ def reset_for_new_video() -> None:
         "ball_diagnostics",
         "excluded_player_ids",
         "id_merge_log",
+        "ball_anchors",
     ):
         if key in ("player_crops", "player_names", "player_numbers"):
             st.session_state[key] = {}
         elif key == "excluded_player_ids":
             st.session_state[key] = []
         elif key == "id_merge_log":
+            st.session_state[key] = []
+        elif key == "ball_anchors":
             st.session_state[key] = []
         elif key in ("ring1_configured", "ring2_configured"):
             st.session_state[key] = False
@@ -3487,14 +3723,19 @@ def render_step2_zones(device: str) -> None:
         "Координаты и якорный кадр сохраняются в исходном разрешении."
     )
     st.info(
-        "**Инструкция:** выберите «Кольцо 1» и **кликните по ободу** на превью. "
-        "Затем переключитесь на «Кольцо 2» и повторите на нужном кадре."
+        "**Инструкция:** выберите «Кольцо 1» / «Кольцо 2» и **кликните по ободу** на превью. "
+        "Для мяча выберите «Мяч» и кликните по нему на нескольких кадрах, где он хорошо виден."
     )
     if streamlit_image_coordinates is not None and cv2 is not None:
+        current_target = st.session_state.get("click_target_ring", "Кольцо 1")
+        if current_target not in CLICK_TARGET_OPTIONS:
+            current_target = "Кольцо 1"
         st.session_state["click_target_ring"] = st.radio(
-            "Сейчас клик по превью задаёт:", ["Кольцо 1", "Кольцо 2"],
-            horizontal=True, key="click_target_ring_radio",
-            index=0 if st.session_state.get("click_target_ring", "Кольцо 1") == "Кольцо 1" else 1,
+            "Сейчас клик по превью задаёт:",
+            list(CLICK_TARGET_OPTIONS),
+            horizontal=True,
+            key="click_target_ring_radio",
+            index=list(CLICK_TARGET_OPTIONS).index(current_target),
         )
     else:
         st.caption(
@@ -3502,10 +3743,14 @@ def render_step2_zones(device: str) -> None:
             "числовыми полями ниже (см. requirements.txt)."
         )
 
+    st.caption(
+        "Кликните мяч на **2–10 кадрах**, где он хорошо виден — так трекер реже теряет его между детекциями YOLO."
+    )
+
     if int(st.session_state.get("preview_frame_idx", 0)) > max_frame_idx:
         st.session_state["preview_frame_idx"] = max_frame_idx
     st.slider(
-        "Кадр для настройки колец (клик привязывает линию к этому кадру)",
+        "Кадр для настройки (кольца и мяч привязываются к этому кадру)",
         min_value=0,
         max_value=max_frame_idx,
         step=1,
@@ -3555,6 +3800,9 @@ def render_step2_zones(device: str) -> None:
             possession_threshold=st.session_state["possession_threshold"],
             preview_frame_idx=preview_frame_idx,
             show_anchor_debug=panning_mode,
+            ball_anchors=st.session_state.get("ball_anchors"),
+            camera_transforms=camera_transforms_preview,
+            panning_mode=panning_mode,
         )
         preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
 
@@ -3573,11 +3821,18 @@ def render_step2_zones(device: str) -> None:
                     scale_y = meta["height"] / disp_h if disp_h else 1.0
                     orig_x = int(np.clip(click_value["x"] * scale_x, 0, meta["width"]))
                     orig_y = int(np.clip(click_value["y"] * scale_y, 0, meta["height"]))
-                    ring_num = 1 if st.session_state["click_target_ring"] == "Кольцо 1" else 2
-                    mark_ring_configured(
-                        st.session_state, ring_num, orig_x, orig_y,
-                        frame_idx=int(st.session_state["preview_frame_idx"]),
-                    )
+                    target = st.session_state["click_target_ring"]
+                    if target == "Мяч":
+                        add_ball_anchor(
+                            st.session_state, orig_x, orig_y,
+                            frame_idx=int(st.session_state["preview_frame_idx"]),
+                        )
+                    else:
+                        ring_num = 1 if target == "Кольцо 1" else 2
+                        mark_ring_configured(
+                            st.session_state, ring_num, orig_x, orig_y,
+                            frame_idx=int(st.session_state["preview_frame_idx"]),
+                        )
                     ring_click_triggered_rerun = True
         else:
             st.image(preview_rgb, caption="Превью с зонами колец", use_container_width=True)
@@ -3603,6 +3858,23 @@ def render_step2_zones(device: str) -> None:
             )
         else:
             st.caption("Кольцо 2: кликните по ободу на превью.")
+
+    ball_anchors = normalize_ball_anchors(st.session_state.get("ball_anchors"))
+    st.markdown("**Якоря мяча**")
+    if not ball_anchors:
+        st.caption("Пока нет — выберите режим «Мяч» и кликните по мячу на превью.")
+    else:
+        for idx, anchor in enumerate(ball_anchors):
+            row_cols = st.columns([5, 1])
+            with row_cols[0]:
+                st.text(
+                    f"Кадр {int(anchor['frame'])}: "
+                    f"({int(anchor['x'])}, {int(anchor['y'])}) px"
+                )
+            with row_cols[1]:
+                if st.button("✕", key=f"del_ball_anchor_{int(anchor['frame'])}_{idx}"):
+                    remove_ball_anchor_at(st.session_state, idx)
+                    st.rerun()
 
     rings_ready = any_ring_configured(st.session_state)
     if not rings_ready:
@@ -3932,6 +4204,7 @@ def run_full_analysis(video_path: str, device: str) -> None:
             min_person_bbox_area=float(st.session_state.get("min_person_bbox_area", MIN_PERSON_BBOX_AREA_DEFAULT)),
             excluded_player_ids=set(st.session_state.get("excluded_player_ids") or []),
             camera_transforms=camera_transforms,
+            ball_anchors=st.session_state.get("ball_anchors") or [],
         )
     except Exception as exc:
         st.error(f"Ошибка при обработке видео: {exc}")

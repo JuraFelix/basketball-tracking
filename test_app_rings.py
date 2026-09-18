@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from app import (
+    add_ball_anchor,
     any_ring_configured,
     apply_default_ring_positions,
     compute_dynamic_rings,
@@ -15,6 +16,7 @@ from app import (
     draw_text_on_bgr,
     ensure_ring_zones_for_video,
     estimate_camera_transforms,
+    interpolate_ball_position,
     mark_ring_configured,
     prepare_rings_for_drawing,
     rings_from_session_state,
@@ -176,6 +178,22 @@ class RingSessionFlowTests(unittest.TestCase):
         state = {"ring1_x": 0, "ring1_y": 0, "ring1_r": 40, "ring1_configured": False}
         mark_ring_configured(state, 1, 300, 180, frame_idx=412)
         self.assertEqual(state["ring1_frame"], 412)
+
+    def test_ball_anchor_interpolation_static(self) -> None:
+        anchors = [{"x": 100.0, "y": 200.0, "frame": 10}, {"x": 300.0, "y": 220.0, "frame": 30}]
+        hit = interpolate_ball_position(anchors, 20, None)
+        self.assertIsNotNone(hit)
+        x, y, source = hit
+        self.assertEqual(source, "user_interp")
+        self.assertAlmostEqual(x, 200.0)
+        self.assertAlmostEqual(y, 210.0)
+
+    def test_ball_anchor_add_replaces_same_frame(self) -> None:
+        state: dict = {"ball_anchors": []}
+        add_ball_anchor(state, 50, 60, 12)
+        add_ball_anchor(state, 80, 90, 12)
+        self.assertEqual(len(state["ball_anchors"]), 1)
+        self.assertAlmostEqual(state["ball_anchors"][0]["x"], 80.0)
 
 
 class DrawingTests(unittest.TestCase):
