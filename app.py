@@ -523,23 +523,186 @@ def segment_crosses_hoop_line_top_to_bottom(
 # Экспериментальный режим "камера в движении": оценка сдвига камеры между
 # кадрами и пересчёт позиций зон колец под панораму/наклон.
 # ---------------------------------------------------------------------------
+def _affine2x3_to_3x3(m: np.ndarray) -> np.ndarray:
+    T = np.eye(3, dtype=np.float64)
+    T[:2, :] = m
+    return T
+
+
+def _is_degenerate_homography(H: Optional[np.ndarray]) -> bool:
+    if H is None or H.shape != (3, 3):
+        return True
+    if not np.all(np.isfinite(H)):
+        return True
+    if abs(float(H[2, 2])) < 1e-12:
+        return True
+    try:
+        det = float(np.linalg.det(H))
+    except np.linalg.LinAlgError:
+        return True
+    return abs(det) < 1e-8 or abs(det) > 1e4
+
+
+def _filter_flow_outliers(
+    prev_pts: np.ndarray, next_pts: np.ndarray, mad_multiplier: float = 2.5
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Оставляет треки с похожей величиной сдвига — движущиеся игроки отсекаются."""
+    if len(prev_pts) < 8:
+        return prev_pts, next_pts
+    flow = next_pts.reshape(-1, 2) - prev_pts.reshape(-1, 2)
+    mag = np.linalg.norm(flow, axis=1)
+    med = float(np.median(mag))
+    mad = float(np.median(np.abs(mag - med))) + 1e-6
+    if med < 0.25:
+        return prev_pts, next_pts
+    keep = np.abs(mag - med) <= mad_multiplier * max(mad, 0.5)
+    if int(np.count_nonzero(keep)) >= 6:
+        return prev_pts[keep], next_pts[keep]
+    return prev_pts, next_pts
+
+
+def _estimate_incremental_transform(prev_pts: np.ndarray, next_pts: np.ndarray) -> np.ndarray:
+    """Оценивает T_{i-1→i}: prev_pts (кадр i-1) → next_pts (кадр i). Homography, затем affine."""
+    incremental = np.eye(3, dtype=np.float64)
+    if len(prev_pts) < 6:
+        return incremental
+    prev_f = prev_pts.reshape(-1, 1, 2).astype(np.float32)
+    next_f = next_pts.reshape(-1, 1, 2).astype(np.float32)
+    prev_f, next_f = _filter_flow_outliers(prev_f, next_f)
+    if len(prev_f) < 6:
+        return incremental
+    H, _inliers = cv2.findHomography(prev_f, next_f, cv2.RANSAC, 3.0, maxIters=2000, confidence=0.995)
+    if H is not None and not _is_degenerate_homography(H):
+        H = H.astype(np.float64)
+        H /= H[2, 2]
+        return H
+    m, _inliers = cv2.estimateAffinePartial2D(
+        prev_f, next_f, method=cv2.RANSAC, ransacReprojThreshold=3.0
+    )
+    if m is not None:
+        return _affine2x3_to_3x3(m)
+    return incremental
+
+
+def _detect_local_motion_blobs(
+    prev_gray: np.ndarray, gray: np.ndarray, dilate_kernel: np.ndarray
+) -> np.ndarray:
+    """Маскирует только локальные движущиеся объекты (игроки), не глобальный панорамный сдвиг."""
+    h, w = prev_gray.shape
+    diff = cv2.absdiff(prev_gray, gray)
+    _, motion_bin = cv2.threshold(diff, 24, 255, cv2.THRESH_BINARY)
+    motion_bin = cv2.dilate(motion_bin, dilate_kernel, iterations=1)
+    contours, _ = cv2.findContours(motion_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    frame_area = float(h * w)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 400.0 or area > frame_area * 0.12:
+            continue
+        cv2.drawContours(mask, [contour], -1, 255, thickness=-1)
+    if np.count_nonzero(mask):
+        mask = cv2.dilate(mask, dilate_kernel, iterations=2)
+    return mask
+
+
+def _create_background_feature_mask(
+    gray: np.ndarray, motion_mask: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """Маска фич: весь кадр, кроме локально движущихся объектов (person-bbox-подобных blob)."""
+    h, w = gray.shape
+    mask = np.full((h, w), 255, dtype=np.uint8)
+    if motion_mask is not None:
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(motion_mask))
+    margin = max(int(min(w, h) * 0.03), 4)
+    mask[:margin, :] = 255
+    mask[h - margin :, :] = 255
+    mask[:, :margin] = 255
+    mask[:, w - margin :] = 255
+    return mask
+
+
+def _collect_matched_points(
+    prev_gray: np.ndarray,
+    gray: np.ndarray,
+    bg_mask: np.ndarray,
+    orb: Any,
+    bf: Any,
+    feature_params: Dict[str, Any],
+    lk_params: Dict[str, Any],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """ORB-матчи + LK-поток только по фоновой маске."""
+    prev_list: List[List[float]] = []
+    next_list: List[List[float]] = []
+
+    kp_prev, desc_prev = orb.detectAndCompute(prev_gray, bg_mask)
+    kp_curr, desc_curr = orb.detectAndCompute(gray, bg_mask)
+    if (
+        desc_prev is not None
+        and desc_curr is not None
+        and len(desc_prev) >= 8
+        and len(desc_curr) >= 8
+    ):
+        matches = bf.knnMatch(desc_prev, desc_curr, k=2)
+        for pair in matches:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                prev_list.append(kp_prev[m.queryIdx].pt)
+                next_list.append(kp_curr[m.trainIdx].pt)
+
+    prev_pts = cv2.goodFeaturesToTrack(prev_gray, mask=bg_mask, **feature_params)
+    if prev_pts is not None and len(prev_pts) >= 6:
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts, None, **lk_params)
+        if next_pts is not None and status is not None:
+            status_flat = status.flatten() == 1
+            good_prev = prev_pts[status_flat]
+            good_next = next_pts[status_flat]
+            for pt_prev, pt_next in zip(good_prev.reshape(-1, 2), good_next.reshape(-1, 2)):
+                prev_list.append([float(pt_prev[0]), float(pt_prev[1])])
+                next_list.append([float(pt_next[0]), float(pt_next[1])])
+
+    if len(prev_list) < 6:
+        return None, None
+    return np.array(prev_list, dtype=np.float32), np.array(next_list, dtype=np.float32)
+
+
+def smooth_cumulative_transforms(
+    transforms: List[np.ndarray], window: int = 9
+) -> List[np.ndarray]:
+    """Сглаживает накопленный сдвиг (tx, ty), сохраняя локальную геометрию матрицы."""
+    if len(transforms) < 3 or window < 3:
+        return transforms
+    n = len(transforms)
+    txs = np.array([T[0, 2] for T in transforms], dtype=np.float64)
+    tys = np.array([T[1, 2] for T in transforms], dtype=np.float64)
+    half = window // 2
+    smoothed_tx = txs.copy()
+    smoothed_ty = tys.copy()
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        smoothed_tx[i] = float(np.mean(txs[lo:hi]))
+        smoothed_ty[i] = float(np.mean(tys[lo:hi]))
+    out: List[np.ndarray] = []
+    for i, T in enumerate(transforms):
+        S = T.copy()
+        S[0, 2] = smoothed_tx[i]
+        S[1, 2] = smoothed_ty[i]
+        out.append(S)
+    return out
+
+
 def estimate_camera_transforms(
     video_path: str, progress_callback: Optional[Any] = None
 ) -> List[np.ndarray]:
-    """Оценивает покадровый сдвиг камеры методом оптического потока Лукаса-Канаде
-    по устойчивым фоновым фичам (линии площадки, трибуны, стены и т.п.).
+    """Оценивает покадровый сдвиг камеры по фоновым фичам (ORB + LK, RANSAC).
 
-    Возвращает список накопленных 3x3 матриц гомографии длиной в число кадров
-    видео, где transforms[i] переводит точку из системы координат КАДРА 0 в
-    систему координат КАДРА i. transforms[0] всегда единичная матрица.
+    Возвращает список накопленных 3×3 матриц длиной в число кадров, где
+    transforms[i] переводит точку из системы координат КАДРА 0 в систему
+    координат КАДРА i. transforms[0] — единичная матрица.
 
-    Это ЭКСПЕРИМЕНТАЛЬНАЯ оценка: RANSAC внутри estimateAffinePartial2D
-    достаточно устойчив к перемещающимся игрокам (они занимают меньшую часть
-    кадра, чем статичный фон), но метод рассчитан на ПЛАВНУЮ панораму/наклон
-    камеры. Резкий зум, сильная тряска или смена плана (склейка) могут сбить
-    накопленную оценку — поэтому режим явно помечен как экспериментальный
-    в GUI, и статичный режим (весь фон предположения) остаётся дефолтным и
-    полностью независимым путём кода.
+    Для якоря на кадре A и отрисовки на кадре t используйте
+    transform_ring_to_frame (композиция T_0→t · inv(T_0→A)).
     """
     if cv2 is None:
         return [np.eye(3, dtype=np.float64)]
@@ -555,12 +718,15 @@ def estimate_camera_transforms(
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
     cumulative: List[np.ndarray] = [np.eye(3, dtype=np.float64)]
 
-    feature_params = dict(maxCorners=250, qualityLevel=0.01, minDistance=12, blockSize=7)
+    feature_params = dict(maxCorners=300, qualityLevel=0.01, minDistance=10, blockSize=7)
     lk_params = dict(
         winSize=(21, 21),
         maxLevel=3,
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
     )
+    orb = cv2.ORB_create(nfeatures=700, fastThreshold=12)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    motion_kernel = np.ones((13, 13), np.uint8)
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
 
@@ -570,20 +736,15 @@ def estimate_camera_transforms(
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        motion_mask = _detect_local_motion_blobs(prev_gray, gray, motion_kernel)
+        bg_mask = _create_background_feature_mask(prev_gray, motion_mask)
+
         incremental = np.eye(3, dtype=np.float64)
-        prev_pts = cv2.goodFeaturesToTrack(prev_gray, mask=None, **feature_params)
-        if prev_pts is not None and len(prev_pts) >= 6:
-            next_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts, None, **lk_params)
-            if next_pts is not None and status is not None:
-                status_flat = status.flatten() == 1
-                good_prev = prev_pts[status_flat]
-                good_next = next_pts[status_flat]
-                if len(good_prev) >= 6:
-                    m, _inliers = cv2.estimateAffinePartial2D(
-                        good_prev, good_next, method=cv2.RANSAC, ransacReprojThreshold=3.0
-                    )
-                    if m is not None:
-                        incremental[:2, :] = m
+        prev_pts, next_pts = _collect_matched_points(
+            prev_gray, gray, bg_mask, orb, bf, feature_params, lk_params
+        )
+        if prev_pts is not None and next_pts is not None:
+            incremental = _estimate_incremental_transform(prev_pts, next_pts)
 
         cumulative.append(incremental @ cumulative[-1])
         prev_gray = gray
@@ -600,7 +761,45 @@ def estimate_camera_transforms(
             progress_callback(1.0)
         except Exception:
             pass
-    return cumulative
+    return smooth_cumulative_transforms(cumulative, window=9)
+
+
+def create_synthetic_pan_video(
+    path: str,
+    n_frames: int = 20,
+    dx_per_frame: float = 10.0,
+    width: int = 640,
+    height: int = 480,
+    moving_blobs: bool = False,
+) -> None:
+    """Синтетическое видео: каждый кадр контент сдвигается вправо на dx_per_frame px.
+
+    Используется в геометрических тестах warp колец. moving_blobs — имитация игроков.
+    """
+    if cv2 is None:
+        raise RuntimeError("opencv required")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(path, fourcc, 25.0, (width, height))
+    base = np.zeros((height, width, 3), dtype=np.uint8)
+    for y in range(height):
+        for x in range(width):
+            if (x // 20 + y // 20) % 2 == 0:
+                base[y, x] = (40, 40, 40)
+    cv2.line(base, (100, 0), (100, height), (255, 255, 255), 2)
+    rng = np.random.default_rng(42)
+    for i in range(n_frames):
+        M = np.float32([[1, 0, i * dx_per_frame], [0, 1, 0]])
+        frame = cv2.warpAffine(
+            base, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)
+        )
+        if moving_blobs:
+            for _ in range(4):
+                bx = int(rng.integers(80, width - 80))
+                by = int(rng.integers(120, height - 80))
+                br = int(rng.integers(18, 32))
+                cv2.circle(frame, (bx + i * 3, by - i * 2), br, (0, 0, 200), -1)
+        writer.write(frame)
+    writer.release()
 
 
 def transform_ring_to_frame(
@@ -1216,6 +1415,8 @@ def draw_zones_preview(
     frame,
     rings: List[RingZone],
     possession_threshold: Optional[float] = None,
+    preview_frame_idx: Optional[int] = None,
+    show_anchor_debug: bool = False,
 ) -> Any:
     """Рисует горизонтальные линии колец на копии кадра для наглядной проверки в GUI.
 
@@ -1223,12 +1424,15 @@ def draw_zones_preview(
     эталонный полупрозрачный круг такого радиуса с подписью в пикселях, чтобы
     пользователь видел порог владения мячом в реальном масштабе кадра, а не
     гадал по числу пикселей.
+
+    show_anchor_debug — крест якоря и подпись «як.A→t» в режиме динамической камеры.
     """
     preview = frame.copy()
     h, w = preview.shape[:2]
     prepared, _ = prepare_rings_for_drawing(rings, w, h)
     for idx, ring in enumerate(prepared):
         color = HOOP_LINE_COLORS_BGR[idx % len(HOOP_LINE_COLORS_BGR)]
+        source = rings[idx] if idx < len(rings) else ring
         center_x = int(round(ring["x"]))
         line_y = int(round(ring["y"]))
         half_w = int(round(ring["half_width"]))
@@ -1245,6 +1449,25 @@ def draw_zones_preview(
             preview, f"Кольцо {idx + 1}", label_pos, font_size=20, color_bgr=color,
             outline_bgr=(0, 0, 0), outline_width=3,
         )
+        if show_anchor_debug and preview_frame_idx is not None:
+            anchor_frame = int(source.get("anchor_frame", preview_frame_idx))
+            cross = 10
+            cv2.line(
+                preview, (center_x - cross, line_y), (center_x + cross, line_y),
+                (255, 255, 255), 1, lineType=cv2.LINE_AA,
+            )
+            cv2.line(
+                preview, (center_x, line_y - cross), (center_x, line_y + cross),
+                (255, 255, 255), 1, lineType=cv2.LINE_AA,
+            )
+            cv2.circle(preview, (center_x, line_y), 4, color, -1, lineType=cv2.LINE_AA)
+            debug_label = f"як.{anchor_frame}→{preview_frame_idx}"
+            draw_text_on_bgr(
+                preview, debug_label,
+                (min(center_x + 12, w - 120), max(line_y - 28, 16)),
+                font_size=16, color_bgr=(255, 255, 255),
+                outline_bgr=(0, 0, 0), outline_width=2,
+            )
 
     if possession_threshold and possession_threshold > 0:
         h, w = preview.shape[:2]
@@ -3119,7 +3342,13 @@ def render_step2_zones(device: str) -> None:
             camera_transforms=camera_transforms_preview,
             panning_mode=panning_mode,
         )
-        preview_bgr = draw_zones_preview(frame, rings, possession_threshold=st.session_state["possession_threshold"])
+        preview_bgr = draw_zones_preview(
+            frame,
+            rings,
+            possession_threshold=st.session_state["possession_threshold"],
+            preview_frame_idx=preview_frame_idx,
+            show_anchor_debug=panning_mode,
+        )
         preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
 
         if streamlit_image_coordinates is not None:

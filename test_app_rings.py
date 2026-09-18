@@ -1,7 +1,9 @@
 """Юнит-тесты состояния колец (шаг 2 → шаг 4) и prepare_rings_for_drawing."""
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -9,8 +11,10 @@ from app import (
     any_ring_configured,
     apply_default_ring_positions,
     compute_dynamic_rings,
+    create_synthetic_pan_video,
     draw_text_on_bgr,
     ensure_ring_zones_for_video,
+    estimate_camera_transforms,
     mark_ring_configured,
     prepare_rings_for_drawing,
     rings_from_session_state,
@@ -123,6 +127,40 @@ class RingSessionFlowTests(unittest.TestCase):
         at_target = transform_ring_to_frame(ring, transforms, 10)
         self.assertAlmostEqual(at_target["x"], 150.0)
         self.assertAlmostEqual(at_target["y"], 200.0)
+
+    def test_anchor_warp_frame_15_synthetic_shift(self) -> None:
+        """Якорь кадр 5 в (100,200); при +10 px/кадр вправо на кадре 15 → x=200."""
+        n_per_frame = 10.0
+        transforms = _translation_transforms(20, n_per_frame)
+        ring = {
+            "x": 100.0,
+            "y": 200.0,
+            "half_width": 50.0,
+            "anchor_frame": 5,
+            "configured": True,
+        }
+        at_15 = transform_ring_to_frame(ring, transforms, 15)
+        self.assertAlmostEqual(at_15["x"], 100.0 + 10.0 * n_per_frame)
+        self.assertAlmostEqual(at_15["y"], 200.0)
+
+    def test_estimate_camera_transforms_on_synthetic_pan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = str(Path(tmp) / "pan.mp4")
+            create_synthetic_pan_video(video_path, n_frames=20, dx_per_frame=10.0)
+            transforms = estimate_camera_transforms(video_path)
+            self.assertEqual(len(transforms), 20)
+            ring = {
+                "x": 100.0,
+                "y": 200.0,
+                "half_width": 50.0,
+                "anchor_frame": 5,
+                "configured": True,
+            }
+            at_15 = transform_ring_to_frame(ring, transforms, 15)
+            self.assertAlmostEqual(at_15["x"], 200.0, delta=3.0)
+            self.assertAlmostEqual(at_15["y"], 200.0, delta=2.0)
+            at_5 = transform_ring_to_frame(ring, transforms, 5)
+            self.assertAlmostEqual(at_5["x"], 100.0, delta=2.0)
 
     def test_compute_dynamic_rings_per_ring_anchor(self) -> None:
         transforms = _translation_transforms(30, 8.0)
