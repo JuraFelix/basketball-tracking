@@ -8,6 +8,7 @@ import numpy as np
 from app import (
     any_ring_configured,
     apply_default_ring_positions,
+    compute_dynamic_rings,
     draw_text_on_bgr,
     ensure_ring_zones_for_video,
     mark_ring_configured,
@@ -15,7 +16,17 @@ from app import (
     rings_from_session_state,
     sync_ring_widgets_to_canonical,
     test_draw_hoop_lines_on_frame,
+    transform_ring_to_frame,
 )
+
+
+def _translation_transforms(n: int, dx_per_frame: float) -> list:
+    transforms = []
+    for i in range(n):
+        t = np.eye(3, dtype=np.float64)
+        t[0, 2] = i * dx_per_frame
+        transforms.append(t)
+    return transforms
 
 
 class RingSessionFlowTests(unittest.TestCase):
@@ -96,6 +107,37 @@ class RingSessionFlowTests(unittest.TestCase):
         self.assertFalse(any_ring_configured(state))
         self.assertGreater(state["ring1_y"], 0)
         self.assertIn("wi_ring1_x", state)
+
+    def test_anchor_frame_warp_to_target(self) -> None:
+        transforms = _translation_transforms(20, 10.0)
+        ring = {
+            "x": 100.0,
+            "y": 200.0,
+            "half_width": 50.0,
+            "anchor_frame": 5,
+            "configured": True,
+        }
+        at_anchor = transform_ring_to_frame(ring, transforms, 5)
+        self.assertAlmostEqual(at_anchor["x"], 100.0)
+        self.assertAlmostEqual(at_anchor["y"], 200.0)
+        at_target = transform_ring_to_frame(ring, transforms, 10)
+        self.assertAlmostEqual(at_target["x"], 150.0)
+        self.assertAlmostEqual(at_target["y"], 200.0)
+
+    def test_compute_dynamic_rings_per_ring_anchor(self) -> None:
+        transforms = _translation_transforms(30, 8.0)
+        rings = [
+            {"x": 80.0, "y": 120.0, "half_width": 40.0, "anchor_frame": 10, "configured": True},
+            {"x": 400.0, "y": 130.0, "half_width": 45.0, "anchor_frame": 20, "configured": True},
+        ]
+        out = compute_dynamic_rings(rings, transforms, 25)
+        self.assertAlmostEqual(out[0]["x"], 80.0 + (25 - 10) * 8.0)
+        self.assertAlmostEqual(out[1]["x"], 400.0 + (25 - 20) * 8.0)
+
+    def test_mark_ring_stores_anchor_frame(self) -> None:
+        state = {"ring1_x": 0, "ring1_y": 0, "ring1_r": 40, "ring1_configured": False}
+        mark_ring_configured(state, 1, 300, 180, frame_idx=412)
+        self.assertEqual(state["ring1_frame"], 412)
 
 
 class DrawingTests(unittest.TestCase):

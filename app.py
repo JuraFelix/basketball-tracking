@@ -585,36 +585,55 @@ def estimate_camera_transforms(
     return cumulative
 
 
+def transform_ring_to_frame(
+    ring: RingZone,
+    camera_transforms: List[np.ndarray],
+    target_frame_idx: int,
+) -> RingZone:
+    """Переносит кольцо из координат якорного кадра (ring['anchor_frame']) в target_frame_idx.
+
+    camera_transforms[i] — накопленная гомография из кадра 0 в кадр i.
+    Композиция: T_0→target * inv(T_0→anchor).
+    """
+    if not camera_transforms:
+        return dict(ring)
+    n = len(camera_transforms)
+    anchor_idx = int(np.clip(int(ring.get("anchor_frame", 0)), 0, n - 1))
+    target_idx = int(np.clip(int(target_frame_idx), 0, n - 1))
+    try:
+        anchor_inv = np.linalg.inv(camera_transforms[anchor_idx])
+    except np.linalg.LinAlgError:
+        return dict(ring)
+    transform = camera_transforms[target_idx] @ anchor_inv
+    scale = math.hypot(transform[0, 0], transform[1, 0]) or 1.0
+    point = transform @ np.array([ring["x"], ring["y"], 1.0], dtype=np.float64)
+    half_w = float(ring.get("half_width", ring.get("r", 40.0)))
+    return {
+        "x": float(point[0]),
+        "y": float(point[1]),
+        "half_width": float(half_w * scale),
+        "configured": bool(ring.get("configured", True)),
+        "anchor_frame": anchor_idx,
+    }
+
+
 def compute_dynamic_rings(
     rings: List[RingZone],
     camera_transforms: List[np.ndarray],
-    ref_frame_idx: int,
     frame_idx: int,
 ) -> List[RingZone]:
-    """Пересчитывает позиции (и радиус, с учётом лёгкого зума) зон колец из
-    системы координат кадра, на котором пользователь их задал (ref_frame_idx),
-    в систему координат текущего кадра (frame_idx), используя накопленные
-    трансформации камеры из estimate_camera_transforms."""
+    """Пересчитывает каждое кольцо из его якорного кадра в frame_idx (динамическое видео)."""
     if not camera_transforms:
         return rings
-    n = len(camera_transforms)
-    ref_idx = int(np.clip(ref_frame_idx, 0, n - 1))
-    cur_idx = int(np.clip(frame_idx, 0, n - 1))
-    try:
-        ref_inv = np.linalg.inv(camera_transforms[ref_idx])
-    except np.linalg.LinAlgError:
-        return rings
-    transform = camera_transforms[cur_idx] @ ref_inv
-    scale = math.hypot(transform[0, 0], transform[1, 0]) or 1.0
+    return [transform_ring_to_frame(ring, camera_transforms, frame_idx) for ring in rings]
 
-    dynamic_rings: List[RingZone] = []
-    for ring in rings:
-        point = transform @ np.array([ring["x"], ring["y"], 1.0], dtype=np.float64)
-        half_w = ring.get("half_width", ring.get("r", 40.0))
-        dynamic_rings.append(
-            {"x": float(point[0]), "y": float(point[1]), "half_width": float(half_w * scale)}
-        )
-    return dynamic_rings
+
+def get_camera_transforms_cached(video_path: str, state: Dict[str, Any]) -> List[np.ndarray]:
+    """Кэширует estimate_camera_transforms в session_state для превью шага 2."""
+    if state.get("camera_transforms_video") != video_path or state.get("camera_transforms") is None:
+        state["camera_transforms"] = estimate_camera_transforms(video_path)
+        state["camera_transforms_video"] = video_path
+    return state["camera_transforms"]
 
 
 # ---------------------------------------------------------------------------
@@ -763,12 +782,16 @@ def ring_configuration_status(state: Dict[str, Any]) -> Tuple[bool, bool]:
     return bool(state.get("ring1_configured")), bool(state.get("ring2_configured"))
 
 
-def mark_ring_configured(state: Dict[str, Any], ring_num: int, x: int, y: int) -> None:
+def mark_ring_configured(
+    state: Dict[str, Any], ring_num: int, x: int, y: int, frame_idx: Optional[int] = None
+) -> None:
     state[f"ring{ring_num}_configured"] = True
     state[f"ring{ring_num}_x"] = int(x)
     state[f"ring{ring_num}_y"] = int(y)
     state[f"wi_ring{ring_num}_x"] = int(x)
     state[f"wi_ring{ring_num}_y"] = int(y)
+    if frame_idx is not None:
+        state[f"ring{ring_num}_frame"] = int(frame_idx)
 
 
 def init_ring_widget_keys(state: Dict[str, Any], ring_num: int) -> None:
@@ -797,6 +820,7 @@ def apply_default_ring_positions(state: Dict[str, Any], width: int, height: int)
         state[f"wi_ring{ring_num}_x"] = int(ring["x"])
         state[f"wi_ring{ring_num}_y"] = int(ring["y"])
         state[f"wi_ring{ring_num}_r"] = int(ring.get("half_width", ring.get("r", 40)))
+        state.setdefault(f"ring{ring_num}_frame", 0)
 
 
 def ensure_ring_zones_for_video(video_path: str, state: Dict[str, Any]) -> None:
@@ -811,32 +835,46 @@ def ensure_ring_zones_for_video(video_path: str, state: Dict[str, Any]) -> None:
     state["rings_initialized_for"] = video_path
 
 
-def rings_for_preview_display(state: Dict[str, Any]) -> List[RingZone]:
-    """Кольца для превью шага 2: рисуем дефолтные позиции как подсказку, configured не меняем."""
+def rings_for_preview_display(
+    state: Dict[str, Any],
+    preview_frame_idx: int,
+    camera_transforms: Optional[List[np.ndarray]] = None,
+    panning_mode: bool = False,
+) -> List[RingZone]:
+    """Кольца для превью: в динамике проецируем якорь на текущий кадр слайдера."""
     rings = rings_from_session_state(state)
     display: List[RingZone] = []
     for ring in rings:
-        copy = dict(ring)
-        if float(copy.get("y", 0.0)) > 0.0:
-            copy["configured"] = True
-        display.append(copy)
+        if ring.get("configured") and panning_mode and camera_transforms:
+            projected = transform_ring_to_frame(ring, camera_transforms, preview_frame_idx)
+            projected["configured"] = True
+            display.append(projected)
+        elif ring.get("configured"):
+            display.append(dict(ring))
+        else:
+            copy = dict(ring)
+            if float(copy.get("y", 0.0)) > 0.0:
+                copy["configured"] = True
+            display.append(copy)
     return display
 
 
 def rings_from_session_state(state: Dict[str, Any]) -> List[RingZone]:
-    """Собирает зоны колец из session_state в системе координат исходного кадра."""
+    """Собирает зоны колец из session_state (координаты в системе якорного кадра)."""
     return [
         {
             "x": float(state["ring1_x"]),
             "y": float(state["ring1_y"]),
             "half_width": float(state["ring1_r"]),
             "configured": bool(state.get("ring1_configured")),
+            "anchor_frame": int(state.get("ring1_frame", 0)),
         },
         {
             "x": float(state["ring2_x"]),
             "y": float(state["ring2_y"]),
             "half_width": float(state["ring2_r"]),
             "configured": bool(state.get("ring2_configured")),
+            "anchor_frame": int(state.get("ring2_frame", 0)),
         },
     ]
 
@@ -844,8 +882,10 @@ def rings_from_session_state(state: Dict[str, Any]) -> List[RingZone]:
 def describe_ring_state_for_debug(state: Dict[str, Any]) -> str:
     r1, r2 = ring_configuration_status(state)
     return (
-        f"ring1_configured={r1}, ring1_x/y/r=({state.get('ring1_x')}, {state.get('ring1_y')}, {state.get('ring1_r')}); "
-        f"ring2_configured={r2}, ring2_x/y/r=({state.get('ring2_x')}, {state.get('ring2_y')}, {state.get('ring2_r')})"
+        f"ring1_configured={r1}, anchor_frame={state.get('ring1_frame')}, "
+        f"ring1_x/y/r=({state.get('ring1_x')}, {state.get('ring1_y')}, {state.get('ring1_r')}); "
+        f"ring2_configured={r2}, anchor_frame={state.get('ring2_frame')}, "
+        f"ring2_x/y/r=({state.get('ring2_x')}, {state.get('ring2_y')}, {state.get('ring2_r')})"
     )
 
 
@@ -1128,15 +1168,22 @@ def get_video_metadata(video_path: str) -> Dict[str, float]:
     return {"fps": fps, "width": width, "height": height, "total_frames": total_frames, "duration": duration}
 
 
+def extract_frame_at_index(video_path: str, frame_idx: int):
+    """Извлекает кадр по индексу (для превью настройки колец)."""
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(int(frame_idx), 0))
+    ret, frame = cap.read()
+    cap.release()
+    return frame if ret else None
+
+
 def extract_frame_at_time(video_path: str, t_seconds: float):
     """Извлекает один кадр видео на заданной секунде (для превью настройки зон)."""
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     frame_idx = max(int(t_seconds * fps), 0)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-    ret, frame = cap.read()
     cap.release()
-    return frame if ret else None
+    return extract_frame_at_index(video_path, frame_idx)
 
 
 def default_ring_zones(width: int, height: int) -> Tuple[RingZone, RingZone]:
@@ -2383,7 +2430,6 @@ def process_video(
     min_person_bbox_area: float = MIN_PERSON_BBOX_AREA_DEFAULT,
     excluded_player_ids: Optional[set] = None,
     camera_transforms: Optional[List[np.ndarray]] = None,
-    ring_reference_frame_idx: int = 0,
 ) -> Tuple[Dict[int, PlayerStats], Path, Dict[str, List[Dict[str, Any]]]]:
     """Обрабатывает видео покадрово: детекция, трекинг, события, хайлайты.
 
@@ -2393,12 +2439,11 @@ def process_video(
     parse_track_results (мяч — более мелкий и часто менее уверенный объект,
     чем игрок, поэтому его порог обычно значительно ниже).
 
-    camera_transforms/ring_reference_frame_idx — экспериментальный режим
-    "камера в движении": если camera_transforms передан (список накопленных
-    матриц из estimate_camera_transforms), позиции зон колец пересчитываются
-    для каждого кадра относительно кадра ring_reference_frame_idx (на котором
-    пользователь их задал на шаге 2), см. compute_dynamic_rings. Если None —
-    поведение идентично исходному статичному режиму (зоны неподвижны).
+    camera_transforms — экспериментальный режим «камера в движении»: если передан
+    список накопленных матриц из estimate_camera_transforms, каждое кольцо
+    пересчитывается из своего якорного кадра (ring*_frame) в текущий кадр,
+    см. transform_ring_to_frame / compute_dynamic_rings. Если None — статичный
+    режим (линии фиксированы).
 
     Возвращает (стата по игрокам, путь к аннотированному видео, отладочный лог
     владения мячом для GUI-таймлайна).
@@ -2533,7 +2578,7 @@ def process_video(
             )
 
         if camera_transforms is not None:
-            current_rings = compute_dynamic_rings(rings, camera_transforms, ring_reference_frame_idx, frame_idx)
+            current_rings = compute_dynamic_rings(rings, camera_transforms, frame_idx)
         else:
             current_rings = rings
 
@@ -2770,10 +2815,13 @@ def init_session_state() -> None:
         "ring1_y": 0.0,
         "ring1_r": 40.0,
         "ring1_configured": False,
+        "ring1_frame": 0,
         "ring2_x": 0.0,
         "ring2_y": 0.0,
         "ring2_r": 40.0,
         "ring2_configured": False,
+        "ring2_frame": 0,
+        "preview_frame_idx": 0,
         "possession_threshold": float(POSSESSION_THRESHOLD_DEFAULT),
         "pass_min_frames": int(PASS_MIN_FRAMES_DEFAULT),
         "pass_max_frames": int(PASS_MAX_FRAMES_DEFAULT),
@@ -2790,6 +2838,8 @@ def init_session_state() -> None:
         "camera_mode": CAMERA_MODE_STATIC,
         "ball_diagnostics": None,
         "preview_time": 0.0,
+        "camera_transforms": None,
+        "camera_transforms_video": None,
         "avg_player_diagonal": None,
         "auto_threshold_computed_for": None,
         "click_target_ring": "Кольцо 1",
@@ -2816,6 +2866,8 @@ def reset_for_new_video() -> None:
         "rings_initialized_for",
         "ring1_configured",
         "ring2_configured",
+        "camera_transforms",
+        "camera_transforms_video",
         "player_crops",
         "player_names",
         "player_numbers",
@@ -2848,6 +2900,7 @@ def _make_ring_widget_change_handler(ring_num: int):
     def _handler() -> None:
         st.session_state[f"ring{ring_num}_configured"] = True
         sync_ring_widgets_to_canonical(st.session_state, ring_num)
+        st.session_state[f"ring{ring_num}_frame"] = int(st.session_state.get("preview_frame_idx", 0))
 
     return _handler
 
@@ -2960,18 +3013,43 @@ def render_step2_zones(device: str) -> None:
     init_ring_widget_keys(st.session_state, 1)
     init_ring_widget_keys(st.session_state, 2)
 
-    max_t = max(meta["duration"] - 0.05, 0.0)
-    st.session_state["preview_time"] = st.slider(
-        "Кадр для превью (сек)", min_value=0.0, max_value=max_t if max_t > 0 else 0.1,
-        value=min(st.session_state["preview_time"], max_t), step=0.5,
-    )
-    frame = extract_frame_at_time(video_path, st.session_state["preview_time"])
+    max_frame_idx = max(int(meta["total_frames"]) - 1, 0)
 
     # --- Авто-калибровка порога владения по среднему размеру игрока на кадре ---
     # Фиксированный порог в пикселях не учитывает масштаб конкретного видео
     # (камера близко/далеко, разное разрешение) — поэтому один раз на видео
     # (и по кнопке повторно) считаем средний размер рамки игрока и предлагаем
     # адаптивный дефолт вместо жёстких 90px.
+    panning_mode = st.session_state.get("camera_mode") == CAMERA_MODE_PANNING
+    camera_transforms_preview: Optional[List[np.ndarray]] = None
+    if panning_mode:
+        st.info(
+            "🎥 **Динамическое видео:** каждое кольцо привязывается к **номеру кадра**, "
+            "на котором вы кликнули. Сдвигайте ползунок ниже, чтобы проверить, как линия "
+            "проецируется на другие кадры."
+        )
+        if st.session_state.get("camera_transforms_video") != video_path:
+            with st.spinner("Оценка движения камеры для превью колец..."):
+                get_camera_transforms_cached(video_path, st.session_state)
+        camera_transforms_preview = st.session_state.get("camera_transforms")
+
+    st.subheader("🎯 Положение колец")
+    st.caption(
+        "Сдвиньте кадр → убедитесь, что кольцо видно → кликните по ободу. "
+        "Координаты и якорный кадр сохраняются в исходном разрешении."
+    )
+    preview_frame_idx = st.slider(
+        "Кадр для настройки колец (клик привязывает линию к этому кадру)",
+        min_value=0,
+        max_value=max_frame_idx,
+        value=min(int(st.session_state.get("preview_frame_idx", 0)), max_frame_idx),
+        step=1,
+        key="preview_frame_idx",
+    )
+    st.session_state["preview_time"] = float(preview_frame_idx) / float(meta["fps"] or 25.0)
+    st.caption(f"Текущий кадр превью: **{preview_frame_idx}** (~{st.session_state['preview_time']:.2f} с)")
+
+    frame = extract_frame_at_index(video_path, preview_frame_idx)
     if frame is not None and st.session_state.get("auto_threshold_computed_for") != video_path:
         model, _ = load_model(device)
         if model is not None:
@@ -2986,19 +3064,9 @@ def render_step2_zones(device: str) -> None:
                 st.session_state["possession_threshold"] = suggest_possession_threshold(avg_diag)
         st.session_state["auto_threshold_computed_for"] = video_path
 
-    if st.session_state.get("camera_mode") == CAMERA_MODE_PANNING:
-        st.info(
-            "🎥 Режим «камера в движении» включён: зоны колец задаются здесь на выбранном кадре "
-            "превью, а на шаге 4 их позиции будут автоматически пересчитываться под сдвиг камеры "
-            "относительно ИМЕННО ЭТОГО кадра. Если поменяете секунду превью выше — точка отсчёта "
-            "для пересчёта сдвинется вместе с ней."
-        )
-
-    st.subheader("🎯 Линии обоих колец")
     st.info(
-        "**Инструкция:** выберите «Кольцо 1» и **кликните по ободу кольца** на превью "
-        "(центр линии и её Y). Затем переключитесь на «Кольцо 2» и повторите. "
-        "Полуширину линии можно подправить числовыми полями ниже."
+        "**Инструкция:** выберите «Кольцо 1» и **кликните по ободу** на превью. "
+        "Затем переключитесь на «Кольцо 2» и повторите на нужном кадре."
     )
     if streamlit_image_coordinates is not None and cv2 is not None:
         st.session_state["click_target_ring"] = st.radio(
@@ -3025,7 +3093,12 @@ def render_step2_zones(device: str) -> None:
     # ещё разрешена. Сам st.rerun() при этом откладывается флагом
     # ring_click_triggered_rerun до конца функции — см. комментарий там.
     if frame is not None:
-        rings = rings_for_preview_display(st.session_state)
+        rings = rings_for_preview_display(
+            st.session_state,
+            preview_frame_idx,
+            camera_transforms=camera_transforms_preview,
+            panning_mode=panning_mode,
+        )
         preview_bgr = draw_zones_preview(frame, rings, possession_threshold=st.session_state["possession_threshold"])
         preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
 
@@ -3043,7 +3116,10 @@ def render_step2_zones(device: str) -> None:
                     orig_x = int(np.clip(click_value["x"] * scale_x, 0, meta["width"]))
                     orig_y = int(np.clip(click_value["y"] * scale_y, 0, meta["height"]))
                     ring_num = 1 if st.session_state["click_target_ring"] == "Кольцо 1" else 2
-                    mark_ring_configured(st.session_state, ring_num, orig_x, orig_y)
+                    mark_ring_configured(
+                        st.session_state, ring_num, orig_x, orig_y,
+                        frame_idx=int(st.session_state["preview_frame_idx"]),
+                    )
                     ring_click_triggered_rerun = True
         else:
             st.image(preview_rgb, caption="Превью с зонами колец", use_container_width=True)
@@ -3055,7 +3131,8 @@ def render_step2_zones(device: str) -> None:
         if st.session_state.get("ring1_configured"):
             st.success(
                 f"✅ **Кольцо 1 задано:** X={int(st.session_state['ring1_x'])}, "
-                f"линия Y={int(st.session_state['ring1_y'])}, полуширина={int(st.session_state['ring1_r'])} px"
+                f"линия Y={int(st.session_state['ring1_y'])}, полуширина={int(st.session_state['ring1_r'])} px · "
+                f"**привязано к кадру {int(st.session_state.get('ring1_frame', 0))}**"
             )
         else:
             st.caption("Кольцо 1: кликните по превью или введите координаты вручную.")
@@ -3063,7 +3140,8 @@ def render_step2_zones(device: str) -> None:
         if st.session_state.get("ring2_configured"):
             st.success(
                 f"✅ **Кольцо 2 задано:** X={int(st.session_state['ring2_x'])}, "
-                f"линия Y={int(st.session_state['ring2_y'])}, полуширина={int(st.session_state['ring2_r'])} px"
+                f"линия Y={int(st.session_state['ring2_y'])}, полуширина={int(st.session_state['ring2_r'])} px · "
+                f"**привязано к кадру {int(st.session_state.get('ring2_frame', 0))}**"
             )
         else:
             st.caption("Кольцо 2: кликните по превью или введите координаты вручную.")
@@ -3552,18 +3630,21 @@ def run_full_analysis(video_path: str, device: str) -> None:
         st.warning(f"⚠️ {warn}")
 
     camera_transforms: Optional[List[np.ndarray]] = None
-    ring_reference_frame_idx = 0
     if st.session_state.get("camera_mode") == CAMERA_MODE_PANNING and cv2 is not None:
-        meta = get_video_metadata(video_path)
-        ring_reference_frame_idx = int(round(float(st.session_state.get("preview_time", 0.0)) * meta["fps"]))
-        st.info("🎥 Экспериментальный режим «камера в движении»: оцениваю сдвиг камеры по всему видео...")
-        cam_progress = st.progress(0.0)
-        try:
-            camera_transforms = estimate_camera_transforms(video_path, progress_callback=cam_progress.progress)
-        except Exception as exc:
-            st.warning(f"⚠️ Не удалось оценить движение камеры ({exc}) — зоны колец останутся фиксированными.")
-            camera_transforms = None
-        cam_progress.progress(1.0)
+        if st.session_state.get("camera_transforms_video") == video_path and st.session_state.get("camera_transforms"):
+            camera_transforms = st.session_state["camera_transforms"]
+            st.info("🎥 Использую оценку движения камеры с шага 2 (якорный кадр каждого кольца).")
+        else:
+            st.info("🎥 Экспериментальный режим «камера в движении»: оцениваю сдвиг камеры по всему видео...")
+            cam_progress = st.progress(0.0)
+            try:
+                camera_transforms = estimate_camera_transforms(video_path, progress_callback=cam_progress.progress)
+                st.session_state["camera_transforms"] = camera_transforms
+                st.session_state["camera_transforms_video"] = video_path
+            except Exception as exc:
+                st.warning(f"⚠️ Не удалось оценить движение камеры ({exc}) — зоны колец останутся фиксированными.")
+                camera_transforms = None
+            cam_progress.progress(1.0)
 
     progress_bar = st.progress(0.0)
     status_text = st.empty()
@@ -3596,7 +3677,6 @@ def run_full_analysis(video_path: str, device: str) -> None:
             min_person_bbox_area=float(st.session_state.get("min_person_bbox_area", MIN_PERSON_BBOX_AREA_DEFAULT)),
             excluded_player_ids=set(st.session_state.get("excluded_player_ids") or []),
             camera_transforms=camera_transforms,
-            ring_reference_frame_idx=ring_reference_frame_idx,
         )
     except Exception as exc:
         st.error(f"Ошибка при обработке видео: {exc}")
@@ -3710,8 +3790,9 @@ def render_step4_run(device: str) -> None:
     with st.expander("⚙️ Текущие настройки анализа", expanded=False):
         st.write(
             f"Кольцо 1: X={int(st.session_state['ring1_x'])}, Y={int(st.session_state['ring1_y'])}, "
-            f"полуширина={int(st.session_state['ring1_r'])} · Кольцо 2: X={int(st.session_state['ring2_x'])}, "
-            f"Y={int(st.session_state['ring2_y'])}, полуширина={int(st.session_state['ring2_r'])}"
+            f"полуширина={int(st.session_state['ring1_r'])}, якорь кадр {int(st.session_state.get('ring1_frame', 0))} · "
+            f"Кольцо 2: X={int(st.session_state['ring2_x'])}, Y={int(st.session_state['ring2_y'])}, "
+            f"полуширина={int(st.session_state['ring2_r'])}, якорь кадр {int(st.session_state.get('ring2_frame', 0))}"
         )
         st.write(
             f"Порог владения: {int(st.session_state['possession_threshold'])} px · "
