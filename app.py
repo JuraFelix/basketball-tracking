@@ -54,6 +54,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yaml
+from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
 # Защищённые импорты "тяжёлых" библиотек.
@@ -252,6 +253,14 @@ BALL_ROI_DETECT_IMGSZ = 960
 JERSEY_OCR_ENABLED_DEFAULT = True
 JERSEY_OCR_MIN_CONF = 0.45
 REID_SIMILARITY_THRESHOLD = 0.78
+# Жёсткий гейт внешности: ниже — не доверяем ID ByteTrack (лучше новый ID, чем swap).
+APPEARANCE_SWAP_GATE = 0.58
+APPEARANCE_MATCH_MIN = 0.62
+APPEARANCE_MOTION_MAX_PX = 180
+# Минимальная площадь bbox игрока (px²); 0 = не отбрасывать мелкие силуэты.
+MIN_PERSON_BBOX_AREA_DEFAULT = 0
+MIN_PERSON_BBOX_AREA_MIN = 0
+MIN_PERSON_BBOX_AREA_MAX = 2000
 # Линии колец на аннотированном видео: яркий cyan/lime + чёрная обводка (BGR).
 HOOP_LINE_COLORS_BGR = [(255, 255, 0), (0, 255, 128)]
 HOOP_LINE_THICKNESS = 7
@@ -321,22 +330,14 @@ def ensure_directories() -> None:
 
 
 def ensure_tracker_config(path: Path = TRACKER_CONFIG_PATH) -> Path:
-    """Генерирует локальный конфиг трекера ByteTrack при первом запуске.
-
-    ByteTrack удерживает ID игроков без ReID/номеров на форме: track_buffer=180
-    (~5–6 сек при 30 fps) помогает не терять трек при окклюзии, а
-    track_low_thresh=0.1 не отбрасывает частично перекрытые силуэты.
-    """
-    if path.exists():
-        return path
-
+    """Генерирует/обновляет конфиг ByteTrack: низкий new_track_thresh для дальних игроков."""
     tracker_cfg = {
         "tracker_type": "bytetrack",
-        "track_high_thresh": 0.25,
+        "track_high_thresh": 0.2,
         "track_low_thresh": 0.1,
-        "new_track_thresh": 0.25,
+        "new_track_thresh": 0.15,
         "track_buffer": 180,
-        "match_thresh": 0.8,
+        "match_thresh": 0.75,
         "fuse_score": True,
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -344,6 +345,7 @@ def ensure_tracker_config(path: Path = TRACKER_CONFIG_PATH) -> Path:
             "# Автоматически сгенерированный конфиг трекера ByteTrack.\n"
             "# track_buffer=180 — помнить игрока ~5–6 сек при окклюзии.\n"
             "# track_low_thresh=0.1 — не терять трек при частичном перекрытии.\n"
+            "# new_track_thresh=0.15 — чаще стартовать трек для мелких/дальних силуэтов.\n"
         )
         yaml.safe_dump(tracker_cfg, f, sort_keys=False, allow_unicode=True)
     return path
@@ -430,6 +432,28 @@ def reset_tracker(model) -> None:
 def bbox_center(box: Tuple[float, float, float, float]) -> Tuple[float, float]:
     x1, y1, x2, y2 = box
     return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def bbox_area(box: Tuple[float, float, float, float]) -> float:
+    x1, y1, x2, y2 = box
+    return max(float(x2) - float(x1), 0.0) * max(float(y2) - float(y1), 0.0)
+
+
+def bbox_iou(
+    box_a: Tuple[float, float, float, float], box_b: Tuple[float, float, float, float]
+) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(ix2 - ix1, 0.0), max(iy2 - iy1, 0.0)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = bbox_area(box_a)
+    area_b = bbox_area(box_b)
+    union = area_a + area_b - inter
+    return float(inter / union) if union > 0 else 0.0
 
 
 def distance_point_to_bbox(px: float, py: float, box: Tuple[float, float, float, float]) -> float:
@@ -658,19 +682,145 @@ def id_to_color(pid: int) -> Tuple[int, int, int]:
     return int(bgr_pixel[0]), int(bgr_pixel[1]), int(bgr_pixel[2])
 
 
+_CYRILLIC_FONT_PATH: Optional[str] = None
+_CYRILLIC_FONT_OBJECTS: Dict[int, ImageFont.FreeTypeFont] = {}
+
+
+def resolve_cyrillic_font_path() -> Optional[str]:
+    """DejaVuSans / Arial / Liberation — первый доступный TTF с кириллицей."""
+    global _CYRILLIC_FONT_PATH
+    if _CYRILLIC_FONT_PATH is not None:
+        return _CYRILLIC_FONT_PATH
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+    ]
+    for candidate in candidates:
+        if Path(candidate).is_file():
+            _CYRILLIC_FONT_PATH = candidate
+            return candidate
+    return None
+
+
+def _get_cyrillic_font(size: int) -> Optional[ImageFont.FreeTypeFont]:
+    path = resolve_cyrillic_font_path()
+    if path is None:
+        return None
+    if size not in _CYRILLIC_FONT_OBJECTS:
+        try:
+            _CYRILLIC_FONT_OBJECTS[size] = ImageFont.truetype(path, size)
+        except Exception:
+            return None
+    return _CYRILLIC_FONT_OBJECTS[size]
+
+
+def draw_text_on_bgr(
+    img_bgr: Any,
+    text: str,
+    xy: Tuple[int, int],
+    font_size: int = 20,
+    color_bgr: Tuple[int, int, int] = (255, 255, 255),
+    outline_bgr: Optional[Tuple[int, int, int]] = (0, 0, 0),
+    outline_width: int = 2,
+) -> None:
+    """Рисует Unicode/кириллицу на BGR-кадре (нижний левый угол текста в xy, как cv2.putText)."""
+    if cv2 is None or not text:
+        return
+    font = _get_cyrillic_font(font_size)
+    if font is None:
+        cv2.putText(
+            img_bgr, text, xy, cv2.FONT_HERSHEY_SIMPLEX, font_size / 30.0, color_bgr, 2, cv2.LINE_AA
+        )
+        return
+    x, y = int(xy[0]), int(xy[1])
+    rgb = (int(color_bgr[2]), int(color_bgr[1]), int(color_bgr[0]))
+    outline_rgb = None
+    if outline_bgr is not None:
+        outline_rgb = (int(outline_bgr[2]), int(outline_bgr[1]), int(outline_bgr[0]))
+    pil_img = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_img)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_h = bbox[3] - bbox[1]
+    top_y = y - text_h
+    if outline_rgb and outline_width > 0:
+        for dx in range(-outline_width, outline_width + 1):
+            for dy in range(-outline_width, outline_width + 1):
+                if dx * dx + dy * dy <= outline_width * outline_width:
+                    draw.text((x + dx, top_y + dy), text, font=font, fill=outline_rgb)
+    draw.text((x, top_y), text, font=font, fill=rgb)
+    img_bgr[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
+def any_ring_configured(state: Dict[str, Any]) -> bool:
+    return bool(state.get("ring1_configured") or state.get("ring2_configured"))
+
+
+def ring_configuration_status(state: Dict[str, Any]) -> Tuple[bool, bool]:
+    return bool(state.get("ring1_configured")), bool(state.get("ring2_configured"))
+
+
+def mark_ring_configured(state: Dict[str, Any], ring_num: int, x: int, y: int) -> None:
+    state[f"ring{ring_num}_configured"] = True
+    state[f"ring{ring_num}_x"] = int(x)
+    state[f"ring{ring_num}_y"] = int(y)
+    state[f"wi_ring{ring_num}_x"] = int(x)
+    state[f"wi_ring{ring_num}_y"] = int(y)
+
+
+def init_ring_widget_keys(state: Dict[str, Any], ring_num: int) -> None:
+    for field in ("x", "y", "r"):
+        wkey = f"wi_ring{ring_num}_{field}"
+        if wkey not in state:
+            state[wkey] = int(state.get(f"ring{ring_num}_{field}", 0))
+
+
+def sync_ring_widgets_to_canonical(state: Dict[str, Any], ring_num: int) -> None:
+    prefix = f"ring{ring_num}"
+    for field in ("x", "y", "r"):
+        wkey = f"wi_{prefix}_{field}"
+        if wkey in state:
+            state[f"{prefix}_{field}"] = state[wkey]
+
+
+def apply_default_ring_positions(state: Dict[str, Any], width: int, height: int) -> None:
+    """Подставляет разумные дефолты для превью — без флага configured."""
+    ring1, ring2 = default_ring_zones(width, height)
+    for ring_num, ring in ((1, ring1), (2, ring2)):
+        state[f"ring{ring_num}_x"] = int(ring["x"])
+        state[f"ring{ring_num}_y"] = int(ring["y"])
+        state[f"ring{ring_num}_r"] = int(ring.get("half_width", ring.get("r", 40)))
+        init_ring_widget_keys(state, ring_num)
+        state[f"wi_ring{ring_num}_x"] = int(ring["x"])
+        state[f"wi_ring{ring_num}_y"] = int(ring["y"])
+        state[f"wi_ring{ring_num}_r"] = int(ring.get("half_width", ring.get("r", 40)))
+
+
 def ensure_ring_zones_for_video(video_path: str, state: Dict[str, Any]) -> None:
-    """Инициализирует ring1/ring2 в координатах исходного кадра, если шаг 2 ещё не открывали."""
+    """Дефолты только если пользователь ещё не задавал кольца; configured не затираем."""
     if state.get("rings_initialized_for") == video_path or cv2 is None:
         return
+    if any_ring_configured(state):
+        state["rings_initialized_for"] = video_path
+        return
     meta = get_video_metadata(video_path)
-    ring1, ring2 = default_ring_zones(int(meta["width"]), int(meta["height"]))
-    state["ring1_x"] = int(ring1["x"])
-    state["ring1_y"] = int(ring1["y"])
-    state["ring1_r"] = int(ring1.get("half_width", ring1.get("r", 40)))
-    state["ring2_x"] = int(ring2["x"])
-    state["ring2_y"] = int(ring2["y"])
-    state["ring2_r"] = int(ring2.get("half_width", ring2.get("r", 40)))
+    apply_default_ring_positions(state, int(meta["width"]), int(meta["height"]))
     state["rings_initialized_for"] = video_path
+
+
+def rings_for_preview_display(state: Dict[str, Any]) -> List[RingZone]:
+    """Кольца для превью шага 2: рисуем дефолтные позиции как подсказку, configured не меняем."""
+    rings = rings_from_session_state(state)
+    display: List[RingZone] = []
+    for ring in rings:
+        copy = dict(ring)
+        if float(copy.get("y", 0.0)) > 0.0:
+            copy["configured"] = True
+        display.append(copy)
+    return display
 
 
 def rings_from_session_state(state: Dict[str, Any]) -> List[RingZone]:
@@ -680,48 +830,53 @@ def rings_from_session_state(state: Dict[str, Any]) -> List[RingZone]:
             "x": float(state["ring1_x"]),
             "y": float(state["ring1_y"]),
             "half_width": float(state["ring1_r"]),
+            "configured": bool(state.get("ring1_configured")),
         },
         {
             "x": float(state["ring2_x"]),
             "y": float(state["ring2_y"]),
             "half_width": float(state["ring2_r"]),
+            "configured": bool(state.get("ring2_configured")),
         },
     ]
+
+
+def describe_ring_state_for_debug(state: Dict[str, Any]) -> str:
+    r1, r2 = ring_configuration_status(state)
+    return (
+        f"ring1_configured={r1}, ring1_x/y/r=({state.get('ring1_x')}, {state.get('ring1_y')}, {state.get('ring1_r')}); "
+        f"ring2_configured={r2}, ring2_x/y/r=({state.get('ring2_x')}, {state.get('ring2_y')}, {state.get('ring2_r')})"
+    )
 
 
 def prepare_rings_for_drawing(
     rings: List[RingZone], frame_w: int, frame_h: int
 ) -> Tuple[List[RingZone], List[str]]:
-    """Нормализует координаты колец и формирует предупреждения о вырожденных линиях."""
+    """Нормализует координаты колец; «не задано» — только если configured=False."""
     warnings: List[str] = []
     prepared: List[RingZone] = []
     if not rings:
         warnings.append("Зоны колец не заданы — линии не рисуются.")
         return prepared, warnings
 
-    both_at_origin = len(rings) >= 2 and all(
-        float(r.get("x", 0.0)) == 0.0 and float(r.get("y", 0.0)) == 0.0 for r in rings[:2]
-    )
+    if not any(bool(r.get("configured", True)) for r in rings):
+        warnings.append(
+            "Кольца не заданы пользователем (ring1_configured и ring2_configured = False) — линии не рисуются."
+        )
+        return prepared, warnings
 
     for idx, ring in enumerate(rings):
+        label = f"Кольцо {idx + 1}"
+        configured = bool(ring.get("configured", True))
+        if not configured:
+            continue
+
         x = float(ring.get("x", 0.0))
         y = float(ring.get("y", 0.0))
-        half_w = float(ring.get("half_width", ring.get("r", 0.0)))
-        label = f"Кольцо {idx + 1}"
-
-        degenerate = both_at_origin or half_w <= 0.0 or (x == 0.0 and y == 0.0)
-        if degenerate and y > 0.0:
-            half_w = max(half_w, frame_w * 0.2)
-            x = frame_w / 2.0
-            warnings.append(
-                f"{label}: вырожденная линия (X={int(ring.get('x', 0))}, полуширина={int(half_w)}) — "
-                f"fallback: горизонталь на всю ширину кадра по Y={int(y)}."
-            )
-        elif degenerate or y <= 0.0:
-            warnings.append(
-                f"{label}: не задано или Y=0 (X={int(x)}, Y={int(y)}, полуширина={int(half_w)}) — линия пропущена."
-            )
-            continue
+        half_w = float(ring.get("half_width", ring.get("r", 40.0)))
+        if half_w <= 0.0:
+            half_w = 40.0
+            warnings.append(f"{label}: полуширина была 0 — использован fallback {int(half_w)} px.")
 
         half_w = max(half_w, 5.0)
         x = float(np.clip(x, 0, max(frame_w - 1, 0)))
@@ -777,12 +932,7 @@ def draw_hoop_lines_on_frame(
         )
         label = f"Кольцо {idx + 1}"
         label_pos = (max(center_x - 55, 4), max(line_y - 28, 24))
-        cv2.putText(
-            frame, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 5, cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2, cv2.LINE_AA,
-        )
+        draw_text_on_bgr(frame, label, label_pos, font_size=22, color_bgr=color, outline_bgr=(0, 0, 0), outline_width=3)
     return frame
 
 
@@ -791,7 +941,7 @@ def test_draw_hoop_lines_on_frame() -> bool:
     if cv2 is None:
         return True
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    rings = [{"x": 320.0, "y": 120.0, "half_width": 80.0}]
+    rings = [{"x": 320.0, "y": 120.0, "half_width": 80.0, "configured": True}]
     draw_hoop_lines_on_frame(frame, rings)
     line_y = 120
     segment = frame[line_y, 240:401]
@@ -1026,8 +1176,10 @@ def draw_zones_preview(
             outline_thickness=HOOP_LINE_OUTLINE_THICKNESS,
         )
         label_pos = (max(center_x - 45, 0), max(line_y - 18, 20))
-        cv2.putText(preview, f"Кольцо {idx + 1}", label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(preview, f"Кольцо {idx + 1}", label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+        draw_text_on_bgr(
+            preview, f"Кольцо {idx + 1}", label_pos, font_size=20, color_bgr=color,
+            outline_bgr=(0, 0, 0), outline_width=3,
+        )
 
     if possession_threshold and possession_threshold > 0:
         h, w = preview.shape[:2]
@@ -1039,9 +1191,10 @@ def draw_zones_preview(
         preview = cv2.addWeighted(overlay, 0.18, preview, 0.82, 0)
         cv2.circle(preview, hint_center, r, (0, 255, 0), 2, lineType=cv2.LINE_AA)
         label = f"Порог владения: {r}px"
-        cv2.putText(
-            preview, label, (min(margin - r, w - 10), max(h - margin - r - 10, 20)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA,
+        draw_text_on_bgr(
+            preview, label,
+            (min(margin - r, w - 10), max(h - margin - r - 10, 20)),
+            font_size=18, color_bgr=(0, 255, 0), outline_bgr=(0, 0, 0), outline_width=2,
         )
     return preview
 
@@ -1649,97 +1802,192 @@ def read_jersey_number_from_box(
     return best_num
 
 
+@dataclass
+class _DetectionFeatures:
+    raw_id: int
+    box: Tuple[float, float, float, float]
+    center: Tuple[float, float]
+    hist: Optional[np.ndarray]
+    emb: Optional[np.ndarray]
+    jersey: Optional[str]
+    area: float
+
+
+@dataclass
+class _TrackProfile:
+    canonical_id: int
+    histogram: Optional[np.ndarray] = None
+    embedding: Optional[np.ndarray] = None
+    jersey_number: Optional[str] = None
+    last_center: Tuple[float, float] = (0.0, 0.0)
+    last_box: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    velocity: Tuple[float, float] = (0.0, 0.0)
+    last_seen_frame: int = -1
+
+
 class AppearanceMerger:
-    """Post-process поверх ByteTrack: OCR номера → ReID + HSV-гистограмма майки."""
+    """Стабилизация ID поверх ByteTrack: motion + ReID/HSV + OCR, анти-swap при пересечении."""
 
     def __init__(
         self,
         similarity_threshold: float = APPEARANCE_SIMILARITY_DEFAULT,
         lost_buffer_frames: int = APPEARANCE_LOST_BUFFER_FRAMES,
         jersey_ocr_enabled: bool = JERSEY_OCR_ENABLED_DEFAULT,
+        min_person_bbox_area: float = MIN_PERSON_BBOX_AREA_DEFAULT,
+        motion_max_px: float = APPEARANCE_MOTION_MAX_PX,
     ) -> None:
         self.similarity_threshold = similarity_threshold
         self.lost_buffer_frames = lost_buffer_frames
         self.jersey_ocr_enabled = jersey_ocr_enabled
-        self.raw_to_canonical: Dict[int, int] = {}
-        self.histograms: Dict[int, np.ndarray] = {}
-        self.embeddings: Dict[int, np.ndarray] = {}
-        self.jersey_numbers: Dict[int, str] = {}
-        self.last_seen: Dict[int, int] = {}
-        self.active_canonical: set = set()
+        self.min_person_bbox_area = float(min_person_bbox_area)
+        self.motion_max_px = float(motion_max_px)
+        self.profiles: Dict[int, _TrackProfile] = {}
+        self.prev_active_ids: List[int] = []
+        self._next_synthetic_id = 50_000
         self.merge_log: List[Dict[str, Any]] = []
 
-    def _update_histogram(self, canonical_id: int, hist: np.ndarray) -> None:
-        prev = self.histograms.get(canonical_id)
-        if prev is None:
-            self.histograms[canonical_id] = hist.copy()
-        else:
-            alpha = APPEARANCE_HIST_EMA_ALPHA
-            self.histograms[canonical_id] = (1.0 - alpha) * prev + alpha * hist
+    def _allocate_new_id(self, raw_id: int) -> int:
+        if raw_id not in self.profiles:
+            return int(raw_id)
+        while self._next_synthetic_id in self.profiles:
+            self._next_synthetic_id += 1
+        cid = self._next_synthetic_id
+        self._next_synthetic_id += 1
+        return cid
 
-    def _update_embedding(self, canonical_id: int, emb: np.ndarray) -> None:
-        prev = self.embeddings.get(canonical_id)
-        if prev is None:
-            self.embeddings[canonical_id] = emb.copy()
-        else:
-            alpha = APPEARANCE_HIST_EMA_ALPHA
-            merged = (1.0 - alpha) * prev + alpha * emb
-            norm = np.linalg.norm(merged)
-            if norm > 1e-6:
-                merged /= norm
-            self.embeddings[canonical_id] = merged.astype(np.float32)
+    def _jersey_compatible(self, det_jersey: Optional[str], stored: Optional[str]) -> bool:
+        if not det_jersey or not stored:
+            return True
+        return det_jersey == stored
 
-    def _combined_similarity(
+    def _appearance_similarity(
         self,
-        canonical_id: int,
+        profile: _TrackProfile,
         hist: Optional[np.ndarray],
         emb: Optional[np.ndarray],
     ) -> float:
         scores: List[float] = []
-        if hist is not None and canonical_id in self.histograms:
-            scores.append(histogram_similarity(hist, self.histograms[canonical_id]))
-        if emb is not None and canonical_id in self.embeddings:
-            scores.append(embedding_similarity(emb, self.embeddings[canonical_id]))
+        if hist is not None and profile.histogram is not None:
+            scores.append(histogram_similarity(hist, profile.histogram))
+        if emb is not None and profile.embedding is not None:
+            scores.append(embedding_similarity(emb, profile.embedding))
         if not scores:
             return -1.0
         return float(np.mean(scores))
 
-    def _match_lost_by_number(self, jersey_num: Optional[str], frame_idx: int) -> Optional[int]:
-        if not jersey_num:
-            return None
-        for canonical_id, stored in self.jersey_numbers.items():
-            if canonical_id in self.active_canonical:
-                continue
-            if stored != jersey_num:
-                continue
-            if frame_idx - self.last_seen.get(canonical_id, -10**9) > self.lost_buffer_frames:
-                continue
-            return canonical_id
-        return None
+    def _match_score(self, det: _DetectionFeatures, profile: _TrackProfile, frame_idx: int) -> float:
+        if not self._jersey_compatible(det.jersey, profile.jersey_number):
+            return -1.0
+        app = self._appearance_similarity(profile, det.hist, det.emb)
+        if app < 0:
+            app = 0.0
+        if profile.last_seen_frame >= 0 and frame_idx - profile.last_seen_frame <= 2 and app < APPEARANCE_SWAP_GATE:
+            return -1.0
+        dt = max(frame_idx - profile.last_seen_frame, 1)
+        pred_x = profile.last_center[0] + profile.velocity[0] * dt
+        pred_y = profile.last_center[1] + profile.velocity[1] * dt
+        dist = math.hypot(det.center[0] - pred_x, det.center[1] - pred_y)
+        diag = math.hypot(profile.last_box[2] - profile.last_box[0], profile.last_box[3] - profile.last_box[1])
+        max_dist = max(self.motion_max_px, diag * 1.6, 40.0)
+        motion = max(0.0, 1.0 - dist / max_dist)
+        return 0.65 * app + 0.35 * motion
 
-    def _match_lost(
+    def _greedy_assign(
         self,
-        hist: Optional[np.ndarray],
-        emb: Optional[np.ndarray],
+        detections: List[_DetectionFeatures],
+        candidate_ids: List[int],
         frame_idx: int,
-        jersey_num: Optional[str],
-    ) -> Optional[int]:
-        by_number = self._match_lost_by_number(jersey_num, frame_idx)
-        if by_number is not None:
-            return by_number
-        best_id: Optional[int] = None
-        best_sim = -1.0
-        for canonical_id in self.histograms.keys() | self.embeddings.keys():
-            if canonical_id in self.active_canonical:
+        min_score: float,
+    ) -> Dict[int, int]:
+        pairs: List[Tuple[float, int, int]] = []
+        for di, det in enumerate(detections):
+            for cid in candidate_ids:
+                profile = self.profiles.get(cid)
+                if profile is None:
+                    continue
+                score = self._match_score(det, profile, frame_idx)
+                if score >= min_score:
+                    pairs.append((score, di, cid))
+        pairs.sort(key=lambda item: item[0], reverse=True)
+        det_to_cid: Dict[int, int] = {}
+        used_dets: set = set()
+        used_cids: set = set()
+        for score, di, cid in pairs:
+            if di in used_dets or cid in used_cids:
                 continue
-            if frame_idx - self.last_seen.get(canonical_id, -10**9) > self.lost_buffer_frames:
-                continue
-            sim = self._combined_similarity(canonical_id, hist, emb)
-            threshold = max(self.similarity_threshold, REID_SIMILARITY_THRESHOLD - 0.08)
-            if sim >= threshold and sim > best_sim:
-                best_sim = sim
-                best_id = canonical_id
-        return best_id
+            det_to_cid[di] = cid
+            used_dets.add(di)
+            used_cids.add(cid)
+        return det_to_cid
+
+    def _correct_pair_swap(
+        self,
+        detections: List[_DetectionFeatures],
+        assignments: Dict[int, int],
+        frame_idx: int,
+    ) -> Dict[int, int]:
+        if len(detections) != 2 or len(assignments) != 2:
+            return assignments
+        di0, di1 = 0, 1
+        if di0 not in assignments or di1 not in assignments:
+            return assignments
+        c0, c1 = assignments[di0], assignments[di1]
+        p0, p1 = self.profiles[c0], self.profiles[c1]
+        direct = self._match_score(detections[di0], p0, frame_idx) + self._match_score(detections[di1], p1, frame_idx)
+        crossed = self._match_score(detections[di0], p1, frame_idx) + self._match_score(detections[di1], p0, frame_idx)
+        if crossed > direct + 0.04 and min(
+            self._match_score(detections[di0], p1, frame_idx),
+            self._match_score(detections[di1], p0, frame_idx),
+        ) >= APPEARANCE_SWAP_GATE:
+            assignments = {di0: c1, di1: c0}
+            self.merge_log.append(
+                {
+                    "Кадр": frame_idx,
+                    "Событие": "swap_corrected",
+                    "ID A": int(c0),
+                    "ID B": int(c1),
+                    "Причина": "внешность+движение",
+                }
+            )
+        return assignments
+
+    def _update_profile(
+        self,
+        canonical_id: int,
+        det: _DetectionFeatures,
+        frame_idx: int,
+    ) -> None:
+        profile = self.profiles.get(canonical_id)
+        if profile is None:
+            profile = _TrackProfile(canonical_id=canonical_id)
+            self.profiles[canonical_id] = profile
+        if det.hist is not None:
+            if profile.histogram is None:
+                profile.histogram = det.hist.copy()
+            else:
+                alpha = APPEARANCE_HIST_EMA_ALPHA
+                profile.histogram = (1.0 - alpha) * profile.histogram + alpha * det.hist
+        if det.emb is not None:
+            if profile.embedding is None:
+                profile.embedding = det.emb.copy()
+            else:
+                alpha = APPEARANCE_HIST_EMA_ALPHA
+                merged = (1.0 - alpha) * profile.embedding + alpha * det.emb
+                norm = np.linalg.norm(merged)
+                if norm > 1e-6:
+                    merged /= norm
+                profile.embedding = merged.astype(np.float32)
+        if det.jersey:
+            profile.jersey_number = det.jersey
+        dt = max(frame_idx - profile.last_seen_frame, 1)
+        if profile.last_seen_frame >= 0 and dt <= 30:
+            profile.velocity = (
+                (det.center[0] - profile.last_center[0]) / dt,
+                (det.center[1] - profile.last_center[1]) / dt,
+            )
+        profile.last_center = det.center
+        profile.last_box = det.box
+        profile.last_seen_frame = frame_idx
 
     def remap(
         self,
@@ -1747,38 +1995,74 @@ class AppearanceMerger:
         frame_bgr: Any,
         persons: List[Tuple[int, Tuple[float, float, float, float]]],
     ) -> List[Tuple[int, Tuple[float, float, float, float]]]:
-        self.active_canonical = set()
-        remapped: List[Tuple[int, Tuple[float, float, float, float]]] = []
+        detections: List[_DetectionFeatures] = []
         for raw_id, box in persons:
+            area = bbox_area(box)
+            if area < self.min_person_bbox_area:
+                continue
             hist = extract_jersey_histogram(frame_bgr, box)
             emb = extract_reid_embedding(frame_bgr, box)
-            jersey_num = read_jersey_number_from_box(frame_bgr, box) if self.jersey_ocr_enabled else None
-            if raw_id in self.raw_to_canonical:
-                canonical_id = self.raw_to_canonical[raw_id]
-            else:
-                canonical_id = self._match_lost(hist, emb, frame_idx, jersey_num)
-                if canonical_id is None:
-                    canonical_id = int(raw_id)
-                elif canonical_id != raw_id:
-                    reason = "номер" if jersey_num and self.jersey_numbers.get(canonical_id) == jersey_num else "внешность"
-                    self.merge_log.append(
-                        {
-                            "Кадр": frame_idx,
-                            "Новый ID трекера": int(raw_id),
-                            "Склеен с ID": int(canonical_id),
-                            "Причина": reason,
-                        }
-                    )
-                self.raw_to_canonical[raw_id] = canonical_id
-            if hist is not None:
-                self._update_histogram(canonical_id, hist)
-            if emb is not None:
-                self._update_embedding(canonical_id, emb)
-            if jersey_num:
-                self.jersey_numbers[canonical_id] = jersey_num
-            self.last_seen[canonical_id] = frame_idx
-            self.active_canonical.add(canonical_id)
-            remapped.append((canonical_id, box))
+            jersey = read_jersey_number_from_box(frame_bgr, box) if self.jersey_ocr_enabled else None
+            detections.append(
+                _DetectionFeatures(
+                    raw_id=int(raw_id),
+                    box=box,
+                    center=bbox_center(box),
+                    hist=hist,
+                    emb=emb,
+                    jersey=jersey,
+                    area=area,
+                )
+            )
+
+        prev_active = list(self.prev_active_ids)
+        match_min = max(self.similarity_threshold, APPEARANCE_MATCH_MIN)
+        assignments = self._greedy_assign(detections, prev_active, frame_idx, match_min)
+        assignments = self._correct_pair_swap(detections, assignments, frame_idx)
+
+        assigned_cids = set(assignments.values())
+        for di, det in enumerate(detections):
+            if di in assignments:
+                continue
+            lost_candidates = [
+                cid
+                for cid, profile in self.profiles.items()
+                if cid not in assigned_cids
+                and cid not in prev_active
+                and frame_idx - profile.last_seen_frame <= self.lost_buffer_frames
+            ]
+            lost_assign = self._greedy_assign([det], lost_candidates, frame_idx, match_min)
+            if lost_assign:
+                assignments[di] = lost_assign[0]
+                assigned_cids.add(lost_assign[0])
+                self.merge_log.append(
+                    {
+                        "Кадр": frame_idx,
+                        "Событие": "reid_after_lost",
+                        "Новый ID трекера": int(det.raw_id),
+                        "Склеен с ID": int(lost_assign[0]),
+                    }
+                )
+
+        remapped: List[Tuple[int, Tuple[float, float, float, float]]] = []
+        active_this_frame: List[int] = []
+        for di, det in enumerate(detections):
+            canonical_id = assignments.get(di)
+            if canonical_id is None:
+                canonical_id = self._allocate_new_id(det.raw_id)
+                self.merge_log.append(
+                    {
+                        "Кадр": frame_idx,
+                        "Событие": "new_id",
+                        "ID трекера ByteTrack": int(det.raw_id),
+                        "Назначен ID": int(canonical_id),
+                    }
+                )
+            self._update_profile(canonical_id, det, frame_idx)
+            active_this_frame.append(canonical_id)
+            remapped.append((canonical_id, det.box))
+
+        self.prev_active_ids = active_this_frame
         return remapped
 
 
@@ -1970,6 +2254,7 @@ def quick_player_scan(
     imgsz: int = IMGSZ_DEFAULT,
     appearance_similarity: float = APPEARANCE_SIMILARITY_DEFAULT,
     jersey_ocr_enabled: bool = JERSEY_OCR_ENABLED_DEFAULT,
+    min_person_bbox_area: float = MIN_PERSON_BBOX_AREA_DEFAULT,
     progress_callback: Optional[Callable[[float], Any]] = None,
     status_callback: Optional[Callable[[str], Any]] = None,
 ) -> Tuple[Dict[int, Any], List[Dict[str, Any]]]:
@@ -1991,6 +2276,7 @@ def quick_player_scan(
     appearance = AppearanceMerger(
         similarity_threshold=appearance_similarity,
         jersey_ocr_enabled=jersey_ocr_enabled,
+        min_person_bbox_area=min_person_bbox_area,
     )
 
     cap = cv2.VideoCapture(video_path)
@@ -2094,6 +2380,7 @@ def process_video(
     color_roi_half: int = BALL_COLOR_ROI_HALF_DEFAULT,
     appearance_similarity: float = APPEARANCE_SIMILARITY_DEFAULT,
     jersey_ocr_enabled: bool = JERSEY_OCR_ENABLED_DEFAULT,
+    min_person_bbox_area: float = MIN_PERSON_BBOX_AREA_DEFAULT,
     excluded_player_ids: Optional[set] = None,
     camera_transforms: Optional[List[np.ndarray]] = None,
     ring_reference_frame_idx: int = 0,
@@ -2158,6 +2445,7 @@ def process_video(
     appearance_merger = AppearanceMerger(
         similarity_threshold=appearance_similarity,
         jersey_ocr_enabled=jersey_ocr_enabled,
+        min_person_bbox_area=min_person_bbox_area,
     )
     excluded_ids: set = set(excluded_player_ids or [])
     ring_draw_warnings: List[str] = []
@@ -2481,9 +2769,11 @@ def init_session_state() -> None:
         "ring1_x": 0.0,
         "ring1_y": 0.0,
         "ring1_r": 40.0,
+        "ring1_configured": False,
         "ring2_x": 0.0,
         "ring2_y": 0.0,
         "ring2_r": 40.0,
+        "ring2_configured": False,
         "possession_threshold": float(POSSESSION_THRESHOLD_DEFAULT),
         "pass_min_frames": int(PASS_MIN_FRAMES_DEFAULT),
         "pass_max_frames": int(PASS_MAX_FRAMES_DEFAULT),
@@ -2513,6 +2803,7 @@ def init_session_state() -> None:
         "excluded_player_ids": [],
         "appearance_similarity": float(APPEARANCE_SIMILARITY_DEFAULT),
         "jersey_ocr_enabled": JERSEY_OCR_ENABLED_DEFAULT,
+        "min_person_bbox_area": int(MIN_PERSON_BBOX_AREA_DEFAULT),
         "id_merge_log": [],
     }
     for key, value in defaults.items():
@@ -2523,6 +2814,8 @@ def reset_for_new_video() -> None:
     """Сбрасывает всё, что зависит от конкретного видео (при загрузке нового)."""
     for key in (
         "rings_initialized_for",
+        "ring1_configured",
+        "ring2_configured",
         "player_crops",
         "player_names",
         "player_numbers",
@@ -2542,8 +2835,21 @@ def reset_for_new_video() -> None:
             st.session_state[key] = []
         elif key == "id_merge_log":
             st.session_state[key] = []
+        elif key in ("ring1_configured", "ring2_configured"):
+            st.session_state[key] = False
         else:
             st.session_state[key] = None
+    for widget_key in list(st.session_state.keys()):
+        if str(widget_key).startswith("wi_ring"):
+            del st.session_state[widget_key]
+
+
+def _make_ring_widget_change_handler(ring_num: int):
+    def _handler() -> None:
+        st.session_state[f"ring{ring_num}_configured"] = True
+        sync_ring_widgets_to_canonical(st.session_state, ring_num)
+
+    return _handler
 
 
 def go_to_step(step: int) -> None:
@@ -2649,18 +2955,10 @@ def render_step2_zones(device: str) -> None:
     meta = get_video_metadata(video_path)
 
     if st.session_state.get("rings_initialized_for") != video_path:
-        ring1, ring2 = default_ring_zones(int(meta["width"]), int(meta["height"]))
-        st.session_state["ring1_x"], st.session_state["ring1_y"], st.session_state["ring1_r"] = (
-            int(ring1["x"]),
-            int(ring1["y"]),
-            int(ring1.get("half_width", ring1.get("r", 40))),
-        )
-        st.session_state["ring2_x"], st.session_state["ring2_y"], st.session_state["ring2_r"] = (
-            int(ring2["x"]),
-            int(ring2["y"]),
-            int(ring2.get("half_width", ring2.get("r", 40))),
-        )
+        apply_default_ring_positions(st.session_state, int(meta["width"]), int(meta["height"]))
         st.session_state["rings_initialized_for"] = video_path
+    init_ring_widget_keys(st.session_state, 1)
+    init_ring_widget_keys(st.session_state, 2)
 
     max_t = max(meta["duration"] - 0.05, 0.0)
     st.session_state["preview_time"] = st.slider(
@@ -2697,14 +2995,14 @@ def render_step2_zones(device: str) -> None:
         )
 
     st.subheader("🎯 Линии обоих колец")
+    st.info(
+        "**Инструкция:** выберите «Кольцо 1» и **кликните по ободу кольца** на превью "
+        "(центр линии и её Y). Затем переключитесь на «Кольцо 2» и повторите. "
+        "Полуширину линии можно подправить числовыми полями ниже."
+    )
     if streamlit_image_coordinates is not None and cv2 is not None:
-        st.caption(
-            "Кликните по превью, чтобы задать центр и Y горизонтальной линии выбранного кольца "
-            "(линия рисуется горизонтально через заданную полуширину), либо используйте "
-            "числовые поля ниже для точной донастройки."
-        )
         st.session_state["click_target_ring"] = st.radio(
-            "Клик по превью ставит линию кольца:", ["Кольцо 1", "Кольцо 2"],
+            "Сейчас клик по превью задаёт:", ["Кольцо 1", "Кольцо 2"],
             horizontal=True, key="click_target_ring_radio",
             index=0 if st.session_state.get("click_target_ring", "Кольцо 1") == "Кольцо 1" else 1,
         )
@@ -2727,18 +3025,7 @@ def render_step2_zones(device: str) -> None:
     # ещё разрешена. Сам st.rerun() при этом откладывается флагом
     # ring_click_triggered_rerun до конца функции — см. комментарий там.
     if frame is not None:
-        rings = [
-            {
-                "x": st.session_state["ring1_x"],
-                "y": st.session_state["ring1_y"],
-                "half_width": st.session_state["ring1_r"],
-            },
-            {
-                "x": st.session_state["ring2_x"],
-                "y": st.session_state["ring2_y"],
-                "half_width": st.session_state["ring2_r"],
-            },
-        ]
+        rings = rings_for_preview_display(st.session_state)
         preview_bgr = draw_zones_preview(frame, rings, possession_threshold=st.session_state["possession_threshold"])
         preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
 
@@ -2755,14 +3042,31 @@ def render_step2_zones(device: str) -> None:
                     scale_y = meta["height"] / disp_h if disp_h else 1.0
                     orig_x = int(np.clip(click_value["x"] * scale_x, 0, meta["width"]))
                     orig_y = int(np.clip(click_value["y"] * scale_y, 0, meta["height"]))
-                    target = "ring1" if st.session_state["click_target_ring"] == "Кольцо 1" else "ring2"
-                    st.session_state[f"{target}_x"] = orig_x
-                    st.session_state[f"{target}_y"] = orig_y
+                    ring_num = 1 if st.session_state["click_target_ring"] == "Кольцо 1" else 2
+                    mark_ring_configured(st.session_state, ring_num, orig_x, orig_y)
                     ring_click_triggered_rerun = True
         else:
             st.image(preview_rgb, caption="Превью с зонами колец", use_container_width=True)
     else:
         st.error("Не удалось прочитать кадр из видео для превью.")
+
+    status_cols = st.columns(2)
+    with status_cols[0]:
+        if st.session_state.get("ring1_configured"):
+            st.success(
+                f"✅ **Кольцо 1 задано:** X={int(st.session_state['ring1_x'])}, "
+                f"линия Y={int(st.session_state['ring1_y'])}, полуширина={int(st.session_state['ring1_r'])} px"
+            )
+        else:
+            st.caption("Кольцо 1: кликните по превью или введите координаты вручную.")
+    with status_cols[1]:
+        if st.session_state.get("ring2_configured"):
+            st.success(
+                f"✅ **Кольцо 2 задано:** X={int(st.session_state['ring2_x'])}, "
+                f"линия Y={int(st.session_state['ring2_y'])}, полуширина={int(st.session_state['ring2_r'])} px"
+            )
+        else:
+            st.caption("Кольцо 2: кликните по превью или введите координаты вручную.")
 
     # ПРИМЕЧАНИЕ: у number_input ниже key совпадает с именем переменной в
     # session_state (например key="ring1_x" для st.session_state["ring1_x"]),
@@ -2781,29 +3085,35 @@ def render_step2_zones(device: str) -> None:
     with col1:
         st.markdown("**Кольцо №1**")
         st.number_input(
-            "X1 (px)", min_value=0, max_value=int(meta["width"]), value=int(st.session_state["ring1_x"]), key="ring1_x"
+            "X1 (px)", min_value=0, max_value=int(meta["width"]), key="wi_ring1_x",
+            on_change=_make_ring_widget_change_handler(1),
         )
         st.number_input(
-            "Y1 (px)", min_value=0, max_value=int(meta["height"]), value=int(st.session_state["ring1_y"]), key="ring1_y"
+            "Y1 (px)", min_value=0, max_value=int(meta["height"]), key="wi_ring1_y",
+            on_change=_make_ring_widget_change_handler(1),
         )
         st.number_input(
             "Полуширина линии 1 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
-            value=int(st.session_state["ring1_r"]), key="ring1_r",
+            key="wi_ring1_r", on_change=_make_ring_widget_change_handler(1),
             help="Половина длины горизонтального отрезка линии кольца (от центра влево/вправо).",
         )
     with col2:
         st.markdown("**Кольцо №2**")
         st.number_input(
-            "X2 (px)", min_value=0, max_value=int(meta["width"]), value=int(st.session_state["ring2_x"]), key="ring2_x"
+            "X2 (px)", min_value=0, max_value=int(meta["width"]), key="wi_ring2_x",
+            on_change=_make_ring_widget_change_handler(2),
         )
         st.number_input(
-            "Y2 (px)", min_value=0, max_value=int(meta["height"]), value=int(st.session_state["ring2_y"]), key="ring2_y"
+            "Y2 (px)", min_value=0, max_value=int(meta["height"]), key="wi_ring2_y",
+            on_change=_make_ring_widget_change_handler(2),
         )
         st.number_input(
             "Полуширина линии 2 (px)", min_value=5, max_value=int(max(meta["width"], meta["height"])),
-            value=int(st.session_state["ring2_r"]), key="ring2_r",
+            key="wi_ring2_r", on_change=_make_ring_widget_change_handler(2),
             help="Половина длины горизонтального отрезка линии кольца (от центра влево/вправо).",
         )
+    sync_ring_widgets_to_canonical(st.session_state, 1)
+    sync_ring_widgets_to_canonical(st.session_state, 2)
 
     colcal1, colcal2 = st.columns([3, 1])
     with colcal1:
@@ -2944,14 +3254,22 @@ def render_step2_zones(device: str) -> None:
             help="Окно поиска оранжевого blob вокруг последней позиции мяча.",
         )
 
+    st.session_state["min_person_bbox_area"] = st.slider(
+        "Мин. площадь bbox игрока (px², 0 = не фильтровать)",
+        min_value=MIN_PERSON_BBOX_AREA_MIN,
+        max_value=MIN_PERSON_BBOX_AREA_MAX,
+        value=int(st.session_state.get("min_person_bbox_area", MIN_PERSON_BBOX_AREA_DEFAULT)),
+        step=16,
+        help="Отбрасывает слишком мелкие рамки после трекинга. 0 — оставлять дальних/мелких игроков.",
+    )
     st.session_state["appearance_similarity"] = st.slider(
         "Порог похожести игроков (склейка ID)",
         min_value=APPEARANCE_SIMILARITY_MIN,
         max_value=APPEARANCE_SIMILARITY_MAX,
         value=float(st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)),
         step=0.01,
-        help="Чем выше — тем агрессивнее ByteTrack-ID склеиваются по ReID/цвету майки, если игрок "
-        "временно пропал из кадра. Снижайте, если разных игроков ошибочно объединяет.",
+        help="Гейт ReID/цвета при пересечении и повторном появлении. Снижайте, если ID слишком часто "
+        "дробятся; повышайте, если при пересечении ID всё ещё путаются.",
     )
     st.session_state["jersey_ocr_enabled"] = st.checkbox(
         "На форме есть номера (EasyOCR)",
@@ -2976,12 +3294,18 @@ def render_step2_zones(device: str) -> None:
             "трекеру на видео низкого разрешения, ценой более медленной обработки."
         )
 
+    rings_ready = any_ring_configured(st.session_state)
+    if not rings_ready:
+        st.warning("Задайте **хотя бы одно кольцо** кликом по превью или числовыми полями, чтобы перейти дальше.")
+
     colA, colB = st.columns(2)
     with colA:
         if st.button("← Назад к загрузке"):
             go_to_step(1)
     with colB:
-        if st.button("Далее → Сопоставление игроков", type="primary"):
+        if st.button("Далее → Сопоставление игроков", type="primary", disabled=not rings_ready):
+            sync_ring_widgets_to_canonical(st.session_state, 1)
+            sync_ring_widgets_to_canonical(st.session_state, 2)
             go_to_step(3)
 
     # Отложенный rerun после клика по превью (см. комментарий у
@@ -3045,6 +3369,7 @@ def render_step3_players(device: str) -> None:
                     st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)
                 ),
                 jersey_ocr_enabled=bool(st.session_state.get("jersey_ocr_enabled", JERSEY_OCR_ENABLED_DEFAULT)),
+                min_person_bbox_area=float(st.session_state.get("min_person_bbox_area", MIN_PERSON_BBOX_AREA_DEFAULT)),
                 progress_callback=scan_progress.progress,
                 status_callback=scan_status.caption,
             )
@@ -3187,6 +3512,17 @@ def run_full_analysis(video_path: str, device: str) -> None:
     ensure_directories()
     ensure_tracker_config()
     ensure_ring_zones_for_video(video_path, st.session_state)
+    sync_ring_widgets_to_canonical(st.session_state, 1)
+    sync_ring_widgets_to_canonical(st.session_state, 2)
+
+    if not any_ring_configured(st.session_state):
+        st.error(
+            "Кольца не заданы: ни ring1_configured, ни ring2_configured не установлены в True. "
+            f"Текущее состояние: {describe_ring_state_for_debug(st.session_state)}"
+        )
+        if st.button("← Вернуться к шагу 2 (зоны и пороги)", type="primary"):
+            go_to_step(2)
+        return
 
     model, model_error = load_model(device)
     if model is None:
@@ -3201,9 +3537,17 @@ def run_full_analysis(video_path: str, device: str) -> None:
 
     video_meta = get_video_metadata(video_path)
     rings = rings_from_session_state(st.session_state)
-    _, ring_preview_warnings = prepare_rings_for_drawing(
+    prepared_rings, ring_preview_warnings = prepare_rings_for_drawing(
         rings, int(video_meta["width"]), int(video_meta["height"])
     )
+    if not prepared_rings:
+        st.error(
+            "Не удалось подготовить линии колец для отрисовки. "
+            f"Состояние: {describe_ring_state_for_debug(st.session_state)}"
+        )
+        if st.button("← Вернуться к шагу 2", key="back_step2_ring_error"):
+            go_to_step(2)
+        return
     for warn in ring_preview_warnings:
         st.warning(f"⚠️ {warn}")
 
@@ -3249,6 +3593,7 @@ def run_full_analysis(video_path: str, device: str) -> None:
                 st.session_state.get("appearance_similarity", APPEARANCE_SIMILARITY_DEFAULT)
             ),
             jersey_ocr_enabled=bool(st.session_state.get("jersey_ocr_enabled", JERSEY_OCR_ENABLED_DEFAULT)),
+            min_person_bbox_area=float(st.session_state.get("min_person_bbox_area", MIN_PERSON_BBOX_AREA_DEFAULT)),
             excluded_player_ids=set(st.session_state.get("excluded_player_ids") or []),
             camera_transforms=camera_transforms,
             ring_reference_frame_idx=ring_reference_frame_idx,
