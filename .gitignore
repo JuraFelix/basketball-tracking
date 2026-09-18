@@ -22,3 +22,6 @@ highlights/*.mp4
 output_videos/*.mp4
 !highlights/.gitkeep
 !output_videos/.gitkeep
+
+# Накопление разметки мяча для будущего fine-tuning (не коммитить)
+training_seeds/

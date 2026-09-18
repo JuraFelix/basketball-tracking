@@ -39,6 +39,7 @@ Basketball Tracking Analytics
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -117,6 +118,9 @@ except Exception as exc:  # pragma: no cover - защита от отсутст�
 BASE_DIR = Path(__file__).resolve().parent
 HIGHLIGHTS_DIR = BASE_DIR / "highlights"
 OUTPUT_DIR = BASE_DIR / "output_videos"
+TRAINING_SEEDS_DIR = BASE_DIR / "training_seeds"
+BALL_LABELS_JSONL = TRAINING_SEEDS_DIR / "ball_labels.jsonl"
+BALL_TRAINING_CROPS_DIR = TRAINING_SEEDS_DIR / "crops"
 TRACKER_CONFIG_PATH = BASE_DIR / "custom_bytetrack.yaml"
 
 # Самая точная модель семейства YOLO11. Официальное имя весов в Ultralytics —
@@ -248,6 +252,7 @@ BALL_PREVIEW_COLOR_BGR = (0, 140, 255)
 BALL_PREVIEW_INTERP_COLOR_BGR = (0, 200, 255)
 CLICK_TARGET_OPTIONS = ("Кольцо 1", "Кольцо 2", "Мяч")
 BALL_ANCHORS_MIN_RECOMMENDED = 2
+BALL_INTERP_CHECKS_PER_GAP = 3
 # Яркая траектория мяча на аннотированном видео (BGR) + чёрная обводка.
 BALL_TRAJECTORY_COLOR_BGR = (0, 255, 255)
 BALL_TRAJECTORY_THICKNESS = 6
@@ -333,6 +338,14 @@ def ensure_directories() -> None:
     """Создаёт папки highlights/ и output_videos/, если их ещё нет."""
     HIGHLIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_training_seeds_dir() -> None:
+    """Создаёт training_seeds/ для накопления разметки мяча (не для git)."""
+    TRAINING_SEEDS_DIR.mkdir(parents=True, exist_ok=True)
+    BALL_TRAINING_CROPS_DIR.mkdir(parents=True, exist_ok=True)
+    if not BALL_LABELS_JSONL.exists():
+        BALL_LABELS_JSONL.write_text("", encoding="utf-8")
 
 
 def clear_highlights_directory() -> None:
@@ -960,6 +973,179 @@ def interpolate_ball_position(
     return None
 
 
+def suggest_ball_interp_check_frames(
+    anchors: Optional[List[Any]],
+    max_per_gap: int = BALL_INTERP_CHECKS_PER_GAP,
+) -> List[int]:
+    """1–3 равномерно распределённых кадра между соседними якорями для проверки интерполяции."""
+    sorted_anchors = normalize_ball_anchors(anchors)
+    if len(sorted_anchors) < 2:
+        return []
+    frames: List[int] = []
+    for i in range(len(sorted_anchors) - 1):
+        f0 = int(sorted_anchors[i]["frame"])
+        f1 = int(sorted_anchors[i + 1]["frame"])
+        gap = f1 - f0
+        if gap <= 1:
+            continue
+        n_checks = min(max_per_gap, gap - 1, 3)
+        for j in range(1, n_checks + 1):
+            frame = int(round(f0 + j * gap / (n_checks + 1)))
+            if f0 < frame < f1:
+                frames.append(frame)
+    return frames
+
+
+def get_pending_ball_interp_checks(
+    anchors: Optional[List[Any]],
+    skipped_frames: Optional[List[int]] = None,
+) -> List[int]:
+    """Кадры для проверки интерполяции: предложены, но ещё не якорь и не пропущены."""
+    anchor_frames = {int(a["frame"]) for a in normalize_ball_anchors(anchors)}
+    skipped = {int(f) for f in (skipped_frames or [])}
+    return [
+        frame
+        for frame in suggest_ball_interp_check_frames(anchors)
+        if frame not in anchor_frames and frame not in skipped
+    ]
+
+
+def append_ball_training_seed(
+    video_path: Optional[str],
+    video_name: Optional[str],
+    frame_idx: int,
+    x: float,
+    y: float,
+    frame_bgr: Any,
+    source: str = "user_click",
+) -> None:
+    """Дописывает разметку мяча в training_seeds/ (jsonl + кроп) для будущего обучения."""
+    if cv2 is None or frame_bgr is None or frame_bgr.size == 0:
+        return
+    ensure_training_seeds_dir()
+    h, w = frame_bgr.shape[:2]
+    half = BALL_DEFAULT_BBOX_HALF
+    x1 = max(int(round(x)) - half, 0)
+    y1 = max(int(round(y)) - half, 0)
+    x2 = min(int(round(x)) + half, w)
+    y2 = min(int(round(y)) + half, h)
+    crop = frame_bgr[y1:y2, x1:x2]
+    stem = Path(video_path or "video").stem
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    crop_name = f"{stem}_f{int(frame_idx)}_{stamp}.jpg"
+    crop_path = BALL_TRAINING_CROPS_DIR / crop_name
+    if crop.size > 0:
+        cv2.imwrite(str(crop_path), crop)
+    record = {
+        "frame_idx": int(frame_idx),
+        "center": [float(x), float(y)],
+        "xyxy": [float(x1), float(y1), float(x2), float(y2)],
+        "video_path": str(video_path or ""),
+        "video_name": str(video_name or stem),
+        "crop_path": str(crop_path.relative_to(BASE_DIR)),
+        "source": source,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(BALL_LABELS_JSONL, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def make_id_resolver(manual_id_map: Optional[Dict[int, int]]) -> Callable[[int], int]:
+    """Возвращает функцию raw_tracker_id → канонический ID (с учётом цепочек склейки)."""
+    mapping = {int(k): int(v) for k, v in (manual_id_map or {}).items()}
+
+    def resolve(player_id: int) -> int:
+        current = int(player_id)
+        seen: set = set()
+        while current in mapping:
+            if current in seen:
+                break
+            seen.add(current)
+            current = mapping[current]
+        return current
+
+    return resolve
+
+
+def build_id_former_labels(manual_id_map: Optional[Dict[int, int]]) -> Dict[int, List[int]]:
+    """Канонический ID → список бывших raw ID для подписи на видео (=б. 12)."""
+    resolve = make_id_resolver(manual_id_map)
+    labels: Dict[int, List[int]] = {}
+    for raw_id in (manual_id_map or {}):
+        canonical = resolve(int(raw_id))
+        if int(raw_id) != canonical:
+            labels.setdefault(canonical, []).append(int(raw_id))
+    for canonical in labels:
+        labels[canonical] = sorted(set(labels[canonical]))
+    return labels
+
+
+def apply_manual_id_merge(state: Dict[str, Any], canonical_id: int, source_ids: List[int]) -> None:
+    """Склеивает выбранные tracker ID в один канонический (шаг 3)."""
+    canonical = int(canonical_id)
+    manual_map = {int(k): int(v) for k, v in (state.get("manual_id_map") or {}).items()}
+    merged_sources: List[int] = []
+    for sid in source_ids:
+        sid = int(sid)
+        if sid == canonical:
+            continue
+        manual_map[sid] = canonical
+        merged_sources.append(sid)
+        for raw_id, target in list(manual_map.items()):
+            if target == sid:
+                manual_map[raw_id] = canonical
+    resolve = make_id_resolver(manual_map)
+    flattened = {raw_id: resolve(raw_id) for raw_id in manual_map if resolve(raw_id) != raw_id}
+    state["manual_id_map"] = flattened
+    if not merged_sources:
+        return
+    merge_log = list(state.get("manual_id_merge_log") or [])
+    merge_log.append({"Канонический ID": canonical, "Объединены ID": sorted(merged_sources)})
+    state["manual_id_merge_log"] = merge_log
+    crops = dict(state.get("player_crops") or {})
+    names = dict(state.get("player_names") or {})
+    numbers = dict(state.get("player_numbers") or {})
+    for sid in merged_sources:
+        if sid in crops and canonical not in crops:
+            crops[canonical] = crops[sid]
+        if (names.get(sid) or "").strip() and not (names.get(canonical) or "").strip():
+            names[canonical] = names[sid]
+        if (numbers.get(sid) or "").strip() and not (numbers.get(canonical) or "").strip():
+            numbers[canonical] = numbers[sid]
+    state["player_crops"] = crops
+    state["player_names"] = names
+    state["player_numbers"] = numbers
+
+
+def lookup_player_meta(
+    canonical_id: int,
+    player_names: Optional[Dict[int, str]],
+    player_numbers: Optional[Dict[int, str]],
+    manual_id_map: Optional[Dict[int, int]] = None,
+) -> Tuple[str, str]:
+    """Имя/номер для канонического ID с учётом бывших raw ID после ручной склейки."""
+    names = player_names or {}
+    numbers = player_numbers or {}
+    resolve = make_id_resolver(manual_id_map)
+    candidates = [int(canonical_id)]
+    for raw_id in (manual_id_map or {}):
+        if resolve(int(raw_id)) == int(canonical_id):
+            candidates.append(int(raw_id))
+    name = ""
+    for cid in candidates:
+        n = (names.get(cid) or "").strip()
+        if n:
+            name = n
+            break
+    number = ""
+    for cid in candidates:
+        n = (numbers.get(cid) or "").strip()
+        if n:
+            number = n
+            break
+    return name, number
+
+
 def get_camera_transforms_cached(
     video_path: str,
     state: Dict[str, Any],
@@ -1110,6 +1296,29 @@ def draw_text_on_bgr(
                     draw.text((x + dx, top_y + dy), text, font=font, fill=outline_rgb)
     draw.text((x, top_y), text, font=font, fill=rgb)
     img_bgr[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
+def draw_ball_interp_check_marker(preview: Any, x: float, y: float) -> None:
+    """Яркий маркер предсказанной интерполированной позиции мяча на превью."""
+    if cv2 is None:
+        return
+    center = (int(round(x)), int(round(y)))
+    cv2.circle(preview, center, 15, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+    cv2.circle(preview, center, 12, BALL_PREVIEW_INTERP_COLOR_BGR, -1, lineType=cv2.LINE_AA)
+    cross = 9
+    cv2.line(
+        preview, (center[0] - cross, center[1]), (center[0] + cross, center[1]),
+        (255, 255, 255), 2, lineType=cv2.LINE_AA,
+    )
+    cv2.line(
+        preview, (center[0], center[1] - cross), (center[0], center[1] + cross),
+        (255, 255, 255), 2, lineType=cv2.LINE_AA,
+    )
+    draw_text_on_bgr(
+        preview, "интерпол.", (center[0] + 18, max(center[1] - 10, 20)),
+        font_size=18, color_bgr=BALL_PREVIEW_INTERP_COLOR_BGR,
+        outline_bgr=(0, 0, 0), outline_width=2,
+    )
 
 
 def any_ring_configured(state: Dict[str, Any]) -> bool:
@@ -1348,6 +1557,7 @@ def draw_annotations(
     excluded_ids: Optional[set] = None,
     ball_lost: bool = False,
     last_ball: Optional[Tuple[float, float]] = None,
+    id_former_labels: Optional[Dict[int, List[int]]] = None,
 ):
     """Рисует рамки игроков (с ID), траекторию мяча и маркер мяча на копии кадра.
 
@@ -1358,6 +1568,7 @@ def draw_annotations(
     """
     annotated = frame.copy()
     excluded_ids = excluded_ids or set()
+    id_former_labels = id_former_labels or {}
     traj_pts: List[Tuple[int, int]] = []
     if ball_trajectory:
         traj_pts = [(int(x), int(y)) for x, y in ball_trajectory]
@@ -1375,7 +1586,12 @@ def draw_annotations(
         p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
         thickness = 1 if excluded else 2
         cv2.rectangle(annotated, p1, p2, color, thickness)
-        label = f"ID {pid}" + (" [excl]" if excluded else "")
+        former = id_former_labels.get(pid) or []
+        label = f"ID {pid}"
+        if former:
+            label += f" (=б. {', '.join(str(x) for x in former)})"
+        if excluded:
+            label += " [excl]"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         label_y1 = max(p1[1] - th - 8, 0)
         cv2.rectangle(annotated, (p1[0], label_y1), (p1[0] + tw + 6, p1[1]), color, -1)
@@ -2912,6 +3128,7 @@ def process_video(
     excluded_player_ids: Optional[set] = None,
     camera_transforms: Optional[List[np.ndarray]] = None,
     ball_anchors: Optional[List[Dict[str, Any]]] = None,
+    manual_id_map: Optional[Dict[int, int]] = None,
 ) -> Tuple[Dict[int, PlayerStats], Path, Dict[str, List[Dict[str, Any]]]]:
     """Обрабатывает видео покадрово: детекция, трекинг, события, хайлайты.
 
@@ -2979,7 +3196,9 @@ def process_video(
         jersey_ocr_enabled=jersey_ocr_enabled,
         min_person_bbox_area=min_person_bbox_area,
     )
-    excluded_ids: set = set(excluded_player_ids or [])
+    resolve_player_id = make_id_resolver(manual_id_map)
+    id_former_labels = build_id_former_labels(manual_id_map)
+    excluded_ids: set = {resolve_player_id(int(pid)) for pid in (excluded_player_ids or [])}
     ring_draw_warnings: List[str] = []
 
     # Состояние владения мячом (для пасов и для "кто владел мячом перед голом").
@@ -3042,6 +3261,7 @@ def process_video(
                 if yolo_ball_bbox is not None:
                     yolo_ball_bbox = tuple(v * inv_scale for v in yolo_ball_bbox)
             persons = appearance_merger.remap(frame_idx, frame, persons)
+            persons = [(resolve_player_id(pid), box) for pid, box in persons]
             ball_state = ball_tracker.update(
                 frame_idx,
                 frame,
@@ -3091,6 +3311,7 @@ def process_video(
                 excluded_ids=excluded_ids,
                 ball_lost=ball_lost if model is not None else False,
                 last_ball=ball_tracker.last_confident_pos if model is not None else None,
+                id_former_labels=id_former_labels,
             )
             annotated = draw_hoop_lines_on_frame(annotated, current_rings, warnings_out=ring_draw_warnings)
         elif effective_ball is not None:
@@ -3254,6 +3475,8 @@ def process_video(
     output_path = reencode_for_browser(output_path)
     if appearance_merger.merge_log:
         debug_log["id_merges"] = appearance_merger.merge_log
+    if manual_id_map:
+        debug_log["manual_id_map"] = dict(manual_id_map)
     if ring_draw_warnings:
         debug_log["ring_draw_warnings"] = list(dict.fromkeys(ring_draw_warnings))
     return stats, output_path, debug_log
@@ -3264,11 +3487,11 @@ def build_box_score(
     player_names: Optional[Dict[int, str]] = None,
     player_numbers: Optional[Dict[int, str]] = None,
     excluded_player_ids: Optional[set] = None,
+    manual_id_map: Optional[Dict[int, int]] = None,
 ) -> pd.DataFrame:
     """Формирует итоговую таблицу статистики (Box Score) по игрокам."""
-    player_names = player_names or {}
-    player_numbers = player_numbers or {}
-    excluded = excluded_player_ids or set()
+    resolve_player_id = make_id_resolver(manual_id_map)
+    excluded = {resolve_player_id(int(pid)) for pid in (excluded_player_ids or set())}
     columns = ["ID игрока", "Имя", "Номер", "Броски", "Попадания", "Точность (%)", "Сделано передач"]
     if not stats:
         return pd.DataFrame(columns=columns)
@@ -3279,8 +3502,9 @@ def build_box_score(
             continue
         shots, makes, passes = s["shots"], s["makes"], s["passes"]
         accuracy = round(100.0 * makes / shots, 1) if shots else 0.0
-        name = (player_names.get(pid) or "").strip() or f"Игрок {pid}"
-        number = (player_numbers.get(pid) or "").strip() or "—"
+        name, number = lookup_player_meta(pid, player_names, player_numbers, manual_id_map)
+        name = name or f"Игрок {pid}"
+        number = number or "—"
         rows.append(
             {
                 "ID игрока": pid,
@@ -3350,6 +3574,10 @@ def init_session_state() -> None:
         "jersey_ocr_enabled": JERSEY_OCR_ENABLED_DEFAULT,
         "min_person_bbox_area": int(MIN_PERSON_BBOX_AREA_DEFAULT),
         "id_merge_log": [],
+        "manual_id_map": {},
+        "manual_id_merge_log": [],
+        "ball_interp_skipped": [],
+        "ball_interp_fix_frame": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -3375,15 +3603,21 @@ def reset_for_new_video() -> None:
         "excluded_player_ids",
         "id_merge_log",
         "ball_anchors",
+        "manual_id_map",
+        "manual_id_merge_log",
+        "ball_interp_skipped",
+        "ball_interp_fix_frame",
     ):
         if key in ("player_crops", "player_names", "player_numbers"):
             st.session_state[key] = {}
-        elif key == "excluded_player_ids":
+        elif key in ("excluded_player_ids", "id_merge_log", "ball_anchors", "ball_interp_skipped"):
             st.session_state[key] = []
-        elif key == "id_merge_log":
+        elif key in ("manual_id_map",):
+            st.session_state[key] = {}
+        elif key == "manual_id_merge_log":
             st.session_state[key] = []
-        elif key == "ball_anchors":
-            st.session_state[key] = []
+        elif key == "ball_interp_fix_frame":
+            st.session_state[key] = None
         elif key in ("ring1_configured", "ring2_configured"):
             st.session_state[key] = False
         else:
@@ -3880,10 +4114,18 @@ def render_step2_zones(device: str) -> None:
                     orig_y = int(np.clip(click_value["y"] * scale_y, 0, meta["height"]))
                     target = st.session_state["click_target_ring"]
                     if target == "Мяч":
-                        add_ball_anchor(
-                            st.session_state, orig_x, orig_y,
-                            frame_idx=int(st.session_state["preview_frame_idx"]),
+                        anchor_frame = int(st.session_state["preview_frame_idx"])
+                        add_ball_anchor(st.session_state, orig_x, orig_y, frame_idx=anchor_frame)
+                        append_ball_training_seed(
+                            video_path,
+                            st.session_state.get("video_name"),
+                            anchor_frame,
+                            orig_x,
+                            orig_y,
+                            frame,
+                            source="user_click",
                         )
+                        st.session_state["ball_interp_fix_frame"] = None
                     else:
                         ring_num = 1 if target == "Кольцо 1" else 2
                         mark_ring_configured(
@@ -3953,6 +4195,86 @@ def render_step2_zones(device: str) -> None:
                 if st.button("✕", key=f"del_ball_anchor_{int(anchor['frame'])}_{idx}"):
                     remove_ball_anchor_at(st.session_state, idx)
                     st.rerun()
+
+    if len(ball_anchors) >= BALL_ANCHORS_MIN_RECOMMENDED:
+        skipped_interp = st.session_state.get("ball_interp_skipped") or []
+        pending_interp = get_pending_ball_interp_checks(ball_anchors, skipped_interp)
+        if pending_interp:
+            check_frame = pending_interp[0]
+            interp_pos = interpolate_ball_position(
+                ball_anchors, check_frame, camera_transforms_preview if panning_mode else None
+            )
+            st.markdown("**Проверка интерполяции мяча**")
+            st.caption(
+                f"Между якорями предлагается проверить кадр **{check_frame}** "
+                f"(осталось проверок: {len(pending_interp)}). Кнопка «Далее» не блокируется."
+            )
+            if interp_pos is not None:
+                ix, iy, _ = interp_pos
+                check_bgr = extract_frame_at_index(video_path, check_frame)
+                if check_bgr is not None:
+                    check_preview = draw_zones_preview(
+                        check_bgr,
+                        rings_for_preview_display(
+                            st.session_state,
+                            check_frame,
+                            camera_transforms=camera_transforms_preview,
+                            panning_mode=panning_mode,
+                        ),
+                        ball_anchors=ball_anchors,
+                        preview_frame_idx=check_frame,
+                        camera_transforms=camera_transforms_preview,
+                        panning_mode=panning_mode,
+                    )
+                    draw_ball_interp_check_marker(check_preview, ix, iy)
+                    st.image(
+                        cv2.cvtColor(check_preview, cv2.COLOR_BGR2RGB),
+                        caption=f"Кадр {check_frame}: предсказанная позиция мяча (интерполяция)",
+                        use_container_width=True,
+                    )
+                btn_ok, btn_fix, btn_skip = st.columns(3)
+                with btn_ok:
+                    if st.button("✅ Верно", key=f"ball_interp_ok_{check_frame}"):
+                        add_ball_anchor(st.session_state, int(round(ix)), int(round(iy)), check_frame)
+                        if check_bgr is not None:
+                            append_ball_training_seed(
+                                video_path,
+                                st.session_state.get("video_name"),
+                                check_frame,
+                                ix,
+                                iy,
+                                check_bgr,
+                                source="interp_confirm",
+                            )
+                        st.rerun()
+                with btn_fix:
+                    if st.button("✏️ Поправить кликом", key=f"ball_interp_fix_{check_frame}"):
+                        st.session_state["click_target_ring"] = "Мяч"
+                        st.session_state["preview_frame_idx"] = check_frame
+                        st.session_state["ball_interp_fix_frame"] = check_frame
+                        st.rerun()
+                with btn_skip:
+                    if st.button("Пропустить", key=f"ball_interp_skip_{check_frame}"):
+                        skipped = list(st.session_state.get("ball_interp_skipped") or [])
+                        if check_frame not in skipped:
+                            skipped.append(check_frame)
+                        st.session_state["ball_interp_skipped"] = skipped
+                        st.rerun()
+            else:
+                st.caption("Для этого кадра интерполяция недоступна — нажмите «Пропустить».")
+                if st.button("Пропустить", key=f"ball_interp_skip_empty_{check_frame}"):
+                    skipped = list(st.session_state.get("ball_interp_skipped") or [])
+                    if check_frame not in skipped:
+                        skipped.append(check_frame)
+                    st.session_state["ball_interp_skipped"] = skipped
+                    st.rerun()
+
+        fix_frame = st.session_state.get("ball_interp_fix_frame")
+        if fix_frame is not None:
+            st.info(
+                f"Режим правки: переключитесь на превью выше, выберите «Мяч» и кликните "
+                f"по мячу на кадре **{fix_frame}**."
+            )
 
     rings_ready = any_ring_configured(st.session_state)
     if not rings_ready:
@@ -4085,6 +4407,49 @@ def render_step3_players(device: str) -> None:
         with st.expander(f"🔗 Склейки ID по внешнему виду ({len(merge_log)})", expanded=False):
             st.dataframe(pd.DataFrame(merge_log), use_container_width=True, hide_index=True)
             st.caption("Новые ID трекера, переназначенные на ранее виденный ID (appearance-matching).")
+
+    st.subheader("🔗 Ручная склейка ID")
+    st.caption(
+        "Если трекер выдал **несколько ID на одного человека**, выберите канонический ID "
+        "и объедините остальные. На шаге 4 статистика, события и подписи на видео будут "
+        "использовать канонический ID; исключения из статистики сохраняются."
+    )
+    manual_map: Dict[int, int] = dict(st.session_state.get("manual_id_map") or {})
+    manual_merge_log = st.session_state.get("manual_id_merge_log") or []
+    if crops:
+        all_ids = sorted(crops.keys())
+        canonical_options = all_ids
+        canonical_default = canonical_options[0]
+        canonical_id = st.selectbox(
+            "Канонический ID (останется в статистике и на видео)",
+            canonical_options,
+            index=canonical_options.index(canonical_default),
+            key="manual_merge_canonical_select",
+        )
+        source_options = [pid for pid in all_ids if pid != canonical_id]
+        source_ids = st.multiselect(
+            "ID для объединения в канонический",
+            source_options,
+            key="manual_merge_sources_select",
+        )
+        if st.button("Объединить выбранные ID", type="secondary", disabled=not source_ids):
+            apply_manual_id_merge(st.session_state, int(canonical_id), source_ids)
+            st.success(
+                f"ID {', '.join(str(s) for s in sorted(source_ids))} объединены в канонический **{canonical_id}**."
+            )
+            st.rerun()
+    else:
+        st.caption("Сначала запустите сканирование — список ID появится выше.")
+
+    if manual_map:
+        rows = [
+            {"Бывший ID": raw_id, "→ Канонический": target}
+            for raw_id, target in sorted(manual_map.items(), key=lambda item: (item[1], item[0]))
+        ]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    if manual_merge_log:
+        with st.expander(f"История ручных склеек ({len(manual_merge_log)})", expanded=False):
+            st.dataframe(pd.DataFrame(manual_merge_log), use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("🏀 Диагностика видимости мяча")
@@ -4283,6 +4648,7 @@ def run_full_analysis(video_path: str, device: str) -> None:
             excluded_player_ids=set(st.session_state.get("excluded_player_ids") or []),
             camera_transforms=camera_transforms,
             ball_anchors=st.session_state.get("ball_anchors") or [],
+            manual_id_map=dict(st.session_state.get("manual_id_map") or {}),
         )
     except Exception as exc:
         st.error(f"Ошибка при обработке видео: {exc}")
@@ -4294,6 +4660,7 @@ def run_full_analysis(video_path: str, device: str) -> None:
         st.session_state.get("player_names"),
         st.session_state.get("player_numbers"),
         excluded_player_ids=set(st.session_state.get("excluded_player_ids") or []),
+        manual_id_map=dict(st.session_state.get("manual_id_map") or {}),
     )
     st.session_state["last_output_video"] = str(output_path)
     st.session_state["debug_log"] = debug_log
