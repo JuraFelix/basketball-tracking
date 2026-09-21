@@ -3,6 +3,25 @@
 - **Origin:** https://cursor.com/codebase/felipok/genesis
 - **GitHub:** https://github.com/JuraFelix/basketball-tracking
 
+### English
+
+Offline **Streamlit** desktop app for basketball practice video analytics: **YOLO11x**
++ **ByteTrack** track players and the ball, detect shots and passes, export highlight
+clips and box-score stats. Runs on **CUDA** GPU (recommended).
+
+**How to run:** create a venv, install CUDA PyTorch, then app deps and launch:
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+Full setup guide and feature list below are in **Russian**.
+
+---
+
 Полностью автономное (офлайн) desktop-приложение на Python с графическим
 интерфейсом [Streamlit](https://streamlit.io/) для аналитики баскетбольных
 тренировок по видео (статичная или панорамная камера).
