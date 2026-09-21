@@ -1,5 +1,8 @@
 # 🏀 Basketball Tracking Analytics
 
+- **Origin:** https://cursor.com/codebase/felipok/genesis
+- **GitHub:** https://github.com/JuraFelix/basketball-tracking
+
 Полностью автономное (офлайн) desktop-приложение на Python с графическим
 интерфейсом [Streamlit](https://streamlit.io/) для аналитики баскетбольных
 тренировок по видео (статичная или панорамная камера).
