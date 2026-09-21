@@ -2,6 +2,8 @@
 
 - **Origin:** https://cursor.com/codebase/felipok/genesis
 - **GitHub:** https://github.com/JuraFelix/basketball-tracking
+- **License:** [MIT](LICENSE) · **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
+- **GitHub topics:** `basketball`, `computer-vision`, `yolo`, `streamlit`, `object-tracking` (add via repo Settings → Topics or `gh repo edit`, see CONTRIBUTING)
 
 ### English
 
@@ -86,6 +88,8 @@ Full setup guide and feature list below are in **Russian**.
 .
 ├── app.py                  # Всё приложение (Streamlit GUI + логика трекинга/аналитики)
 ├── requirements.txt        # Python-зависимости с версиями
+├── LICENSE                 # MIT
+├── CONTRIBUTING.md         # Как форкнуть и слать PR
 ├── custom_bytetrack.yaml   # Конфиг трекера (генерируется автоматически при первом запуске)
 ├── highlights/             # Нарезанные MP4-хайлайты (авто-создаётся)
 ├── output_videos/          # Полные аннотированные видео (авто-создаётся)

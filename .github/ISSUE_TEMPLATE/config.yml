@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Contributing guide
+    url: https://github.com/JuraFelix/basketball-tracking/blob/main/CONTRIBUTING.md
+    about: Fork, setup, and pull request workflow
