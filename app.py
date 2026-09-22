@@ -40,6 +40,7 @@ Basketball Tracking Analytics
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import shutil
@@ -115,6 +116,8 @@ except Exception as exc:  # pragma: no cover - защита от отсутст�
 # ---------------------------------------------------------------------------
 # Константы, пути и настройки по умолчанию
 # ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
 BASE_DIR = Path(__file__).resolve().parent
 HIGHLIGHTS_DIR = BASE_DIR / "highlights"
 OUTPUT_DIR = BASE_DIR / "output_videos"
@@ -472,9 +475,32 @@ def reset_tracker(model) -> None:
     if model is None:
         return
     try:
+        predictor = getattr(model, "predictor", None)
+        if predictor is not None:
+            callbacks = getattr(predictor, "callbacks", None)
+            if isinstance(callbacks, dict):
+                for event in callbacks:
+                    callbacks[event] = []
         model.predictor = None  # заставит ultralytics создать трекер заново
     except Exception:
         pass
+
+
+def tracker_callback_count(model) -> int:
+    """Число зарегистрированных callback-ов Ultralytics (для тестов F07)."""
+    if model is None:
+        return 0
+    predictor = getattr(model, "predictor", None)
+    if predictor is None:
+        return 0
+    callbacks = getattr(predictor, "callbacks", None)
+    if not isinstance(callbacks, dict):
+        return 0
+    total = 0
+    for handlers in callbacks.values():
+        if isinstance(handlers, list):
+            total += len(handlers)
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -877,6 +903,28 @@ def create_synthetic_pan_video(
                 cv2.circle(frame, (bx + i * 3, by - i * 2), br, (0, 0, 200), -1)
         writer.write(frame)
     writer.release()
+
+
+def transform_point_between_frames(
+    x: float,
+    y: float,
+    source_frame_idx: int,
+    target_frame_idx: int,
+    camera_transforms: List[np.ndarray],
+) -> Tuple[float, float]:
+    """Переносит точку из системы координат source_frame_idx в target_frame_idx."""
+    if not camera_transforms or source_frame_idx == target_frame_idx:
+        return float(x), float(y)
+    n = len(camera_transforms)
+    source_idx = int(np.clip(int(source_frame_idx), 0, n - 1))
+    target_idx = int(np.clip(int(target_frame_idx), 0, n - 1))
+    try:
+        source_inv = np.linalg.inv(camera_transforms[source_idx])
+    except np.linalg.LinAlgError:
+        return float(x), float(y)
+    transform = camera_transforms[target_idx] @ source_inv
+    point = transform @ np.array([x, y, 1.0], dtype=np.float64)
+    return float(point[0]), float(point[1])
 
 
 def transform_ring_to_frame(
@@ -1477,12 +1525,21 @@ def effective_prev_event_ball_xy(
     last_event_ball_frame: int,
     frame_idx: int,
     gap_max_frames: int,
+    camera_transforms: Optional[List[np.ndarray]] = None,
 ) -> Optional[Tuple[float, float]]:
     """Сбрасывает предыдущую event_ball-точку, если дыра между кадрами слишком велика."""
     if prev_xy is None:
         return None
     if frame_idx - last_event_ball_frame > gap_max_frames:
         return None
+    if camera_transforms is not None and last_event_ball_frame != frame_idx:
+        return transform_point_between_frames(
+            prev_xy[0],
+            prev_xy[1],
+            last_event_ball_frame,
+            frame_idx,
+            camera_transforms,
+        )
     return prev_xy
 
 
@@ -2581,9 +2638,18 @@ def detect_ball_yolo_on_crop(
     ball_conf_threshold: float,
     imgsz: int,
 ) -> Tuple[Optional[Tuple[float, float]], float, Optional[Tuple[float, float, float, float]]]:
-    """YOLO predict на кропе; координаты возвращаются в системе полного кадра."""
+    """YOLO predict на кропе; координаты возвращаются в системе полного кадра.
+
+    Detection-only: временно отключает ByteTrack на predictor, чтобы ROI/тайлы
+    не подмешивали координаты кропа во внутреннее состояние трекера.
+    """
     if model is None or crop is None or crop.size == 0:
         return None, 0.0, None
+    saved_trackers: Any = None
+    predictor = getattr(model, "predictor", None)
+    if predictor is not None and hasattr(predictor, "trackers"):
+        saved_trackers = predictor.trackers
+        predictor.trackers = None
     try:
         results = model.predict(
             crop,
@@ -2593,8 +2659,12 @@ def detect_ball_yolo_on_crop(
             device=device,
             verbose=False,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("Ball ROI/tile YOLO predict failed: %s", exc)
         return None, 0.0, None
+    finally:
+        if predictor is not None and saved_trackers is not None:
+            predictor.trackers = saved_trackers
     boxes = results[0].boxes
     if boxes is None or len(boxes) == 0:
         return None, 0.0, None
@@ -2768,10 +2838,12 @@ class BallTracker:
         new_bbox: Tuple[float, float, float, float],
         conf: float,
         source: str,
+        prev_bbox: Optional[Tuple[float, float, float, float]] = None,
     ) -> bool:
-        if self.csrt_tracker is None or self.last_bbox is None:
+        compare_bbox = prev_bbox if prev_bbox is not None else self.last_bbox
+        if self.csrt_tracker is None or compare_bbox is None:
             return True
-        if bbox_iou(new_bbox, self.last_bbox) >= CSRT_REINIT_IOU_THRESHOLD:
+        if bbox_iou(new_bbox, compare_bbox) >= CSRT_REINIT_IOU_THRESHOLD:
             return True
         if source in ("yolo", "tiled", "roi") and conf > self.last_committed_conf + CSRT_REINIT_CONF_MARGIN:
             return True
@@ -2788,18 +2860,30 @@ class BallTracker:
         bbox: Optional[Tuple[float, float, float, float]] = None,
     ) -> BallTrackState:
         bbox = bbox or _bbox_from_center(x, y)
+        prev_bbox = self.last_bbox
+        reinit_csrt = self._should_reinit_csrt(bbox, conf, source, prev_bbox=prev_bbox)
         self.last_bbox = bbox
         self._record_confident(frame_idx, x, y)
         if self.kalman.initialized:
             self.kalman.predict()
         self.kalman.correct(x, y)
-        if self._should_reinit_csrt(bbox, conf, source):
+        if reinit_csrt:
             self._init_csrt(frame_bgr, bbox)
         self.last_committed_conf = float(conf)
         if source in ("yolo", "user", "user_interp", "tiled", "roi"):
             self.frames_since_yolo = 0
         self.frames_since_any = 0
         return BallTrackState(x, y, conf, source)
+
+    def _roi_detection_commits_confident(self, x: float, y: float, conf: float) -> bool:
+        if conf < self.ball_conf:
+            return False
+        if self.last_confident_pos is None:
+            return True
+        jump = math.hypot(x - self.last_confident_pos[0], y - self.last_confident_pos[1])
+        if jump > self.csrt_max_jump_px and conf <= self.last_committed_conf + CSRT_REINIT_CONF_MARGIN:
+            return False
+        return True
 
     def update(
         self,
@@ -2855,12 +2939,16 @@ class BallTracker:
             )
             if det_center is not None:
                 x, y = det_center
-                self.last_bbox = det_bbox
-                self._record_confident(frame_idx, x, y)
-                self.kalman.correct(x, y)
-                if det_bbox is not None and self._should_reinit_csrt(det_bbox, det_conf, det_src):
-                    self._init_csrt(frame_bgr, det_bbox)
-                self.last_committed_conf = float(det_conf)
+                if self._roi_detection_commits_confident(x, y, det_conf):
+                    return self._commit_detection(
+                        frame_idx,
+                        frame_bgr,
+                        x,
+                        y,
+                        det_conf,
+                        det_src,
+                        bbox=det_bbox,
+                    )
                 self.frames_since_any = 0
                 return BallTrackState(x, y, det_conf, det_src)
 
@@ -2930,12 +3018,40 @@ def histogram_similarity(h1: np.ndarray, h2: np.ndarray) -> float:
 
 
 _REID_MODEL: Any = None
+_REID_DEVICE: Optional[str] = None
+_REID_LAST_ERROR: Optional[str] = None
 _OCR_READER: Any = None
 
 
-def _get_reid_model() -> Any:
-    global _REID_MODEL
-    if _REID_MODEL is not None or torch is None:
+def _resolve_reid_device(device: Optional[str] = None) -> str:
+    if device:
+        return device
+    if torch is not None and torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def get_reid_error_message() -> Optional[str]:
+    """Последняя ошибка ReID для отображения в UI (шаг 3/4 или sidebar)."""
+    return _REID_LAST_ERROR
+
+
+def render_reid_status_warning() -> None:
+    """Показывает предупреждение, если MobileNet ReID недоступен."""
+    reid_error = get_reid_error_message()
+    if reid_error:
+        st.warning(
+            f"⚠️ ReID (MobileNet) недоступен — склейка ID работает только по HSV/OCR. "
+            f"Причина: {reid_error}"
+        )
+
+
+def _get_reid_model(device: Optional[str] = None) -> Any:
+    global _REID_MODEL, _REID_DEVICE, _REID_LAST_ERROR
+    if torch is None:
+        return None
+    target_device = _resolve_reid_device(device)
+    if _REID_MODEL is not None and _REID_DEVICE == target_device:
         return _REID_MODEL
     try:
         from torchvision import models
@@ -2944,9 +3060,15 @@ def _get_reid_model() -> Any:
         model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
         model.classifier = nn.Identity()
         model.eval()
+        model.to(target_device)
         _REID_MODEL = model
-    except Exception:
+        _REID_DEVICE = target_device
+        _REID_LAST_ERROR = None
+    except Exception as exc:
+        _REID_LAST_ERROR = str(exc)
+        logger.warning("Failed to load MobileNet ReID model: %s", exc)
         _REID_MODEL = None
+        _REID_DEVICE = None
     return _REID_MODEL
 
 
@@ -2963,8 +3085,14 @@ def _get_ocr_reader() -> Any:
     return _OCR_READER
 
 
-def extract_reid_embedding(frame_bgr: Any, box: Tuple[float, float, float, float]) -> Optional[np.ndarray]:
-    model = _get_reid_model()
+def extract_reid_embedding(
+    frame_bgr: Any,
+    box: Tuple[float, float, float, float],
+    device: Optional[str] = None,
+) -> Optional[np.ndarray]:
+    global _REID_LAST_ERROR
+    target_device = _resolve_reid_device(device)
+    model = _get_reid_model(target_device)
     if model is None or torch is None or cv2 is None or frame_bgr is None:
         return None
     x1, y1, x2, y2 = [int(v) for v in box]
@@ -2987,15 +3115,16 @@ def extract_reid_embedding(frame_bgr: Any, box: Tuple[float, float, float, float
                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
         )
-        tensor = transform(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).unsqueeze(0)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        tensor = transform(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).unsqueeze(0).to(target_device)
         with torch.no_grad():
-            emb = model(tensor.to(device)).cpu().numpy().flatten().astype(np.float32)
+            emb = model(tensor).cpu().numpy().flatten().astype(np.float32)
         norm = np.linalg.norm(emb)
         if norm > 1e-6:
             emb /= norm
         return emb
-    except Exception:
+    except Exception as exc:
+        _REID_LAST_ERROR = str(exc)
+        logger.warning("ReID embedding failed: %s", exc)
         return None
 
 
@@ -3225,6 +3354,7 @@ class AppearanceMerger:
         frame_idx: int,
         frame_bgr: Any,
         persons: List[Tuple[int, Tuple[float, float, float, float]]],
+        device: Optional[str] = None,
     ) -> List[Tuple[int, Tuple[float, float, float, float]]]:
         detections: List[_DetectionFeatures] = []
         for raw_id, box in persons:
@@ -3232,7 +3362,7 @@ class AppearanceMerger:
             if area < self.min_person_bbox_area:
                 continue
             hist = extract_jersey_histogram(frame_bgr, box)
-            emb = extract_reid_embedding(frame_bgr, box)
+            emb = extract_reid_embedding(frame_bgr, box, device=device)
             jersey = read_jersey_number_from_box(frame_bgr, box) if self.jersey_ocr_enabled else None
             detections.append(
                 _DetectionFeatures(
@@ -3473,6 +3603,12 @@ def diagnose_ball_visibility(
 # ---------------------------------------------------------------------------
 # Быстрое предварительное сканирование для сбора списка игроков (шаг 3)
 # ---------------------------------------------------------------------------
+def compute_quick_scan_frame_count(fps: float, max_seconds: float) -> int:
+    """Непрерывный префикс кадров для шага 3 — те же кадры, что видит process_video с 0."""
+    requested = max(int(float(fps) * float(max_seconds)), 1)
+    return min(requested, QUICK_SCAN_MAX_TRACK_FRAMES)
+
+
 def quick_player_scan(
     video_path: str,
     model,
@@ -3515,10 +3651,8 @@ def quick_player_scan(
         return {}, []
 
     fps = fps_hint or 25.0
-    max_frames = max(int(fps * max_seconds), 1)
-    frame_step = max(max_frames // QUICK_SCAN_MAX_TRACK_FRAMES, 1) if max_frames > QUICK_SCAN_MAX_TRACK_FRAMES else 1
-    track_targets = list(range(0, max_frames, frame_step))
-    n_track = len(track_targets)
+    max_frames = compute_quick_scan_frame_count(fps, max_seconds)
+    n_track = max_frames
 
     best_crops: Dict[int, Tuple[float, Any]] = {}
     frame_idx = 0
@@ -3527,10 +3661,6 @@ def quick_player_scan(
         ret, frame = cap.read()
         if not ret:
             break
-
-        if frame_idx % frame_step != 0:
-            frame_idx += 1
-            continue
 
         track_done += 1
         if status_callback is not None:
@@ -3566,7 +3696,7 @@ def quick_player_scan(
         if enhance_quality:
             inv_scale = 1.0 / ENHANCE_UPSCALE_FACTOR
             persons = [(pid, tuple(v * inv_scale for v in box)) for pid, box in persons]
-        persons = appearance.remap(frame_idx, frame, persons)
+        persons = appearance.remap(frame_idx, frame, persons, device=device)
         h, w = frame.shape[:2]
         for pid, box in persons:
             x1, y1, x2, y2 = [int(v) for v in box]
@@ -3765,7 +3895,7 @@ def process_video(
                     yolo_ball = (yolo_ball[0] * inv_scale, yolo_ball[1] * inv_scale)
                 if yolo_ball_bbox is not None:
                     yolo_ball_bbox = tuple(v * inv_scale for v in yolo_ball_bbox)
-            persons = appearance_merger.remap(frame_idx, frame, persons)
+            persons = appearance_merger.remap(frame_idx, frame, persons, device=device)
             persons = [(resolve_player_id(pid), box) for pid, box in persons]
             ball_state = ball_tracker.update(
                 frame_idx,
@@ -3944,7 +4074,11 @@ def process_video(
         # Общий кулдаун эпизода у кольца в секундах (не per-ring).
         # -------------------------------------------------------------
         goal_prev_xy = effective_prev_event_ball_xy(
-            prev_event_ball_xy, last_event_ball_frame, frame_idx, event_ball_gap_max_frames
+            prev_event_ball_xy,
+            last_event_ball_frame,
+            frame_idx,
+            event_ball_gap_max_frames,
+            camera_transforms=camera_transforms,
         )
         if event_ball is not None and goal_prev_xy is not None:
             bx_prev, by_prev = goal_prev_xy
@@ -4907,6 +5041,7 @@ def render_step3_players(device: str) -> None:
         "по кропам. EasyOCR номеров **выключен по умолчанию** (шаг 2 → проф. режим) — "
         "включайте только если на вашем видео номера действительно читаются."
     )
+    render_reid_status_warning()
 
     max_scan = max(int(min(meta["duration"], 60)), 5)
     if max_scan <= 5:
@@ -4921,6 +5056,7 @@ def render_step3_players(device: str) -> None:
         )
 
     if st.button("🔍 Запустить предварительное сканирование", type="primary"):
+        st.session_state["manual_id_map"] = {}
         model, model_error = load_model(device)
         if model is None:
             st.warning(
@@ -5391,6 +5527,8 @@ def render_step4_run(device: str) -> None:
             go_to_step(1)
         return
 
+    render_reid_status_warning()
+
     with st.expander("⚙️ Текущие настройки анализа", expanded=False):
         r1_n = len(ring_anchors_from_state(st.session_state, 1))
         r2_n = len(ring_anchors_from_state(st.session_state, 2))
@@ -5492,6 +5630,9 @@ def main() -> None:
             st.success("CUDA доступна")
         else:
             st.warning("Режим CPU / без GPU")
+        reid_error = get_reid_error_message()
+        if reid_error:
+            st.warning(f"ReID недоступен: {reid_error}")
 
     step = st.session_state["step"]
     render_step_indicator(step)
