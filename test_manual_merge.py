@@ -68,10 +68,10 @@ class TrainingSeedTests(unittest.TestCase):
     def test_append_ball_training_seed_writes_jsonl_and_crop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            with mock.patch("app.TRAINING_SEEDS_DIR", base / "training_seeds"), mock.patch(
-                "app.BALL_TRAINING_CROPS_DIR", base / "training_seeds" / "crops"
-            ), mock.patch("app.BALL_LABELS_JSONL", base / "training_seeds" / "ball_labels.jsonl"), mock.patch(
-                "app.BASE_DIR", base
+            with mock.patch("basketball.core.TRAINING_SEEDS_DIR", base / "training_seeds"), mock.patch(
+                "basketball.core.BALL_TRAINING_CROPS_DIR", base / "training_seeds" / "crops"
+            ), mock.patch("basketball.core.BALL_LABELS_JSONL", base / "training_seeds" / "ball_labels.jsonl"), mock.patch(
+                "basketball.core.BASE_DIR", base
             ):
                 frame = np.zeros((100, 120, 3), dtype=np.uint8)
                 append_ball_training_seed("/tmp/test.mp4", "test", 5, 60.0, 40.0, frame, source="user_click")

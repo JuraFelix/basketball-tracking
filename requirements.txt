@@ -10,7 +10,7 @@
 # но чтобы быть уверенным на 100%, ставьте torch/torchvision по инструкции
 # из README ПЕРЕД этим файлом.
 
-streamlit==1.40.2
+streamlit==1.54.0
 streamlit-image-coordinates==0.4.1
 ultralytics==8.3.28
 torch==2.4.1
@@ -23,6 +23,8 @@ PyYAML==6.0.2
 Pillow==10.4.0
 # OCR номеров на майках (опционально на шаге 2; первый запуск скачивает модели ~100 МБ)
 easyocr==1.7.2
+# ByteTrack в Ultralytics требует lap; ставим явно, без auto-install в рантайме (F17).
+lapx==0.5.5
 
 # ffmpeg — НЕ python-пакет, устанавливается отдельно системным менеджером
 # пакетов (sudo apt install ffmpeg / brew install ffmpeg / winget install

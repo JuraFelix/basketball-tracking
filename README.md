@@ -3,6 +3,7 @@
 - **Origin:** https://cursor.com/codebase/felipok/genesis
 - **GitHub:** https://github.com/JuraFelix/basketball-tracking
 - **License:** [MIT](LICENSE) · **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Third-party:** [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) is **AGPL-3.0** (see [licensing](https://www.ultralytics.com/license)); this repo’s MIT license applies to our code only, not to Ultralytics weights/API usage.
 - **GitHub topics:** `basketball`, `computer-vision`, `yolo`, `streamlit`, `object-tracking` (add via repo Settings → Topics or `gh repo edit`, see CONTRIBUTING)
 
 ### English
@@ -86,7 +87,8 @@ Full setup guide and feature list below are in **Russian**.
 
 ```
 .
-├── app.py                  # Всё приложение (Streamlit GUI + логика трекинга/аналитики)
+├── app.py                  # Точка входа Streamlit (`streamlit run app.py`)
+├── basketball/             # Модули: config, core (трекинг/аналитика), ui, offline
 ├── requirements.txt        # Python-зависимости с версиями
 ├── LICENSE                 # MIT
 ├── CONTRIBUTING.md         # Как форкнуть и слать PR
@@ -97,8 +99,16 @@ Full setup guide and feature list below are in **Russian**.
 └── README.md
 ```
 
-`custom_bytetrack.yaml`, `highlights/`, `output_videos/` и `training_seeds/`
-**не нужно создавать руками** — `app.py` создаёт их автоматически при работе.
+`custom_bytetrack.yaml`, `highlights/`, `output_videos/`, `.cache/` и `training_seeds/`
+**не нужно создавать руками** — приложение создаёт их автоматически при работе.
+
+### Лицензии
+
+- **Код этого репозитория** — [MIT](LICENSE).
+- **Ultralytics (YOLO11x, ByteTrack)** — **AGPL-3.0**. При распространении/production-сборке с YOLO
+  учитывайте условия AGPL; MIT репозитория не отменяет лицензию Ultralytics.
+- В сайдбаре есть кнопка **«Очистить кэш проекта»** (highlights, output_videos, `.cache`); веса YOLO
+  в `~/.cache` Ultralytics не удаляются.
 
 ### training_seeds/
 
@@ -205,6 +215,6 @@ Full setup guide and feature list below are in **Russian**.
 ## Разработка
 
 ```bash
-python3 -m py_compile app.py
-python3 -m unittest test_app_rings.py test_ball_events.py test_manual_merge.py test_app_streamlit.py test_sprint_a_regressions.py test_identity.py -v
+python3 -m py_compile app.py basketball/*.py
+python3 -m unittest test_app_rings.py test_ball_events.py test_manual_merge.py test_app_streamlit.py test_sprint_a_regressions.py test_sprint_b_regressions.py test_sprint_c_regressions.py test_identity.py -v
 ```

@@ -17,6 +17,9 @@ venv/
 custom_bytetrack.yaml
 custom_botsort.yaml
 
+# Временный кэш приложения (загрузки, буферы кадров хайлайтов)
+.cache/
+
 # Результаты работы приложения (видео пользователей, хайлайты)
 highlights/*.mp4
 output_videos/*.mp4
