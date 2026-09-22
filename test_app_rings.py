@@ -108,6 +108,8 @@ class RingSessionFlowTests(unittest.TestCase):
         self.assertTrue(state["ring1_configured"])
         self.assertEqual(state["ring1_x"], 512)
         self.assertEqual(state["ring1_y"], 288)
+        self.assertEqual(state["_pending_wi_ring1_x"], 512)
+        self.assertEqual(state["_pending_wi_ring1_y"], 288)
         state["wi_ring1_r"] = 70
         sync_ring_widgets_to_canonical(state, 1)
         self.assertEqual(state["ring1_r"], 70)

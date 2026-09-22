@@ -159,8 +159,8 @@ Full setup guide and feature list below are in **Russian**.
 **Шаг 2** — превью и настройка:
    - Клик по превью задаёт центр (X) и Y **горизонтальной линии** кольца;
      полуширина линии настраивается числовым полем.
-   - Порог владения мячом (дефолт 90 px), окно паса (10–60 кадров без
-     владельца), кулдаун гола (90 кадров), пороги conf/imgsz.
+   - Порог владения мячом (дефолт 90 px), окно паса (0.4–1.5 с без
+     владельца), кулдаун гола (3 с), пороги conf/imgsz.
 
 **Шаг 3** — сопоставление игроков и диагностика мяча.
 
@@ -177,11 +177,11 @@ Full setup guide and feature list below are in **Russian**.
   классам в `parse_track_results`.
 - **Владение мячом.** Центр мяча в пределах `possession_threshold` px от bbox
   игрока (дефолт 90).
-- **Передача.** Игрок_1 владел → мяч без владельца 10–60 кадров → Игрок_2
+- **Передача.** Игрок_1 владел → мяч без владельца 0.4–1.5 с → Игрок_2
   получил владение → +1 пас Игроку_1.
 - **Гол.** Пересечение отрезка `(x_prev,y_prev)→(x_curr,y_curr)` с
   горизонтальной линией кольца сверху вниз; автор — последний владелец мяча;
-  кулдаун 90 кадров на кольцо.
+  кулдаун 3 с на эпизод; только по кольцам, заданным пользователем.
 - **Траектория мяча.** На аннотированном видео рисуется линия по последним 10
   координатам мяча (яркий жёлтый цвет).
 - **Устойчивый трекинг мяча.** YOLO → **OpenCV CSRT** (lock-on) → ROI/tiled YOLO
@@ -206,5 +206,5 @@ Full setup guide and feature list below are in **Russian**.
 
 ```bash
 python3 -m py_compile app.py
-python3 -m unittest test_app_rings.py test_identity.py -v
+python3 -m unittest test_app_rings.py test_ball_events.py test_manual_merge.py test_app_streamlit.py test_sprint_a_regressions.py test_identity.py -v
 ```

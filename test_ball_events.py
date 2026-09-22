@@ -102,8 +102,12 @@ class BallEventSourceTests(unittest.TestCase):
         state = BallTrackState(100.0, 200.0, 0.55, "yolo")
         self.assertTrue(ball_state_counts_for_events(state))
 
-    def test_user_interp_eligible(self) -> None:
+    def test_user_interp_not_eligible(self) -> None:
         state = BallTrackState(100.0, 200.0, 0.92, "user_interp")
+        self.assertFalse(ball_state_counts_for_events(state))
+
+    def test_user_anchor_eligible(self) -> None:
+        state = BallTrackState(100.0, 200.0, 1.0, "user")
         self.assertTrue(ball_state_counts_for_events(state))
 
     def test_lost_ball_not_eligible(self) -> None:

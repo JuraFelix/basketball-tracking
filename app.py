@@ -267,8 +267,12 @@ BALL_DEFAULT_BBOX_HALF = 14
 BALL_CSRT_MAX_JUMP_PX = 120
 CSRT_REINIT_IOU_THRESHOLD = 0.35
 CSRT_REINIT_CONF_MARGIN = 0.12
-# Источники мяча, по которым можно считать гол/пас (не kalman/color/interp с нулевым conf).
-EVENT_ELIGIBLE_BALL_SOURCES = frozenset({"yolo", "csrt", "user", "user_interp", "tiled", "roi"})
+# Источники мяча, по которым можно считать гол/пас (не kalman/color/interp/user_interp).
+EVENT_ELIGIBLE_BALL_SOURCES = frozenset({"yolo", "csrt", "user", "tiled", "roi"})
+# Макс. разрыв между двумя event_ball-кадрами для гола (сек) — иначе не соединять хордой.
+EVENT_BALL_MAX_GAP_SECONDS = 0.3
+# CSRT-seed по клику: только на кадре якоря и коротком хвосте после него.
+BALL_CSRT_SEED_TAIL_FRAMES = 5
 BALL_TILED_IMGSZ = 1280
 BALL_ROI_DETECT_IMGSZ = 960
 JERSEY_OCR_ENABLED_DEFAULT = False
@@ -973,6 +977,7 @@ def add_ring_anchor(
     state[f"ring{ring_num}_y"] = int(y)
     state[f"ring{ring_num}_r"] = hw
     state[f"ring{ring_num}_frame"] = int(frame_idx)
+    _set_pending_ring_widget_coords(state, ring_num, int(x), int(y), hw)
 
 
 def remove_ring_anchor_at(state: Dict[str, Any], ring_num: int, index: int) -> None:
@@ -1325,6 +1330,20 @@ def consume_pending_step2_ui_state(state: Dict[str, Any]) -> None:
         state["click_target_ring"] = pending_target
         # radio с key=click_target_ring_radio хранит своё состояние отдельно от click_target_ring
         state["click_target_ring_radio"] = pending_target
+    for ring_num in (1, 2):
+        for field in ("x", "y", "r"):
+            pending_key = f"_pending_wi_ring{ring_num}_{field}"
+            if pending_key in state:
+                state[f"wi_ring{ring_num}_{field}"] = state.pop(pending_key)
+
+
+def consume_pending_step3_ui_state(state: Dict[str, Any]) -> None:
+    """Сбрасывает merge_pick_* до создания чекбоксов (после склейки на прошлом прогоне)."""
+    to_clear = state.pop("_pending_merge_pick_clear", None)
+    if not to_clear:
+        return
+    for pid in to_clear:
+        state[f"merge_pick_{int(pid)}"] = False
 
 
 def apply_manual_id_merge(state: Dict[str, Any], canonical_id: int, source_ids: List[int]) -> None:
@@ -1451,6 +1470,34 @@ def ball_state_counts_for_events(
     if ball_state.source not in EVENT_ELIGIBLE_BALL_SOURCES:
         return False
     return float(ball_state.conf) > 0.0
+
+
+def effective_prev_event_ball_xy(
+    prev_xy: Optional[Tuple[float, float]],
+    last_event_ball_frame: int,
+    frame_idx: int,
+    gap_max_frames: int,
+) -> Optional[Tuple[float, float]]:
+    """Сбрасывает предыдущую event_ball-точку, если дыра между кадрами слишком велика."""
+    if prev_xy is None:
+        return None
+    if frame_idx - last_event_ball_frame > gap_max_frames:
+        return None
+    return prev_xy
+
+
+def event_ball_from_tracking(
+    model: Any,
+    ball_state: Optional["BallTrackState"],
+    ball_lost: bool,
+    ball: Optional[Tuple[float, float]],
+) -> Optional[Tuple[float, float]]:
+    """Координаты мяча для гол/пас — только при загруженной модели и надёжном source."""
+    if model is None:
+        return None
+    if ball_state_counts_for_events(ball_state, ball_lost):
+        return ball
+    return None
 
 
 def seconds_to_frames(seconds: float, fps: float, minimum: int = 1) -> int:
@@ -1627,12 +1674,23 @@ def ring_configuration_status(state: Dict[str, Any]) -> Tuple[bool, bool]:
     return bool(state.get("ring1_configured")), bool(state.get("ring2_configured"))
 
 
+def _set_pending_ring_widget_coords(
+    state: Dict[str, Any], ring_num: int, x: int, y: int, r: Optional[float] = None
+) -> None:
+    """Откладывает синхронизацию wi_ring* до consume_pending_step2_ui_state (до виджетов)."""
+    state[f"_pending_wi_ring{ring_num}_x"] = int(x)
+    state[f"_pending_wi_ring{ring_num}_y"] = int(y)
+    if r is not None:
+        state[f"_pending_wi_ring{ring_num}_r"] = int(round(r))
+
+
 def mark_ring_configured(
     state: Dict[str, Any], ring_num: int, x: int, y: int, frame_idx: Optional[int] = None
 ) -> None:
     state[f"ring{ring_num}_configured"] = True
     state[f"ring{ring_num}_x"] = int(x)
     state[f"ring{ring_num}_y"] = int(y)
+    _set_pending_ring_widget_coords(state, ring_num, int(x), int(y))
     if frame_idx is not None:
         state[f"ring{ring_num}_frame"] = int(frame_idx)
 
@@ -2268,22 +2326,27 @@ class BallAnchorGuide:
         self.camera_transforms = camera_transforms
 
     def get_override(self, frame_idx: int) -> Optional[BallTrackState]:
+        """Только точный кадр клика — не подменяет YOLO/CSRT между якорями."""
         hit = interpolate_ball_position(self.anchors, frame_idx, self.camera_transforms)
         if hit is None:
             return None
         x, y, source = hit
-        conf = 1.0 if source == "user" else 0.92
-        return BallTrackState(x, y, conf, source)
+        if source != "user":
+            return None
+        return BallTrackState(x, y, 1.0, source)
 
     def get_csrt_seed_bbox(self, frame_idx: int) -> Optional[Tuple[float, float, float, float]]:
+        """Seed CSRT только на кадре клика и коротком хвосте после него."""
         if not self.anchors:
             return None
         best: Optional[Dict[str, Any]] = None
+        best_delta: Optional[int] = None
         for anchor in self.anchors:
-            if int(anchor["frame"]) <= frame_idx:
-                best = anchor
-            else:
-                break
+            delta = int(frame_idx) - int(anchor["frame"])
+            if 0 <= delta <= BALL_CSRT_SEED_TAIL_FRAMES:
+                if best_delta is None or delta < best_delta:
+                    best = anchor
+                    best_delta = delta
         if best is None:
             return None
         x, y = project_ball_point_to_frame(
@@ -2748,22 +2811,22 @@ class BallTracker:
         yolo_bbox: Optional[Tuple[float, float, float, float]] = None,
         ball_anchor_guide: Optional[BallAnchorGuide] = None,
     ) -> Optional[BallTrackState]:
+        if yolo_ball is not None:
+            bbox = yolo_bbox or _bbox_from_center(yolo_ball[0], yolo_ball[1])
+            return self._commit_detection(
+                frame_idx, frame_bgr, yolo_ball[0], yolo_ball[1], yolo_conf, "yolo", bbox=bbox
+            )
+
         if ball_anchor_guide is not None:
             override = ball_anchor_guide.get_override(frame_idx)
             if override is not None:
                 return self._commit_detection(
                     frame_idx, frame_bgr, override.x, override.y, override.conf, override.source
                 )
-            if yolo_ball is None and self.csrt_tracker is None:
+            if self.csrt_tracker is None:
                 seed_bbox = ball_anchor_guide.get_csrt_seed_bbox(frame_idx)
                 if seed_bbox is not None:
                     self._init_csrt(frame_bgr, seed_bbox)
-
-        if yolo_ball is not None:
-            bbox = yolo_bbox or _bbox_from_center(yolo_ball[0], yolo_ball[1])
-            return self._commit_detection(
-                frame_idx, frame_bgr, yolo_ball[0], yolo_ball[1], yolo_conf, "yolo", bbox=bbox
-            )
 
         self.frames_since_yolo += 1
         if self.frames_since_any >= self.max_predict_frames:
@@ -3643,6 +3706,11 @@ def process_video(
     pass_free_start_xy: Optional[Tuple[float, float]] = None
     last_goal_episode_frame: int = -10**9
     prev_event_ball_xy: Optional[Tuple[float, float]] = None
+    last_event_ball_frame: int = -10**9
+    event_ball_gap_max_frames = max(
+        seconds_to_frames(EVENT_BALL_MAX_GAP_SECONDS, fps),
+        pass_max_frames,
+    )
 
     reset_tracker(model)  # независимая от возможного шага 3 сессия трекинга
 
@@ -3714,10 +3782,8 @@ def process_video(
             elif ball_tracker.last_confident_pos is not None and ball_tracker.frames_since_any < ball_tracker.max_predict_frames:
                 ball_lost = True
 
-        event_ball: Optional[Tuple[float, float]] = None
-        if ball_state_counts_for_events(ball_state, ball_lost):
-            event_ball = ball
-        else:
+        event_ball = event_ball_from_tracking(model, ball_state, ball_lost, ball)
+        if model is None:
             persons = []
             annotated = frame.copy()
             cv2.putText(
@@ -3850,6 +3916,11 @@ def process_video(
                 if free_ball_frames > pass_max_frames:
                     pass_origin = None
                     pass_free_start_xy = None
+        elif pass_origin is not None:
+            free_ball_frames += 1
+            if free_ball_frames > pass_max_frames:
+                pass_origin = None
+                pass_free_start_xy = None
         else:
             if free_ball_frames > pass_max_frames:
                 pass_origin = None
@@ -3872,11 +3943,16 @@ def process_video(
         # ГОЛЫ: пересечение траектории мяча с линией кольца (только надёжный source).
         # Общий кулдаун эпизода у кольца в секундах (не per-ring).
         # -------------------------------------------------------------
-        if event_ball is not None and prev_event_ball_xy is not None:
-            bx_prev, by_prev = prev_event_ball_xy
+        goal_prev_xy = effective_prev_event_ball_xy(
+            prev_event_ball_xy, last_event_ball_frame, frame_idx, event_ball_gap_max_frames
+        )
+        if event_ball is not None and goal_prev_xy is not None:
+            bx_prev, by_prev = goal_prev_xy
             bx_curr, by_curr = event_ball[0], event_ball[1]
             if (frame_idx - last_goal_episode_frame) >= goal_cooldown_frames:
                 for ring_idx, ring in enumerate(current_rings):
+                    if not ring.get("configured", True):
+                        continue
                     half_w = ring.get("half_width", ring.get("r", 40.0))
                     if not segment_crosses_hoop_line_top_to_bottom(
                         bx_prev, by_prev, bx_curr, by_curr, ring["y"], ring["x"], half_w
@@ -3887,8 +3963,7 @@ def process_video(
                     if credited_player is None:
                         credited_player = nearest_player_to_point(event_persons, (ring["x"], ring["y"]))
                     if credited_player is not None and credited_player not in excluded_ids:
-                        stats.setdefault(credited_player, blank_stats())["shots"] += 1
-                        stats[credited_player]["makes"] += 1
+                        stats.setdefault(credited_player, blank_stats())["makes"] += 1
                         pending_highlights.append(
                             PendingHighlight(
                                 filename=f"goal_ring{ring_idx + 1}_ID{credited_player}_frame_{frame_idx}.mp4",
@@ -3900,6 +3975,7 @@ def process_video(
 
         if event_ball is not None:
             prev_event_ball_xy = (event_ball[0], event_ball[1])
+            last_event_ball_frame = frame_idx
 
         # -------------------------------------------------------------
         # Буфер прошлого (для хайлайтов) и добор "будущих" кадров для уже
@@ -3952,7 +4028,7 @@ def build_box_score(
     """Формирует итоговую таблицу статистики (Box Score) по игрокам."""
     resolve_player_id = make_id_resolver(manual_id_map)
     excluded = {resolve_player_id(int(pid)) for pid in (excluded_player_ids or set())}
-    columns = ["ID игрока", "Имя", "Номер", "Броски", "Попадания", "Точность (%)", "Сделано передач"]
+    columns = ["ID игрока", "Имя", "Номер", "Попадания", "Сделано передач"]
     if not stats:
         return pd.DataFrame(columns=columns)
 
@@ -3960,8 +4036,7 @@ def build_box_score(
     for pid, s in sorted(stats.items()):
         if pid in excluded:
             continue
-        shots, makes, passes = s["shots"], s["makes"], s["passes"]
-        accuracy = round(100.0 * makes / shots, 1) if shots else 0.0
+        makes, passes = s["makes"], s["passes"]
         name, number = lookup_player_meta(pid, player_names, player_numbers, manual_id_map)
         name = name or f"Игрок {pid}"
         number = number or "—"
@@ -3970,9 +4045,7 @@ def build_box_score(
                 "ID игрока": pid,
                 "Имя": name,
                 "Номер": number,
-                "Броски": shots,
                 "Попадания": makes,
-                "Точность (%)": accuracy,
                 "Сделано передач": passes,
             }
         )
@@ -4096,7 +4169,6 @@ def reset_for_new_video() -> None:
 
 def _make_ring_widget_change_handler(ring_num: int):
     def _handler() -> None:
-        st.session_state[f"ring{ring_num}_configured"] = True
         sync_ring_widgets_to_canonical(st.session_state, ring_num)
         if st.session_state.get("camera_mode") == CAMERA_MODE_PANNING:
             st.session_state[f"ring{ring_num}_frame"] = int(st.session_state.get("preview_frame_idx", 0))
@@ -4883,6 +4955,8 @@ def render_step3_players(device: str) -> None:
             else:
                 st.success(f"Найдено {len(crops)} уникальных ID игроков.")
 
+    consume_pending_step3_ui_state(st.session_state)
+
     crops: Dict[int, Any] = st.session_state.get("player_crops") or {}
     manual_map: Dict[int, int] = dict(st.session_state.get("manual_id_map") or {})
     if crops:
@@ -4971,8 +5045,7 @@ def render_step3_players(device: str) -> None:
                 key="merge_selected_players_btn",
             ):
                 merge_player_ids_selection(st.session_state, merge_pick_ids)
-                for picked in merge_pick_ids:
-                    st.session_state[f"merge_pick_{picked}"] = False
+                st.session_state["_pending_merge_pick_clear"] = list(merge_pick_ids)
                 st.rerun()
         with merge_btn_cols[1]:
             if merge_pick_ids:
@@ -5174,7 +5247,7 @@ def run_full_analysis(video_path: str, device: str) -> None:
             video_path=video_path,
             model=model,
             device=device,
-            rings=rings,
+            rings=prepared_rings,
             possession_threshold=float(st.session_state["possession_threshold"]),
             pass_min_seconds=float(st.session_state.get("pass_min_seconds", PASS_MIN_SECONDS_DEFAULT)),
             pass_max_seconds=float(st.session_state.get("pass_max_seconds", PASS_MAX_SECONDS_DEFAULT)),

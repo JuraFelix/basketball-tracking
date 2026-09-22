@@ -29,6 +29,50 @@ def _translation_transforms(n: int, dx: float = 5.0) -> List[np.ndarray]:
     return transforms
 
 
+def _ss_get(state: Any, key: str, default: Any = None) -> Any:
+    try:
+        return state[key]
+    except KeyError:
+        return default
+
+
+def _copy_session(at: AppTest, base: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    for key in merged:
+        val = _ss_get(at.session_state, key)
+        if val is not None:
+            merged[key] = val
+    for key in (
+        "ring1_anchors",
+        "ring2_anchors",
+        "ring1_configured",
+        "ring2_configured",
+        "ring1_x",
+        "ring1_y",
+        "ring1_r",
+        "ring2_x",
+        "ring2_y",
+        "ring2_r",
+        "wi_ring1_x",
+        "wi_ring1_y",
+        "wi_ring1_r",
+        "wi_ring2_x",
+        "wi_ring2_y",
+        "wi_ring2_r",
+        "ball_interp_fix_frame",
+        "click_target_ring_radio",
+    ):
+        val = _ss_get(at.session_state, key)
+        if val is not None:
+            merged[key] = val
+    return merged
+
+
+def _apply_session(at: AppTest, state: Dict[str, Any]) -> None:
+    for key, value in state.items():
+        at.session_state[key] = value
+
+
 def _step2_session(video_path: str, transforms: List[np.ndarray]) -> Dict[str, Any]:
     return {
         "step": 2,
@@ -77,31 +121,32 @@ class Step2AppTest(unittest.TestCase):
         at.run()
         self._assert_no_streamlit_exception(at)
 
+        plain = _copy_session(at, _step2_session(self.video_path, self.transforms))
         wi_before = (
-            at.session_state.get("wi_ring1_x"),
-            at.session_state.get("wi_ring1_y"),
-            at.session_state.get("wi_ring1_r"),
+            plain.get("wi_ring1_x"),
+            plain.get("wi_ring1_y"),
+            plain.get("wi_ring1_r"),
         )
-        sync_ring_widgets_to_canonical(at.session_state, 1)
+        sync_ring_widgets_to_canonical(plain, 1)
         add_ring_anchor(
-            at.session_state,
+            plain,
             1,
             320,
             120,
-            frame_idx=int(at.session_state["preview_frame_idx"]),
-            half_width=float(at.session_state.get("ring1_r", 40)),
+            frame_idx=int(plain["preview_frame_idx"]),
+            half_width=float(plain.get("ring1_r", 40)),
         )
-        at.session_state["_last_ring_click_time"] = 1.0
+        plain["_last_ring_click_time"] = 1.0
+        _apply_session(at, plain)
         at.run()
         self._assert_no_streamlit_exception(at)
         self.assertEqual(len(at.session_state["ring1_anchors"]), 1)
         self.assertTrue(at.session_state["ring1_configured"])
-        wi_after = (
-            at.session_state.get("wi_ring1_x"),
-            at.session_state.get("wi_ring1_y"),
-            at.session_state.get("wi_ring1_r"),
-        )
-        self.assertEqual(wi_after, wi_before)
+        self.assertEqual(int(at.session_state["ring1_x"]), 320)
+        self.assertEqual(int(at.session_state["ring1_y"]), 120)
+        self.assertEqual(_ss_get(at.session_state, "wi_ring1_x"), 320)
+        self.assertEqual(_ss_get(at.session_state, "wi_ring1_y"), 120)
+        self.assertEqual(wi_before[2], _ss_get(at.session_state, "wi_ring1_r"))
 
     def test_ring2_click_rerun_no_exception(self) -> None:
         """Клик по кольцу 2 в panning-режиме — без записи в wi_ring2_* после виджетов."""
@@ -115,15 +160,23 @@ class Step2AppTest(unittest.TestCase):
         at.run()
         self._assert_no_streamlit_exception(at)
 
-        sync_ring_widgets_to_canonical(at.session_state, 2)
+        plain = _copy_session(at, _step2_session(self.video_path, self.transforms))
+        plain["click_target_ring"] = "Кольцо 2"
+        plain["click_target_ring_radio"] = "Кольцо 2"
+        plain["ring1_configured"] = True
+        plain["ring1_anchors"] = [
+            {"x": 300.0, "y": 100.0, "half_width": 40.0, "frame": 0}
+        ]
+        sync_ring_widgets_to_canonical(plain, 2)
         add_ring_anchor(
-            at.session_state,
+            plain,
             2,
             500,
             130,
             frame_idx=3,
-            half_width=float(at.session_state.get("ring2_r", 40)),
+            half_width=float(plain.get("ring2_r", 40)),
         )
+        _apply_session(at, plain)
         at.run()
         self._assert_no_streamlit_exception(at)
         self.assertEqual(len(at.session_state["ring2_anchors"]), 1)
@@ -146,8 +199,8 @@ class Step2AppTest(unittest.TestCase):
         fix_btn = next(b for b in at.button if b.label and "Поправить кликом" in b.label)
         fix_btn.click().run()
         self._assert_no_streamlit_exception(at)
-        self.assertIsNotNone(at.session_state.get("ball_interp_fix_frame"))
-        self.assertEqual(at.session_state.get("click_target_ring_radio"), "Мяч")
+        self.assertIsNotNone(_ss_get(at.session_state, "ball_interp_fix_frame"))
+        self.assertEqual(_ss_get(at.session_state, "click_target_ring_radio"), "Мяч")
 
 
 class Step2UiHelperTests(unittest.TestCase):
