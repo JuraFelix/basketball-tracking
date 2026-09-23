@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 from collections import deque
+from functools import lru_cache
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -129,6 +130,7 @@ def clear_project_cache(include_training_seeds: bool = False) -> List[str]:
         st.cache_resource.clear()
     except Exception:
         pass
+    clear_video_frame_cache()
     return cleared
 
 
@@ -1209,6 +1211,27 @@ def lookup_player_meta(
     return name, number
 
 
+def format_player_video_label(
+    canonical_id: int,
+    player_names: Optional[Dict[int, str]] = None,
+    player_numbers: Optional[Dict[int, str]] = None,
+    manual_id_map: Optional[Dict[int, int]] = None,
+) -> str:
+    """Подпись игрока на аннотированном видео: имя/номер или канонический ID без списка склеенных ID."""
+    name, number = lookup_player_meta(
+        int(canonical_id), player_names, player_numbers, manual_id_map
+    )
+    name = (name or "").strip()
+    number = (number or "").strip()
+    if name and number:
+        return f"{name} #{number}"
+    if name:
+        return name
+    if number:
+        return f"#{number}"
+    return f"ID {int(canonical_id)}"
+
+
 def get_camera_transforms_cached(
     video_path: str,
     state: Dict[str, Any],
@@ -1723,6 +1746,9 @@ def draw_annotations(
     ball_lost: bool = False,
     last_ball: Optional[Tuple[float, float]] = None,
     id_former_labels: Optional[Dict[int, List[int]]] = None,
+    player_names: Optional[Dict[int, str]] = None,
+    player_numbers: Optional[Dict[int, str]] = None,
+    manual_id_map: Optional[Dict[int, int]] = None,
 ):
     """Рисует рамки игроков (с ID), траекторию мяча и маркер мяча на копии кадра.
 
@@ -1733,7 +1759,6 @@ def draw_annotations(
     """
     annotated = frame.copy()
     excluded_ids = excluded_ids or set()
-    id_former_labels = id_former_labels or {}
     traj_pts: List[Tuple[int, int]] = []
     if ball_trajectory:
         traj_pts = [(int(x), int(y)) for x, y in ball_trajectory]
@@ -1751,10 +1776,9 @@ def draw_annotations(
         p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
         thickness = 1 if excluded else 2
         cv2.rectangle(annotated, p1, p2, color, thickness)
-        former = id_former_labels.get(pid) or []
-        label = f"ID {pid}"
-        if former:
-            label += f" (=б. {', '.join(str(x) for x in former)})"
+        label = format_player_video_label(
+            pid, player_names, player_numbers, manual_id_map
+        )
         if excluded:
             label += " [excl]"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
@@ -1992,13 +2016,68 @@ def get_video_metadata(video_path: str) -> Dict[str, float]:
     return {"fps": fps, "width": width, "height": height, "total_frames": total_frames, "duration": duration}
 
 
-def extract_frame_at_index(video_path: str, frame_idx: int):
-    """Извлекает кадр по индексу (для превью настройки колец)."""
+@lru_cache(maxsize=48)
+def _decode_video_frame_cached(video_path: str, frame_idx: int):
+    """Декодирует кадр один раз; повторные клики по превью берут кадр из LRU-кэша."""
+    if cv2 is None:
+        return None
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, max(int(frame_idx), 0))
     ret, frame = cap.read()
     cap.release()
     return frame if ret else None
+
+
+def clear_video_frame_cache() -> None:
+    _decode_video_frame_cached.cache_clear()
+
+
+def extract_frame_at_index(video_path: str, frame_idx: int):
+    """Извлекает кадр по индексу (для превью настройки колец)."""
+    cached = _decode_video_frame_cached(str(video_path), int(frame_idx))
+    return cached.copy() if cached is not None else None
+
+
+def downscale_frame_for_preview(frame, max_width: int = PREVIEW_MAX_DISPLAY_WIDTH):
+    """Уменьшает кадр только для отображения; клики остаются в координатах исходного кадра."""
+    if frame is None or cv2 is None:
+        return frame, 1.0
+    height, width = frame.shape[:2]
+    if width <= max_width:
+        return frame, 1.0
+    scale = float(max_width) / float(width)
+    new_width = max(int(round(width * scale)), 1)
+    new_height = max(int(round(height * scale)), 1)
+    resized = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    return resized, scale
+
+
+def scale_rings_for_preview(rings: List[RingZone], scale: float) -> List[RingZone]:
+    if scale == 1.0:
+        return [dict(ring) for ring in rings]
+    scaled: List[RingZone] = []
+    for ring in rings:
+        copy = dict(ring)
+        copy["x"] = float(ring["x"]) * scale
+        copy["y"] = float(ring["y"]) * scale
+        copy["half_width"] = float(ring.get("half_width", 0.0)) * scale
+        scaled.append(copy)
+    return scaled
+
+
+def scale_ball_anchors_for_preview(
+    ball_anchors: Optional[List[Dict[str, Any]]], scale: float
+) -> List[Dict[str, Any]]:
+    if not ball_anchors or scale == 1.0:
+        return list(ball_anchors or [])
+    return [
+        {
+            "x": float(anchor["x"]) * scale,
+            "y": float(anchor["y"]) * scale,
+            "frame": int(anchor["frame"]),
+        }
+        for anchor in ball_anchors
+    ]
 
 
 def extract_frame_at_time(video_path: str, t_seconds: float):
@@ -3335,9 +3414,14 @@ def diagnose_ball_visibility(
     color_roi_half: int = BALL_COLOR_ROI_HALF_DEFAULT,
     progress_callback: Optional[Callable[[float], Any]] = None,
     status_callback: Optional[Callable[[str], Any]] = None,
+    max_seconds: Optional[float] = None,
+    fps_hint: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Сэмплирует до ~100 кадров равномерно по всему видео (model.predict на
-    каждом) и сравнивает видимость мяча: YOLO vs YOLO + Kalman/цвет."""
+    """Диагностика видимости мяча на коротком префиксе видео (как скан игроков шага 3).
+
+    По умолчанию — непрерывный префикс 0..min(seconds×fps, QUICK_SCAN_MAX_TRACK_FRAMES)
+    без frame_step; YOLO не гоняется по всему ролику.
+    """
     if model is None or cv2 is None:
         return None
     cap = cv2.VideoCapture(video_path)
@@ -3348,8 +3432,11 @@ def diagnose_ball_visibility(
         cap.release()
         return None
 
-    sample_indices = build_sparse_frame_indices(total_frames)
-    if not sample_indices:
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or fps_hint or 25.0)
+    if max_seconds is None or max_seconds <= 0:
+        max_seconds = float(QUICK_SCAN_SECONDS_DEFAULT)
+    segment_frames = min(compute_quick_scan_frame_count(fps, max_seconds), total_frames)
+    if segment_frames <= 0:
         cap.release()
         return None
 
@@ -3372,24 +3459,26 @@ def diagnose_ball_visibility(
     }
     gaps: List[int] = []
     gap_start_frame: Optional[int] = None
-    n_samples = len(sample_indices)
+    n_samples = 0
 
-    for sample_i, frame_idx in enumerate(sample_indices):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for frame_idx in range(segment_frames):
         ret, frame = cap.read()
         if not ret:
-            continue
+            break
+        n_samples += 1
 
         if status_callback is not None:
             try:
                 status_callback(
-                    f"Сэмпл {sample_i + 1}/{n_samples} · кадр {frame_idx} / {total_frames}"
+                    f"Кадр {frame_idx + 1}/{segment_frames} "
+                    f"(префикс 0–{segment_frames - 1}, не всё видео)"
                 )
             except Exception:
                 pass
         if progress_callback is not None:
             try:
-                progress_callback(min((sample_i + 1) / n_samples, 1.0))
+                progress_callback(min((frame_idx + 1) / segment_frames, 1.0))
             except Exception:
                 pass
 
@@ -3421,10 +3510,16 @@ def diagnose_ball_visibility(
 
     yolo_rate = yolo_hits / n_samples
     enhanced_rate = enhanced_hits / n_samples
+    segment_seconds = n_samples / fps if fps > 0 else 0.0
     return {
         "sampled_frames": n_samples,
         "total_video_frames": total_frames,
-        "sample_step_approx": max(total_frames // max(n_samples, 1), 1),
+        "segment_frames": n_samples,
+        "segment_seconds": segment_seconds,
+        "segment_max_seconds": float(max_seconds),
+        "segment_fps": fps,
+        "scans_full_video": False,
+        "sample_step_approx": 1,
         "frames_with_ball_yolo": yolo_hits,
         "yolo_detection_rate": yolo_rate,
         "frames_with_ball_enhanced": enhanced_hits,
@@ -3585,6 +3680,8 @@ def process_video(
     ball_anchors: Optional[List[Dict[str, Any]]] = None,
     manual_id_map: Optional[Dict[int, int]] = None,
     avg_player_diagonal: Optional[float] = None,
+    player_names: Optional[Dict[int, str]] = None,
+    player_numbers: Optional[Dict[int, str]] = None,
 ) -> Tuple[Dict[int, PlayerStats], Path, Dict[str, List[Dict[str, Any]]]]:
     """Обрабатывает видео покадрово: детекция, трекинг, события, хайлайты.
 
@@ -3664,7 +3761,6 @@ def process_video(
         min_person_bbox_area=min_person_bbox_area,
     )
     resolve_player_id = make_id_resolver(manual_id_map)
-    id_former_labels = build_id_former_labels(manual_id_map)
     excluded_ids: set = {resolve_player_id(int(pid)) for pid in (excluded_player_ids or [])}
     ring_draw_warnings: List[str] = []
 
@@ -3786,7 +3882,9 @@ def process_video(
                 excluded_ids=excluded_ids,
                 ball_lost=ball_lost if model is not None else False,
                 last_ball=ball_tracker.last_confident_pos if model is not None else None,
-                id_former_labels=id_former_labels,
+                player_names=player_names,
+                player_numbers=player_numbers,
+                manual_id_map=manual_id_map,
             )
             annotated = draw_hoop_lines_on_frame(annotated, current_rings, warnings_out=ring_draw_warnings)
         elif effective_ball is not None:
@@ -4127,6 +4225,7 @@ def reset_for_new_video() -> None:
     """Сбрасывает всё, что зависит от конкретного видео (при загрузке нового)."""
     clear_highlights_directory()
     reset_analysis_results()
+    clear_video_frame_cache()
     for key in (
         "rings_initialized_for",
         "ring1_configured",

@@ -403,6 +403,12 @@ def render_step2_zones(device: str) -> None:
         )
 
     frame = extract_frame_at_index(video_path, preview_frame_idx)
+    preview_display_frame = None
+    preview_scale = 1.0
+    if frame is not None:
+        preview_display_frame, preview_scale = downscale_frame_for_preview(
+            frame, PREVIEW_MAX_DISPLAY_WIDTH
+        )
     if frame is not None and st.session_state.get("auto_threshold_computed_for") != video_path:
         model, _ = load_model(device)
         if model is not None:
@@ -429,27 +435,31 @@ def render_step2_zones(device: str) -> None:
     # текущем прогоне ещё не создавались) — значит запись в эти ключи всё
     # ещё разрешена. Сам st.rerun() при этом откладывается флагом
     # ring_click_triggered_rerun до конца функции — см. комментарий там.
-    if frame is not None:
+    if frame is not None and preview_display_frame is not None:
         rings = rings_for_preview_display(
             st.session_state,
             preview_frame_idx,
             camera_transforms=camera_transforms_preview,
             panning_mode=panning_mode,
         )
+        preview_rings = scale_rings_for_preview(rings, preview_scale)
+        preview_ball_anchors = scale_ball_anchors_for_preview(
+            st.session_state.get("ball_anchors"), preview_scale
+        )
         preview_bgr = draw_zones_preview(
-            frame,
-            rings,
-            possession_threshold=st.session_state["possession_threshold"],
+            preview_display_frame,
+            preview_rings,
+            possession_threshold=float(st.session_state["possession_threshold"]) * preview_scale,
             preview_frame_idx=preview_frame_idx,
             show_anchor_debug=panning_mode,
-            ball_anchors=st.session_state.get("ball_anchors"),
+            ball_anchors=preview_ball_anchors,
             camera_transforms=camera_transforms_preview,
             panning_mode=panning_mode,
         )
         preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
 
         if streamlit_image_coordinates is not None:
-            display_width = min(int(meta["width"]), PREVIEW_MAX_DISPLAY_WIDTH)
+            display_width = int(preview_rgb.shape[1])
             click_value = streamlit_image_coordinates(
                 preview_rgb, key=f"ring_click_canvas_{preview_frame_idx}", width=display_width
             )
@@ -594,15 +604,22 @@ def render_step2_zones(device: str) -> None:
                 ix, iy, _ = interp_pos
                 check_bgr = extract_frame_at_index(video_path, check_frame)
                 if check_bgr is not None:
-                    check_preview = draw_zones_preview(
-                        check_bgr,
+                    check_display, check_scale = downscale_frame_for_preview(
+                        check_bgr, PREVIEW_MAX_DISPLAY_WIDTH
+                    )
+                    check_rings = scale_rings_for_preview(
                         rings_for_preview_display(
                             st.session_state,
                             check_frame,
                             camera_transforms=camera_transforms_preview,
                             panning_mode=panning_mode,
                         ),
-                        ball_anchors=ball_anchors,
+                        check_scale,
+                    )
+                    check_preview = draw_zones_preview(
+                        check_display,
+                        check_rings,
+                        ball_anchors=scale_ball_anchors_for_preview(ball_anchors, check_scale),
                         preview_frame_idx=check_frame,
                         camera_transforms=camera_transforms_preview,
                         panning_mode=panning_mode,
@@ -781,13 +798,14 @@ def render_step3_players(device: str) -> None:
                         if st.button("Разъединить", key=f"unmerge_group_{canonical}"):
                             unmerge_player_group(st.session_state, canonical)
                             st.rerun()
-                    main_col, mini_cols = st.columns([2, 3])
-                    with main_col:
+                    card_cols = st.columns([2, 3])
+                    with card_cols[0]:
                         resized_main = resize_crop_to_height(crops[canonical], CROP_DISPLAY_HEIGHT)
                         st.image(
                             cv2.cvtColor(resized_main, cv2.COLOR_BGR2RGB),
                             caption=f"ID {canonical} (канон)",
                         )
+                    with card_cols[1]:
                         st.checkbox(
                             "Исключить из статистики",
                             key=f"exclude_player_{canonical}",
@@ -801,9 +819,9 @@ def render_step3_players(device: str) -> None:
                             "Номер", key=f"player_number_{canonical}",
                             placeholder="Номер", label_visibility="collapsed",
                         )
-                    with mini_cols:
+                    satellite = [m for m in members if m != canonical]
+                    if satellite:
                         st.caption("Склеенные ID:")
-                        satellite = [m for m in members if m != canonical]
                         sat_cols = st.columns(min(len(satellite), 4) or 1)
                         for col, sid in zip(sat_cols, satellite):
                             with col:
@@ -879,10 +897,13 @@ def render_step3_players(device: str) -> None:
 
     st.divider()
     st.subheader("🏀 Диагностика видимости мяча")
+    diag_segment_frames = compute_quick_scan_frame_count(meta["fps"], scan_seconds)
     st.caption(
-        "Если на шаге 4 фиксируется 0 бросков/передач — сначала проверьте здесь, вообще ли модель "
-        "видит мяч на этом видео при текущем пороге уверенности (настраивается на шаге 2), прежде "
-        "чем менять пороги владения/передач."
+        "Проверка идёт только по **начальному отрезку** видео — тем же "
+        f"**{scan_seconds} сек / {diag_segment_frames} кадр.** (кадры 0–{diag_segment_frames - 1}), "
+        "что и сканирование игроков выше, **не по всему ролику**. "
+        "Если на шаге 4 фиксируется 0 бросков/передач — сначала проверьте здесь, видит ли модель "
+        "мяч при текущем пороге уверенности (шаг 2), прежде чем менять пороги владения/передач."
     )
     if st.button("🔍 Проверить видимость мяча"):
         model, model_error = load_model(device)
@@ -902,6 +923,8 @@ def render_step3_players(device: str) -> None:
                 color_roi_half=int(st.session_state.get("ball_color_roi_half", BALL_COLOR_ROI_HALF_DEFAULT)),
                 progress_callback=diag_progress.progress,
                 status_callback=diag_status.caption,
+                max_seconds=float(scan_seconds),
+                fps_hint=float(meta["fps"]),
             )
             diag_progress.progress(1.0, text="Диагностика завершена")
             diag_status.empty()
@@ -914,9 +937,12 @@ def render_step3_players(device: str) -> None:
         yolo_pct = diag.get("yolo_detection_rate", diag.get("detection_rate", 0.0)) * 100.0
         enh_pct = diag.get("enhanced_detection_rate", yolo_pct / 100.0) * 100.0
         src = diag.get("source_counts") or {}
+        segment_frames = int(diag.get("segment_frames", diag["sampled_frames"]))
+        segment_seconds = float(diag.get("segment_seconds", 0.0))
         st.caption(
-            f"Сэмплов по видео: {diag['sampled_frames']}"
-            + (f" из ~{diag.get('total_video_frames', '?')} кадров" if diag.get("total_video_frames") else "")
+            f"Отрезок: кадры 0–{max(segment_frames - 1, 0)} "
+            f"({segment_frames} кадр., ~{segment_seconds:.1f} с) — не всё видео"
+            + (f" (в ролике ~{diag.get('total_video_frames', '?')} кадр.)" if diag.get("total_video_frames") else "")
             + " · "
             f"YOLO: {diag.get('frames_with_ball_yolo', diag.get('frames_with_ball', 0))} "
             f"({yolo_pct:.0f}%, conf≈{diag['avg_confidence']:.2f}) · "
@@ -1112,6 +1138,8 @@ def run_full_analysis(video_path: str, device: str) -> None:
             camera_transforms=camera_transforms,
             ball_anchors=st.session_state.get("ball_anchors") or [],
             manual_id_map=dict(st.session_state.get("manual_id_map") or {}),
+            player_names=dict(st.session_state.get("player_names") or {}),
+            player_numbers=dict(st.session_state.get("player_numbers") or {}),
         )
     except Exception as exc:
         st.error(f"Ошибка при обработке видео: {exc}")
