@@ -13,7 +13,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1809,9 +1809,13 @@ def enhance_frame_for_detection(frame):
 # Нарезка хайлайтов (F16: буфер кадров на диске, не в RAM)
 # ---------------------------------------------------------------------------
 class DiskFrameBuffer:
-    """Скользящий буфер JPEG-кадров на диске (~5 с 1080p не держим в RAM)."""
+    """Скользящий буфер JPEG-кадров на диске (~5 с 1080p не держим в RAM).
 
-    __slots__ = ("maxlen", "cache_dir", "_paths", "_seq")
+    Кадры, переданные в pin(), не удаляются при ротации буфера — это нужно,
+    пока PendingHighlight ещё ссылается на «прошлые» кадры и ждёт «будущие».
+    """
+
+    __slots__ = ("maxlen", "cache_dir", "_paths", "_seq", "_pinned")
 
     def __init__(self, maxlen: int, cache_dir: Path) -> None:
         self.maxlen = max(1, int(maxlen))
@@ -1819,16 +1823,29 @@ class DiskFrameBuffer:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._paths: Deque[Path] = deque(maxlen=self.maxlen)
         self._seq = 0
+        self._pinned: Set[Path] = set()
+
+    def pin(self, paths: Iterable[Path]) -> None:
+        for path in paths:
+            self._pinned.add(Path(path))
+
+    def unpin(self, paths: Iterable[Path]) -> None:
+        for path in paths:
+            self._pinned.discard(Path(path))
 
     def append(self, frame: Any) -> Path:
         path = self.cache_dir / f"frame_{self._seq:08d}.jpg"
-        cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        ok = cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok or not path.is_file():
+            raise RuntimeError(f"Не удалось сохранить кадр в кэш: {path}")
         self._seq += 1
         if len(self._paths) == self.maxlen and self._paths:
-            try:
-                self._paths[0].unlink(missing_ok=True)
-            except OSError:
-                pass
+            old_path = self._paths[0]
+            if old_path not in self._pinned:
+                try:
+                    old_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         self._paths.append(path)
         return path
 
@@ -1895,23 +1912,67 @@ def reencode_for_browser(path: Path) -> Path:
     return path
 
 
-def _read_cached_frame(path: Path) -> Any:
+def _read_cached_frame(path: Path) -> Optional[Any]:
+    if not path.is_file():
+        logging.warning("Кадр хайлайта отсутствует в кэше: %s", path)
+        return None
     frame = cv2.imread(str(path))
     if frame is None:
-        raise RuntimeError(f"Не удалось прочитать кадр из кэша: {path}")
+        logging.warning("Не удалось декодировать кадр хайлайта: %s", path)
+        return None
     return frame
 
 
-def save_highlight_clip(highlight: PendingHighlight, fps: float, width: int, height: int) -> Path:
+def save_highlight_clip(highlight: PendingHighlight, fps: float, width: int, height: int) -> Optional[Path]:
     """Сохраняет буфер прошлого + будущего в автономный MP4-файл в highlights/."""
     frame_paths = highlight.past_paths + highlight.future_paths
+    frames = []
+    for path in frame_paths:
+        frame = _read_cached_frame(path)
+        if frame is not None:
+            frames.append(frame)
+    if not frames:
+        logging.warning("Хайлайт %s пропущен: нет доступных кадров в кэше", highlight.filename)
+        return None
+    if len(frames) < len(frame_paths):
+        logging.warning(
+            "Хайлайт %s: пропущено %d из %d кадров кэша",
+            highlight.filename,
+            len(frame_paths) - len(frames),
+            len(frame_paths),
+        )
     out_path = HIGHLIGHTS_DIR / highlight.filename
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_path), fourcc, fps if fps > 1 else 25.0, (width, height))
-    for path in frame_paths:
-        writer.write(_read_cached_frame(path))
+    for frame in frames:
+        writer.write(frame)
     writer.release()
     return reencode_for_browser(out_path)
+
+
+def _queue_pending_highlight(
+    pending: List[PendingHighlight],
+    frame_buffer: DiskFrameBuffer,
+    filename: str,
+    frames_needed: int,
+) -> None:
+    past_paths = frame_buffer.snapshot_paths()
+    frame_buffer.pin(past_paths)
+    pending.append(PendingHighlight(filename=filename, past_paths=past_paths, frames_needed=frames_needed))
+
+
+def _finalize_highlight(
+    highlight: PendingHighlight,
+    frame_buffer: DiskFrameBuffer,
+    fps: float,
+    width: int,
+    height: int,
+) -> None:
+    try:
+        save_highlight_clip(highlight, fps, width, height)
+    finally:
+        frame_buffer.unpin(highlight.past_paths)
+        frame_buffer.unpin(highlight.future_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -3768,12 +3829,11 @@ def process_video(
                 reason = "✅ передача засчитана"
                 stats.setdefault(pass_origin, blank_stats())["passes"] += 1
                 stats.setdefault(current_owner, blank_stats())
-                pending_highlights.append(
-                    PendingHighlight(
-                        filename=f"pass_from_ID{pass_origin}_to_ID{current_owner}_frame_{frame_idx}.mp4",
-                        past_paths=frame_buffer.snapshot_paths(),
-                        frames_needed=future_frames_needed,
-                    )
+                _queue_pending_highlight(
+                    pending_highlights,
+                    frame_buffer,
+                    filename=f"pass_from_ID{pass_origin}_to_ID{current_owner}_frame_{frame_idx}.mp4",
+                    frames_needed=future_frames_needed,
                 )
                 debug_log["ownership_changes"].append(
                     {
@@ -3875,12 +3935,11 @@ def process_video(
                         credited_player = nearest_player_to_point(event_persons, (ring["x"], ring["y"]))
                     if credited_player is not None and credited_player not in excluded_ids:
                         stats.setdefault(credited_player, blank_stats())["makes"] += 1
-                        pending_highlights.append(
-                            PendingHighlight(
-                                filename=f"goal_ring{ring_idx + 1}_ID{credited_player}_frame_{frame_idx}.mp4",
-                                past_paths=frame_buffer.snapshot_paths(),
-                                frames_needed=future_frames_needed,
-                            )
+                        _queue_pending_highlight(
+                            pending_highlights,
+                            frame_buffer,
+                            filename=f"goal_ring{ring_idx + 1}_ID{credited_player}_frame_{frame_idx}.mp4",
+                            frames_needed=future_frames_needed,
                         )
                     break
 
@@ -3897,8 +3956,9 @@ def process_video(
         still_pending_highlights = []
         for highlight in pending_highlights:
             highlight.future_paths.append(frame_path)
+            frame_buffer.pin([frame_path])
             if highlight.is_ready():
-                save_highlight_clip(highlight, fps, width, height)
+                _finalize_highlight(highlight, frame_buffer, fps, width, height)
             else:
                 still_pending_highlights.append(highlight)
         pending_highlights = still_pending_highlights
@@ -3915,7 +3975,7 @@ def process_video(
     # нужное число "будущих" кадров (событие произошло у самого конца ролика).
     for highlight in pending_highlights:
         if highlight.future_paths:
-            save_highlight_clip(highlight, fps, width, height)
+            _finalize_highlight(highlight, frame_buffer, fps, width, height)
 
     cap.release()
     writer.release()

@@ -21,6 +21,7 @@ from app import (
     save_highlight_clip,
     store_uploaded_video,
 )
+from basketball.ui import video_processing_error_hint
 from basketball.offline import apply_offline_env
 from basketball import config as bt_config
 from basketball import core as bt_core
@@ -102,8 +103,44 @@ class F16DiskBufferTests(unittest.TestCase):
             highlight = PendingHighlight("clip.mp4", [p1], frames_needed=1)
             highlight.future_paths.append(p2)
             out = save_highlight_clip(highlight, fps=25.0, width=4, height=4)
+            self.assertIsNotNone(out)
             self.assertTrue(out.exists())
             self.assertGreater(out.stat().st_size, 0)
+
+    def test_pinned_paths_survive_buffer_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "frames"
+            buf = DiskFrameBuffer(3, cache)
+            pinned = []
+            for i in range(3):
+                pinned.append(buf.append(np.full((4, 4, 3), i, dtype=np.uint8)))
+            buf.pin(pinned)
+            for i in range(3):
+                buf.append(np.full((4, 4, 3), i + 10, dtype=np.uint8))
+            for path in pinned:
+                self.assertTrue(path.is_file(), f"pinned frame was pruned: {path}")
+            buf.cleanup()
+
+    def test_save_highlight_clip_skips_missing_frame_without_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            import cv2
+
+            with mock.patch.object(bt_core, "HIGHLIGHTS_DIR", Path(tmp)):
+                present = Path(tmp) / "ok.jpg"
+                missing = Path(tmp) / "gone.jpg"
+                cv2.imwrite(str(present), np.zeros((4, 4, 3), dtype=np.uint8))
+                highlight = PendingHighlight("partial.mp4", [missing, present], frames_needed=0)
+                out = save_highlight_clip(highlight, fps=25.0, width=4, height=4)
+                self.assertIsNotNone(out)
+                self.assertTrue(out.exists())
+
+    def test_video_processing_error_hint_for_missing_frame(self) -> None:
+        exc = FileNotFoundError(
+            r"D:\VibeCoding\Basketball Tracking\.cache\highlight_frames\20260923_235522\frame_00000096.jpg"
+        )
+        hint = video_processing_error_hint(exc)
+        self.assertIn("Очистить кэш проекта", hint)
+        self.assertIn("шаг 4", hint.lower())
 
 
 class F17OfflineTests(unittest.TestCase):

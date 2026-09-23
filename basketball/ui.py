@@ -969,6 +969,40 @@ def render_step3_players(device: str) -> None:
 # ---------------------------------------------------------------------------
 # Шаг 4 — полный прогон и итоговая статистика
 # ---------------------------------------------------------------------------
+def video_processing_error_hint(exc: BaseException) -> str:
+    """Короткие указания пользователю после ошибки обработки видео (шаг 4)."""
+    msg = str(exc).lower()
+    if (
+        isinstance(exc, FileNotFoundError)
+        or isinstance(exc, OSError) and getattr(exc, "errno", None) == 2
+        or "no such file" in msg
+        or "не удалось прочитать кадр" in msg
+        or "не удалось сохранить кадр" in msg
+        or "highlight_frames" in msg
+        or "frame_" in msg and ".jpg" in msg
+    ):
+        return (
+            "**Что делать:** не удаляйте папку `.cache` во время прогона. "
+            "Очистку — только через «Очистить кэш проекта» в сайдбаре до или после анализа. "
+            "Загрузите ролик заново и повторите шаг 4. "
+            "Если ошибка повторяется — проверьте свободное место на диске."
+        )
+    if "не удалось открыть видеофайл" in msg or "video" in msg and "open" in msg:
+        return (
+            "**Что делать:** проверьте, что файл не повреждён, и загрузите видео заново на шаге 1. "
+            "Затем пройдите шаги 2–4."
+        )
+    if "cuda" in msg or "gpu" in msg or "out of memory" in msg:
+        return (
+            "**Что делать:** уменьшите разрешение инференса (imgsz) в проф. режиме или перезапустите приложение. "
+            "При нехватке VRAM попробуйте CPU-режим."
+        )
+    return (
+        "**Что делать:** перезапустите шаг 4. "
+        "Если не помогло — «Очистить кэш проекта» в сайдбаре, заново загрузите ролик и пройдите шаги 1–4."
+    )
+
+
 def run_full_analysis(video_path: str, device: str) -> None:
     ensure_directories()
     ensure_tracker_config()
@@ -1081,6 +1115,7 @@ def run_full_analysis(video_path: str, device: str) -> None:
         )
     except Exception as exc:
         st.error(f"Ошибка при обработке видео: {exc}")
+        st.markdown(video_processing_error_hint(exc))
         return
 
     status_text.text("Обработка завершена ✅")
